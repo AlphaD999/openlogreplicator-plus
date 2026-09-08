@@ -30,4 +30,15 @@ Schema and username filters may use regular expressions.
 A schema may not exist yet when replication starts and can be created later.
 OpenLogReplicator begins replicating such a schema automatically when it appears.
 
+=== Oracle RAC semantics
+
+When the source database is an Oracle RAC (Real Application Clusters) deployment, OpenLogReplicator replicates all instances (redo threads) from archived redo log copies on a regular file system:
+
+* Transactions of every thread are captured; each thread is consumed independently per archived sequence.
+* Output events are ordered globally by commit SCN: a transaction is emitted only after all threads have been parsed past its commit SCN (low-water-mark model). A slow thread can therefore delay the output of other threads.
+* A closed thread (stopped instance) stops holding back the global output once its remaining archive tail is missing (warning 60038); a thread that archives again automatically rejoins the global ordering.
+* Checkpoint files store per-thread positions; older single-instance checkpoint files remain loadable.
+
+See xref:../installation/installation.adoc#rac-support[Oracle RAC deployment] for configuration prerequisites.
+
 Next chapter: xref:7.startup.adoc[Startup]

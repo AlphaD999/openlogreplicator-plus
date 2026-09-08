@@ -51,6 +51,12 @@ Checkpoint files created by `batch` may not contain a complete schema suitable f
 _NOTE:_ Disabling checks can improve performance but increases risk.
 Use with caution and prefer enabling checks in production.
 
+|`archives-only`
+|_boolean_, default: unset
+|Force (`true`) or forbid (`false`) reading archived redo logs only, skipping online redo logs.
+Equivalent to flag `0x0001` in `flags`.
+When unset, a RAC source database automatically enables archives-only mode (online redo logs in ASM are not readable externally); single-instance databases keep the default online mode.
+
 |`host-timezone`
 |_string_, format: `+HH:MM` or `-HH:MM`, default: host timezone
 |Timezone of the host running OpenLogReplicator.

@@ -344,8 +344,9 @@ namespace OpenLogReplicator {
     // %a - activation id
     // %d - database id
     // %h - some hash
-    Seq Replicator::getSequenceFromFileName(const Replicator* replicator, const std::string& file) {
+    Seq Replicator::getSequenceFromFileName(const Replicator* replicator, const std::string& file, uint16_t& thread) {
         Seq sequence{0};
+        thread = 1;
         size_t i{};
         size_t j{};
 
@@ -372,6 +373,8 @@ namespace OpenLogReplicator {
 
                     if (replicator->metadata->logArchiveFormat[i + 1] == 's' || replicator->metadata->logArchiveFormat[i + 1] == 'S')
                         sequence = Seq(number);
+                    else if (replicator->metadata->logArchiveFormat[i + 1] == 't' || replicator->metadata->logArchiveFormat[i + 1] == 'T')
+                        thread = static_cast<uint16_t>(number);
                     i += 2;
                 } else if (replicator->metadata->logArchiveFormat[i + 1] == 'h') {
                     // Some [0-9a-z]*
@@ -507,12 +510,14 @@ namespace OpenLogReplicator {
                 if (unlikely(replicator->ctx->isTraceSet(Ctx::TRACE::ARCHIVE_LIST)))
                     replicator->ctx->logTrace(Ctx::TRACE::ARCHIVE_LIST, "checking path: " + fileName);
 
-                const Seq sequence = getSequenceFromFileName(replicator, ent2->d_name);
+                uint16_t fileThread = 1;
+                const Seq sequence = getSequenceFromFileName(replicator, ent2->d_name, fileThread);
 
                 if (unlikely(replicator->ctx->isTraceSet(Ctx::TRACE::ARCHIVE_LIST)))
-                    replicator->ctx->logTrace(Ctx::TRACE::ARCHIVE_LIST, "found seq: " + sequence.toString());
+                    replicator->ctx->logTrace(Ctx::TRACE::ARCHIVE_LIST, "found seq: " + sequence.toString() + " thread: " +
+                                              std::to_string(fileThread));
 
-                if (sequence == Seq::zero() || sequence < replicator->metadata->sequence)
+                if (sequence == Seq::zero() || sequence < replicator->metadata->threadSequence(fileThread))
                     continue;
 
                 auto* parser = new Parser(replicator->ctx, replicator->builder, replicator->metadata,
@@ -521,6 +526,7 @@ namespace OpenLogReplicator {
                 parser->firstScn = Scn::none();
                 parser->nextScn = Scn::none();
                 parser->sequence = sequence;
+                parser->thread = fileThread;
                 replicator->archiveRedoQueue.push(parser);
             }
             closedir(dir2);
@@ -562,12 +568,14 @@ namespace OpenLogReplicator {
                         break;
                     --j;
                 }
-                const Seq sequence = getSequenceFromFileName(replicator, fileName + j);
+                uint16_t fileThread = 1;
+                const Seq sequence = getSequenceFromFileName(replicator, fileName + j, fileThread);
 
                 if (unlikely(replicator->ctx->isTraceSet(Ctx::TRACE::ARCHIVE_LIST)))
-                    replicator->ctx->logTrace(Ctx::TRACE::ARCHIVE_LIST, "found seq: " + sequence.toString());
+                    replicator->ctx->logTrace(Ctx::TRACE::ARCHIVE_LIST, "found seq: " + sequence.toString() + " thread: " +
+                                              std::to_string(fileThread));
 
-                if (sequence == Seq::zero() || sequence < replicator->metadata->sequence)
+                if (sequence == Seq::zero() || sequence < replicator->metadata->threadSequence(fileThread))
                     continue;
 
                 auto* parser = new Parser(replicator->ctx, replicator->builder, replicator->metadata,
@@ -575,6 +583,7 @@ namespace OpenLogReplicator {
                 parser->firstScn = Scn::none();
                 parser->nextScn = Scn::none();
                 parser->sequence = sequence;
+                parser->thread = fileThread;
                 replicator->archiveRedoQueue.push(parser);
                 if (sequenceStart == Seq::none() || sequenceStart > sequence)
                     sequenceStart = sequence;
@@ -595,12 +604,14 @@ namespace OpenLogReplicator {
                     if (unlikely(replicator->ctx->isTraceSet(Ctx::TRACE::ARCHIVE_LIST)))
                         replicator->ctx->logTrace(Ctx::TRACE::ARCHIVE_LIST, "checking path: " + fileName);
 
-                    const Seq sequence = getSequenceFromFileName(replicator, ent->d_name);
+                    uint16_t fileThread = 1;
+                    const Seq sequence = getSequenceFromFileName(replicator, ent->d_name, fileThread);
 
                     if (unlikely(replicator->ctx->isTraceSet(Ctx::TRACE::ARCHIVE_LIST)))
-                        replicator->ctx->logTrace(Ctx::TRACE::ARCHIVE_LIST, "found seq: " + sequence.toString());
+                        replicator->ctx->logTrace(Ctx::TRACE::ARCHIVE_LIST, "found seq: " + sequence.toString() + " thread: " +
+                                                  std::to_string(fileThread));
 
-                    if (sequence == Seq::zero() || sequence < replicator->metadata->sequence)
+                    if (sequence == Seq::zero() || sequence < replicator->metadata->threadSequence(fileThread))
                         continue;
 
                     auto* parser = new Parser(replicator->ctx, replicator->builder, replicator->metadata,
@@ -608,6 +619,7 @@ namespace OpenLogReplicator {
                     parser->firstScn = Scn::none();
                     parser->nextScn = Scn::none();
                     parser->sequence = sequence;
+                    parser->thread = fileThread;
                     replicator->archiveRedoQueue.push(parser);
                 }
                 closedir(dir);
@@ -620,6 +632,8 @@ namespace OpenLogReplicator {
     }
 
     bool parserCompare::operator()(const Parser* p1, const Parser* p2) const {
+        if (p1->thread != p2->thread)
+            return p1->thread > p2->thread;
         return p1->sequence > p2->sequence;
     }
 
@@ -643,6 +657,7 @@ namespace OpenLogReplicator {
                 metadata->setResetlogs(oi->resetlogs);
                 metadata->sequence = Seq::zero();
                 metadata->fileOffset = FileOffset::zero();
+                metadata->threadPos.clear();
                 contextSet(CONTEXT::CPU);
                 return;
             }
@@ -719,26 +734,44 @@ namespace OpenLogReplicator {
             while (!archiveRedoQueue.empty() && !ctx->softShutdown) {
                 parser = archiveRedoQueue.top();
                 if (unlikely(ctx->isTraceSet(Ctx::TRACE::REDO)))
-                    ctx->logTrace(Ctx::TRACE::REDO, parser->path + " is seq: " + parser->sequence.toString() + ", scn: " + parser->firstScn.toString());
+                    ctx->logTrace(Ctx::TRACE::REDO, parser->path + " is seq: " + parser->sequence.toString() + " thread: " +
+                                  std::to_string(parser->thread) + ", scn: " + parser->firstScn.toString());
 
-                // When no metadata exists, start processing from the first file
-                if (metadata->sequence == Seq::zero()) {
+                // When no metadata exists for the thread, start processing from the first file
+                Seq expectedSequence = metadata->threadSequence(parser->thread);
+                if (expectedSequence == Seq::zero() || expectedSequence == Seq::none()) {
                     contextSet(CONTEXT::MUTEX, REASON::REPLICATOR_ARCH);
-                    std::unique_lock const lck(metadata->mtxCheckpoint);
-                    metadata->sequence = parser->sequence;
+                    metadata->setSeqFileOffset(parser->sequence, FileOffset::zero(), parser->thread);
                     contextSet(CONTEXT::CPU);
+                    expectedSequence = parser->sequence;
                 }
 
                 // Skip older archived redo logs
-                if (parser->sequence < metadata->sequence) {
+                if (parser->sequence < expectedSequence) {
                     archiveRedoQueue.pop();
                     delete parser;
                     continue;
                 }
 
-                if (parser->sequence > metadata->sequence) {
-                    ctx->warning(60027, "couldn't find archive log for seq: " + metadata->sequence.toString() + ", found: " +
-                                 parser->sequence.toString() + ", sleeping " + std::to_string(ctx->archReadSleepUs) + " us");
+                if (parser->sequence > expectedSequence) {
+                    if (metadata->rac) {
+                        auto threadClosedIt = threadClosed.find(parser->thread);
+                        if (threadClosedIt != threadClosed.end() && threadClosedIt->second) {
+                            // Closed thread stops holding back the global low-water-mark
+                            if (metadata->commitSorter != nullptr)
+                                metadata->commitSorter->threadClosed(parser->thread);
+                            ctx->warning(60038, "couldn't find archive log for thread: " + std::to_string(parser->thread) +
+                                         " seq: " + expectedSequence.toString() + ", found: " + parser->sequence.toString() +
+                                         ", thread is closed - waiting for delayed archival (instance recovery), sleeping " +
+                                         std::to_string(ctx->archReadSleepUs) + " us");
+                        } else
+                            ctx->warning(60027, "couldn't find archive log for thread: " + std::to_string(parser->thread) +
+                                         " seq: " + expectedSequence.toString() + ", found: " + parser->sequence.toString() +
+                                         ", sleeping " + std::to_string(ctx->archReadSleepUs) + " us");
+                    } else {
+                        ctx->warning(60027, "couldn't find archive log for seq: " + expectedSequence.toString() + ", found: " +
+                                     parser->sequence.toString() + ", sleeping " + std::to_string(ctx->archReadSleepUs) + " us");
+                    }
                     contextSet(CONTEXT::SLEEP);
                     ctx->usleepInt(ctx->archReadSleepUs);
                     contextSet(CONTEXT::CPU);
@@ -748,6 +781,8 @@ namespace OpenLogReplicator {
                 }
 
                 logsProcessed = true;
+                if (metadata->commitSorter != nullptr)
+                    metadata->commitSorter->threadReopened(parser->thread);
                 parser->reader = archReader;
 
                 archReader->fileName = parser->path;
@@ -777,8 +812,7 @@ namespace OpenLogReplicator {
                     break;
 
                 ret = parser->parse();
-                metadata->firstScn = parser->firstScn;
-                metadata->nextScn = parser->nextScn;
+                metadata->setFirstNextScn(parser->firstScn, parser->nextScn, parser->thread);
 
                 if (ctx->softShutdown)
                     break;
@@ -795,7 +829,7 @@ namespace OpenLogReplicator {
 
                 // verifySchema(metadata->nextScn);
 
-                ++metadata->sequence;
+                metadata->setNextSequence(parser->thread);
                 archiveRedoQueue.pop();
                 delete parser;
 

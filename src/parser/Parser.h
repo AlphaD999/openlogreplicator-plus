@@ -28,6 +28,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include "../common/types/Time.h"
 #include "../common/types/Types.h"
 #include "../common/types/Xid.h"
+#include "CommitSorter.h"
 
 namespace OpenLogReplicator {
     class Builder;
@@ -60,7 +61,7 @@ namespace OpenLogReplicator {
         }
     };
 
-    class Parser final {
+    class Parser final : public CommitSorter::Executor {
     protected:
         static constexpr uint64_t MAX_LWN_CHUNKS = static_cast<uint64_t>(512 * 2) / Ctx::MEMORY_CHUNK_SIZE_MB;
         static constexpr uint64_t MAX_RECORDS_IN_LWN = 1048576;
@@ -92,10 +93,13 @@ namespace OpenLogReplicator {
         void appendToTransaction(RedoLogRecord* redoLogRecord1, RedoLogRecord* redoLogRecord2);
         void appendToTransactionRollback(RedoLogRecord* redoLogRecord1, RedoLogRecord* redoLogRecord2);
         void dumpRedoVector(const uint8_t* data, typeSize recordSize) const;
+        void executeCommit(Transaction* transaction) override;
+        void executeCheckpoint(const CheckpointEvent& event) override;
 
     public:
         int group;
         std::string path;
+        uint16_t thread{1};
         Seq sequence;
         Scn firstScn{Scn::none()};
         Scn nextScn{Scn::none()};

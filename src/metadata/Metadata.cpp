@@ -57,6 +57,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include "../common/table/SysUser.h"
 #include "../locales/CharacterSet.h"
 #include "../locales/Locales.h"
+#include "../parser/CommitSorter.h"
 #include "../state/StateDisk.h"
 #include "RedoLog.h"
 #include "Metadata.h"
@@ -85,6 +86,11 @@ namespace OpenLogReplicator {
         if (serializer != nullptr) {
             delete serializer;
             serializer = nullptr;
+        }
+
+        if (commitSorter != nullptr) {
+            delete commitSorter;
+            commitSorter = nullptr;
         }
 
         if (state != nullptr) {
@@ -153,27 +159,83 @@ namespace OpenLogReplicator {
         activation = newActivation;
     }
 
-    void Metadata::setFirstNextScn(Scn newFirstScn, Scn newNextScn) {
+    void Metadata::setFirstNextScn(Scn newFirstScn, Scn newNextScn, uint16_t thread) {
         std::unique_lock const lck(mtxCheckpoint);
 
-        firstScn = newFirstScn;
-        nextScn = newNextScn;
+        ThreadPos& pos = threadPosGet(thread);
+        pos.firstScn = newFirstScn;
+        pos.nextScn = newNextScn;
+        if (thread == 1) {
+            firstScn = newFirstScn;
+            nextScn = newNextScn;
+        }
     }
 
-    void Metadata::setNextSequence() {
+    void Metadata::setNextSequence(uint16_t thread) {
         std::unique_lock const lck(mtxCheckpoint);
 
-        ++sequence;
+        ++threadPosGet(thread).sequence;
+        if (thread == 1)
+            ++sequence;
     }
 
-    void Metadata::setSeqFileOffset(Seq newSequence, FileOffset newFileOffset) {
+    void Metadata::setSeqFileOffset(Seq newSequence, FileOffset newFileOffset, uint16_t thread) {
         if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
-            ctx->logTrace(Ctx::TRACE::CHECKPOINT, "setting sequence to: " + newSequence.toString() + ", offset: " + newFileOffset.toString());
+            ctx->logTrace(Ctx::TRACE::CHECKPOINT, "setting sequence to: " + newSequence.toString() + ", offset: " + newFileOffset.toString() +
+                          ", thread: " + std::to_string(thread));
 
         std::unique_lock const lck(mtxCheckpoint);
 
-        sequence = newSequence;
-        fileOffset = newFileOffset;
+        ThreadPos& pos = threadPosGet(thread);
+        pos.sequence = newSequence;
+        pos.fileOffset = newFileOffset;
+        if (thread == 1) {
+            sequence = newSequence;
+            fileOffset = newFileOffset;
+        }
+    }
+
+    ThreadPos& Metadata::threadPosGet(uint16_t thread) {
+        auto it = threadPos.find(thread);
+        if (it == threadPos.end())
+            it = threadPos.try_emplace(thread).first;
+        return it->second;
+    }
+
+    Seq Metadata::threadSequence(uint16_t thread) const {
+        auto it = threadPos.find(thread);
+        if (it != threadPos.end())
+            return it->second.sequence;
+        if (thread == 1)
+            return sequence;
+        return Seq::zero();
+    }
+
+    FileOffset Metadata::takeFileOffset(uint16_t thread) {
+        std::unique_lock const lck(mtxCheckpoint);
+
+        auto it = threadPos.find(thread);
+        if (it == threadPos.end()) {
+            if (thread != 1)
+                return FileOffset::zero();
+            // Legacy single-instance view
+            const FileOffset result = fileOffset;
+            fileOffset = FileOffset::zero();
+            return result;
+        }
+        const FileOffset result = it->second.fileOffset;
+        it->second.fileOffset = FileOffset::zero();
+        if (thread == 1)
+            fileOffset = FileOffset::zero();
+        return result;
+    }
+
+    void Metadata::saveFileOffset(uint16_t thread, FileOffset newFileOffset) {
+        std::unique_lock const lck(mtxCheckpoint);
+
+        threadPosGet(thread).fileOffset = newFileOffset;
+        if (thread == 1)
+            fileOffset = newFileOffset;
     }
 
     bool Metadata::stateRead(const std::string& name, uint64_t maxSize, std::string& in) const {

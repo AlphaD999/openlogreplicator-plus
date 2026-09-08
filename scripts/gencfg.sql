@@ -257,9 +257,10 @@ BEGIN
     v_GROUP := -1;
     v_PREV := FALSE;
     FOR v_REDO IN (
-        SELECT LF.GROUP#, REGEXP_REPLACE(LF.MEMBER,'(\\"|")','\"') AS MEMBER
+        SELECT LF.GROUP#, NVL(L.THREAD#, 1) AS THREAD#, REGEXP_REPLACE(LF.MEMBER,'(\\"|")','\"') AS MEMBER
         FROM SYS.V_$LOGFILE LF
-        ORDER BY LF.GROUP# ASC, LF.IS_RECOVERY_DEST_FILE DESC, LF.MEMBER ASC
+        LEFT JOIN SYS.V_$LOG L ON L.GROUP# = LF.GROUP#
+        ORDER BY NVL(L.THREAD#, 1) ASC, LF.GROUP# ASC, LF.IS_RECOVERY_DEST_FILE DESC, LF.MEMBER ASC
     ) LOOP
         IF v_GROUP <> v_REDO.GROUP# THEN
             IF v_GROUP <> -1 THEN
@@ -267,7 +268,7 @@ BEGIN
             END IF;
 
             DBMS_OUTPUT.NEW_LINE();
-            DBMS_OUTPUT.PUT('{"group":' || v_REDO.GROUP# || ',"path":["' || v_REDO.MEMBER || '"');
+            DBMS_OUTPUT.PUT('{"thread":' || v_REDO.THREAD# || ',"group":' || v_REDO.GROUP# || ',"path":["' || v_REDO.MEMBER || '"');
             v_GROUP := v_REDO.GROUP#;
         ELSE
             DBMS_OUTPUT.PUT(',"' || v_REDO.MEMBER || '"');

@@ -21,6 +21,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #define REPLICATOR_H_
 
 #include <fstream>
+#include <map>
 #include <queue>
 #include <set>
 #include <unordered_map>
@@ -61,11 +62,13 @@ namespace OpenLogReplicator {
         std::set<Reader*> readers;
         std::vector<std::string> pathMapping;
         std::vector<std::string> redoLogsBatch;
+        // RAC thread state: true = thread closed (instance down), refreshed from V$THREAD
+        std::map<uint16_t, bool> threadClosed;
 
         void cleanArchList();
         void updateOnlineLogs() const;
         void readerDropAll();
-        static Seq getSequenceFromFileName(const Replicator* replicator, const std::string& file);
+        static Seq getSequenceFromFileName(const Replicator* replicator, const std::string& file, uint16_t& thread);
         virtual std::string getModeName() const;
         virtual bool checkConnection();
         virtual bool continueWithOnline();

@@ -611,7 +611,7 @@ namespace OpenLogReplicator {
         if (ctx->transactionSizeMax > 0 &&
             transaction->size + redoLogRecord1->size + TransactionBuffer::ROW_HEADER_TOTAL >= ctx->transactionSizeMax) {
             transactionBuffer->skipXidList.insert(transaction->xid);
-            transactionBuffer->dropTransaction(redoLogRecord1->xid, redoLogRecord1->conId);
+            transactionBuffer->dropTransaction(redoLogRecord1->xid, redoLogRecord1->conId, redoLogRecord1->thread);
             transaction->purge(ctx);
             if (transaction == lastTransaction)
                 lastTransaction = nullptr;
@@ -717,7 +717,7 @@ namespace OpenLogReplicator {
         if (ctx->transactionSizeMax > 0 && transaction->size + redoLogRecord1->size + TransactionBuffer::ROW_HEADER_TOTAL >= ctx->transactionSizeMax) {
             transaction->log(ctx, "siz ", redoLogRecord1);
             transactionBuffer->skipXidList.insert(transaction->xid);
-            transactionBuffer->dropTransaction(redoLogRecord1->xid, redoLogRecord1->conId);
+            transactionBuffer->dropTransaction(redoLogRecord1->xid, redoLogRecord1->conId, redoLogRecord1->thread);
             transaction->purge(ctx);
             if (transaction == lastTransaction)
                 lastTransaction = nullptr;
@@ -739,7 +739,7 @@ namespace OpenLogReplicator {
         Transaction* transaction = transactionBuffer->findTransaction(metadata->schema->xmlCtxDefault, xid, redoLogRecord1->conId, redoLogRecord1->thread,
                                                                     true, false, true);
         if (transaction == nullptr) {
-            const XidMap xidMap = (xid.getData() >> 32) | (static_cast<uint64_t>(redoLogRecord1->conId) << 32);
+            const XidMap xidMap = TransactionBuffer::makeXidMap(xid, redoLogRecord1->conId, redoLogRecord1->thread);
             auto brokenXidMapListIt = transactionBuffer->brokenXidMapList.find(xidMap);
             if (brokenXidMapListIt == transactionBuffer->brokenXidMapList.end()) {
                 ctx->warning(60010, "no match found for transaction rollback, skipping, SLT: " +
@@ -806,7 +806,7 @@ namespace OpenLogReplicator {
         }
 
         // Broken transaction
-        const XidMap xidMap = (redoLogRecord1->xid.getData() >> 32) | (static_cast<uint64_t>(redoLogRecord1->conId) << 32);
+        const XidMap xidMap = TransactionBuffer::makeXidMap(redoLogRecord1->xid, redoLogRecord1->conId, redoLogRecord1->thread);
         auto brokenXidMapListIt = transactionBuffer->brokenXidMapList.find(xidMap);
         if (unlikely(brokenXidMapListIt != transactionBuffer->brokenXidMapList.end()))
             transactionBuffer->brokenXidMapList.erase(xidMap);
@@ -824,6 +824,14 @@ namespace OpenLogReplicator {
         if ((redoLogRecord1->flg & OpCode::FLG_ROLLBACK_OP0504) != 0)
             transaction->rollback = true;
 
+        if (metadata->commitSorter != nullptr)
+            // Defer the flush until the low-water-mark over all redo threads passes the commit SCN
+            metadata->commitSorter->enqueueCommit(transaction, transaction->commitScn);
+        else
+            executeCommit(transaction);
+    }
+
+    void Parser::executeCommit(Transaction* transaction) {
         if ((transaction->commitScn > metadata->firstDataScn && !transaction->system) ||
             (transaction->commitScn > metadata->firstSchemaScn && transaction->system)) {
             if (transaction->begin) {
@@ -869,10 +877,31 @@ namespace OpenLogReplicator {
                 ctx->logTrace(Ctx::TRACE::TRANSACTION, "skipping transaction already committed: " + transaction->toString(ctx));
         }
 
-        transactionBuffer->dropTransaction(redoLogRecord1->xid, redoLogRecord1->conId);
+        transactionBuffer->dropTransaction(transaction->xid, transaction->conId, transaction->thread);
         transaction->purge(ctx);
         lastTransaction = nullptr;
         delete transaction;
+    }
+
+    void Parser::executeCheckpoint(const CheckpointEvent& event) {
+        builder->processCheckpoint(event.sequence, event.scn, event.timestamp, event.fileOffset, event.switchRedo);
+
+        Seq minSequence = Seq::none();
+        FileOffset minFileOffset;
+        Xid minXid;
+        transactionBuffer->checkpoint(minSequence, minFileOffset, minXid);
+        metadata->checkpoint(ctx->parserThread, event.scn, event.timestamp, event.sequence, event.fileOffset, event.bytes,
+                             minSequence, minFileOffset, minXid);
+
+        if (ctx->stopCheckpoints > 0 && metadata->isNewData(event.scn, builder->lwnIdx)) {
+            --ctx->stopCheckpoints;
+            if (ctx->stopCheckpoints == 0) {
+                ctx->info(0, "shutdown started - exhausted number of checkpoints");
+                ctx->stopSoft();
+            }
+        }
+        if (ctx->metrics != nullptr)
+            ctx->metrics->emitCheckpointsOut(1);
     }
 
     void Parser::appendToTransaction(RedoLogRecord* redoLogRecord1, RedoLogRecord* redoLogRecord2) {
@@ -966,7 +995,7 @@ namespace OpenLogReplicator {
             transaction->log(ctx, "siz1", redoLogRecord1);
             transaction->log(ctx, "siz2", redoLogRecord2);
             transactionBuffer->skipXidList.insert(transaction->xid);
-            transactionBuffer->dropTransaction(redoLogRecord1->xid, redoLogRecord1->conId);
+            transactionBuffer->dropTransaction(redoLogRecord1->xid, redoLogRecord1->conId, redoLogRecord1->thread);
             transaction->purge(ctx);
             if (transaction == lastTransaction)
                 lastTransaction = nullptr;
@@ -986,7 +1015,7 @@ namespace OpenLogReplicator {
         Transaction* transaction = transactionBuffer->findTransaction(metadata->schema->xmlCtxDefault, xid, redoLogRecord2->conId,
                                                                       redoLogRecord1->thread, true, false, true);
         if (transaction == nullptr) {
-            const XidMap xidMap = (xid.getData() >> 32) | (static_cast<uint64_t>(redoLogRecord2->conId) << 32);
+            const XidMap xidMap = TransactionBuffer::makeXidMap(xid, redoLogRecord2->conId, redoLogRecord1->thread);
             auto brokenXidMapListIt = transactionBuffer->brokenXidMapList.find(xidMap);
             if (brokenXidMapListIt == transactionBuffer->brokenXidMapList.end()) {
                 ctx->warning(60010, "no match found for transaction rollback, skipping, SLT: " +
@@ -1234,7 +1263,7 @@ namespace OpenLogReplicator {
         if (ctx->transactionSizeMax > 0 &&
             transaction->size + redoLogRecord1->size + redoLogRecord2->size + TransactionBuffer::ROW_HEADER_TOTAL >= ctx->transactionSizeMax) {
             transactionBuffer->skipXidList.insert(transaction->xid);
-            transactionBuffer->dropTransaction(redoLogRecord1->xid, redoLogRecord1->conId);
+            transactionBuffer->dropTransaction(redoLogRecord1->xid, redoLogRecord1->conId, redoLogRecord1->thread);
             transaction->purge(ctx);
             if (transaction == lastTransaction)
                 lastTransaction = nullptr;
@@ -1287,16 +1316,18 @@ namespace OpenLogReplicator {
         }
 
         // Continue started offset
-        if (metadata->fileOffset > FileOffset::zero()) {
-            if (unlikely(!metadata->fileOffset.matchesBlockSize(reader->getBlockSize())))
-                throw RedoLogException(50047, "incorrect offset start: " + metadata->fileOffset.toString() +
-                                       " - not a multiplication of block size: " + std::to_string(reader->getBlockSize()));
+        {
+            const FileOffset startOffset = metadata->takeFileOffset(thread);
+            if (startOffset > FileOffset::zero()) {
+                if (unlikely(!startOffset.matchesBlockSize(reader->getBlockSize())))
+                    throw RedoLogException(50047, "incorrect offset start: " + startOffset.toString() +
+                                           " - not a multiplication of block size: " + std::to_string(reader->getBlockSize()));
 
-            lwnConfirmedBlock = metadata->fileOffset.getBlock(reader->getBlockSize());
-            if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
-                ctx->logTrace(Ctx::TRACE::CHECKPOINT, "setting reader start position to " + metadata->fileOffset.toString() + " (block " +
-                              std::to_string(lwnConfirmedBlock) + ")");
-            metadata->fileOffset = FileOffset::zero();
+                lwnConfirmedBlock = startOffset.getBlock(reader->getBlockSize());
+                if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
+                    ctx->logTrace(Ctx::TRACE::CHECKPOINT, "setting reader start position to " + startOffset.toString() + " (block " +
+                                  std::to_string(lwnConfirmedBlock) + ")");
+            }
         }
         reader->setBufferStartEnd(FileOffset(lwnConfirmedBlock, reader->getBlockSize()),
                                   FileOffset(lwnConfirmedBlock, reader->getBlockSize()));
@@ -1510,30 +1541,49 @@ namespace OpenLogReplicator {
                         --lwnRecords;
                     }
 
+                    if (metadata->commitSorter != nullptr)
+                        // All records of this LWN have been analyzed for the thread
+                        metadata->commitSorter->setThreadWatermark(thread, lwnScn);
+
                     if (lwnScn > metadata->firstDataScn) {
                         if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
                             ctx->logTrace(Ctx::TRACE::CHECKPOINT, "on: " + lwnScn.toString());
-                        builder->processCheckpoint(sequence, lwnScn, lwnTimestamp, FileOffset(currentBlock, reader->getBlockSize()), switchRedo);
 
-                        Seq minSequence = Seq::none();
-                        FileOffset minFileOffset;
-                        Xid minXid;
-                        transactionBuffer->checkpoint(minSequence, minFileOffset, minXid);
-                        if (unlikely(ctx->isTraceSet(Ctx::TRACE::LWN)))
-                            ctx->logTrace(Ctx::TRACE::LWN, "* checkpoint: " + lwnScn.toString());
-                        metadata->checkpoint(ctx->parserThread, lwnScn, lwnTimestamp, sequence, FileOffset(currentBlock, reader->getBlockSize()),
-                                             static_cast<uint64_t>(currentBlock - lwnConfirmedBlock) * reader->getBlockSize(), minSequence,
-                                             minFileOffset, minXid);
+                        if (metadata->commitSorter != nullptr) {
+                            CheckpointEvent event;
+                            event.sequence = sequence;
+                            event.scn = lwnScn;
+                            event.timestamp = lwnTimestamp;
+                            event.fileOffset = FileOffset(currentBlock, reader->getBlockSize());
+                            event.bytes = static_cast<uint64_t>(currentBlock - lwnConfirmedBlock) * reader->getBlockSize();
+                            event.switchRedo = switchRedo;
+                            metadata->commitSorter->enqueueCheckpoint(event);
+                            if (unlikely(ctx->isTraceSet(Ctx::TRACE::LWN)))
+                                ctx->logTrace(Ctx::TRACE::LWN, "* checkpoint: " + lwnScn.toString());
+                            metadata->commitSorter->flushReady(this);
+                        } else {
+                            builder->processCheckpoint(sequence, lwnScn, lwnTimestamp, FileOffset(currentBlock, reader->getBlockSize()), switchRedo);
 
-                        if (ctx->stopCheckpoints > 0 && metadata->isNewData(lwnScn, builder->lwnIdx)) {
-                            --ctx->stopCheckpoints;
-                            if (ctx->stopCheckpoints == 0) {
-                                ctx->info(0, "shutdown started - exhausted number of checkpoints");
-                                ctx->stopSoft();
+                            Seq minSequence = Seq::none();
+                            FileOffset minFileOffset;
+                            Xid minXid;
+                            transactionBuffer->checkpoint(minSequence, minFileOffset, minXid);
+                            if (unlikely(ctx->isTraceSet(Ctx::TRACE::LWN)))
+                                ctx->logTrace(Ctx::TRACE::LWN, "* checkpoint: " + lwnScn.toString());
+                            metadata->checkpoint(ctx->parserThread, lwnScn, lwnTimestamp, sequence, FileOffset(currentBlock, reader->getBlockSize()),
+                                                 static_cast<uint64_t>(currentBlock - lwnConfirmedBlock) * reader->getBlockSize(), minSequence,
+                                                 minFileOffset, minXid);
+
+                            if (ctx->stopCheckpoints > 0 && metadata->isNewData(lwnScn, builder->lwnIdx)) {
+                                --ctx->stopCheckpoints;
+                                if (ctx->stopCheckpoints == 0) {
+                                    ctx->info(0, "shutdown started - exhausted number of checkpoints");
+                                    ctx->stopSoft();
+                                }
                             }
+                            if (ctx->metrics != nullptr)
+                                ctx->metrics->emitCheckpointsOut(1);
                         }
-                        if (ctx->metrics != nullptr)
-                            ctx->metrics->emitCheckpointsOut(1);
                     } else {
                         if (ctx->metrics != nullptr)
                             ctx->metrics->emitCheckpointsSkip(1);
@@ -1561,7 +1611,19 @@ namespace OpenLogReplicator {
                     switchRedo = true;
                     if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
                         ctx->logTrace(Ctx::TRACE::CHECKPOINT, "on: " + lwnScn.toString() + " with switch");
-                    builder->processCheckpoint(sequence, lwnScn, lwnTimestamp, FileOffset(currentBlock, reader->getBlockSize()), switchRedo);
+                    if (metadata->commitSorter != nullptr) {
+                        CheckpointEvent event;
+                        event.sequence = sequence;
+                        event.scn = lwnScn;
+                        event.timestamp = lwnTimestamp;
+                        event.fileOffset = FileOffset(currentBlock, reader->getBlockSize());
+                        event.bytes = static_cast<uint64_t>(currentBlock - lwnConfirmedBlock) * reader->getBlockSize();
+                        event.switchRedo = switchRedo;
+                        metadata->commitSorter->enqueueCheckpoint(event);
+                        metadata->commitSorter->flushReady(this);
+                    } else {
+                        builder->processCheckpoint(sequence, lwnScn, lwnTimestamp, FileOffset(currentBlock, reader->getBlockSize()), switchRedo);
+                    }
                     if (ctx->metrics != nullptr)
                         ctx->metrics->emitCheckpointsOut(1);
                 } else {
@@ -1573,7 +1635,21 @@ namespace OpenLogReplicator {
             if (ctx->softShutdown) {
                 if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
                     ctx->logTrace(Ctx::TRACE::CHECKPOINT, "on: " + lwnScn.toString() + " at exit");
-                builder->processCheckpoint(sequence, lwnScn, lwnTimestamp, FileOffset(currentBlock, reader->getBlockSize()), false);
+
+                if (metadata->commitSorter != nullptr) {
+                    CheckpointEvent event;
+                    event.sequence = sequence;
+                    event.scn = lwnScn;
+                    event.timestamp = lwnTimestamp;
+                    event.fileOffset = FileOffset(currentBlock, reader->getBlockSize());
+                    event.bytes = static_cast<uint64_t>(currentBlock - lwnConfirmedBlock) * reader->getBlockSize();
+                    event.switchRedo = false;
+                    metadata->commitSorter->enqueueCheckpoint(event);
+                    // Soft shutdown: flush everything ignoring the watermark
+                    metadata->commitSorter->flushAll(this);
+                } else {
+                    builder->processCheckpoint(sequence, lwnScn, lwnTimestamp, FileOffset(currentBlock, reader->getBlockSize()), false);
+                }
                 if (ctx->metrics != nullptr)
                     ctx->metrics->emitCheckpointsOut(1);
 
@@ -1583,7 +1659,7 @@ namespace OpenLogReplicator {
                     if (reader->getRet() == Reader::REDO_CODE::FINISHED && nextScn == Scn::none() && reader->getNextScn() != Scn::none())
                         nextScn = reader->getNextScn();
                     if (reader->getRet() == Reader::REDO_CODE::STOPPED || reader->getRet() == Reader::REDO_CODE::OVERWRITTEN)
-                        metadata->fileOffset = FileOffset(lwnConfirmedBlock, reader->getBlockSize());
+                        metadata->saveFileOffset(thread, FileOffset(lwnConfirmedBlock, reader->getBlockSize()));
                     break;
                 }
             }

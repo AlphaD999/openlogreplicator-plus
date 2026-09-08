@@ -51,6 +51,7 @@ namespace OpenLogReplicator {
         LobCtx lobCtx;
         XmlCtx* xmlCtx;
         Xid xid;
+        typeConId conId{0};
         Seq beginSequence{Seq::none()};
         Scn beginScn{Scn::none()};
         Time beginTimestamp{0};
@@ -71,7 +72,7 @@ namespace OpenLogReplicator {
 
         AttributeMap attributes;
 
-        explicit Transaction(Xid newXid, std::map<LobKey, uint8_t*>* newOrphanedLobs, XmlCtx* newXmlCtx, uint16_t thread);
+        explicit Transaction(Xid newXid, typeConId newConId, std::map<LobKey, uint8_t*>* newOrphanedLobs, XmlCtx* newXmlCtx, uint16_t thread);
 
         void add(const Metadata* metadata, TransactionBuffer* transactionBuffer, RedoLogRecord* redoLogRecord1);
         void add(const Metadata* metadata, TransactionBuffer* transactionBuffer, RedoLogRecord* redoLogRecord1, const RedoLogRecord* redoLogRecord2);

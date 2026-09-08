@@ -1,3 +1,9 @@
+2.1.0
+- enhancement: added support for Oracle RAC source databases (archives-only mode via log_archive_dest_2, per-thread positions, cross-thread commit ordering with low-water-mark flushing)
+- enhancement: new reader parameter "archives-only" to force reading only archived redo logs
+- enhancement: checkpoint files store per-thread replication positions (backward compatible with single-instance format)
+- enhancement: archived log discovery skips ASM copies (NAME starting with '+') and selects filesystem copies
+
 2.0.0
 - fix: empty command line argument prints help message
 - documentation refresh

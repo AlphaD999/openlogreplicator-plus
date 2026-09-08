@@ -54,11 +54,25 @@ namespace OpenLogReplicator {
         ss << R"({"database":")";
         Data::writeEscapeValue(ss, metadata->database);
         ss << R"(","scn":)" << metadata->checkpointScn.toString() <<
-                R"(,"resetlogs":)" << std::dec << metadata->resetlogs <<
-                R"(,"activation":)" << std::dec << metadata->activation <<
-                R"(,"time":)" << std::dec << metadata->checkpointTime.getVal() << // not read
-                R"(,"seq":)" << metadata->checkpointSequence.toString() <<
-                R"(,"offset":)" << metadata->checkpointFileOffset.toString();
+                R"(","resetlogs":)" << std::dec << metadata->resetlogs <<
+                R"(","activation":)" << std::dec << metadata->activation <<
+                R"(","time":)" << std::dec << metadata->checkpointTime.getVal() << // not read
+                R"(","seq":)" << metadata->checkpointSequence.toString() <<
+                R"(","offset":)" << metadata->checkpointFileOffset.toString();
+        if (!metadata->threadPos.empty()) {
+            ss << R"(","threads":[)";
+            bool hasThread = false;
+            for (const auto& [threadNumber, pos]: metadata->threadPos) {
+                if (hasThread)
+                    ss << ",";
+                else
+                    hasThread = true;
+                ss << R"({"thread":)" << std::dec << threadNumber <<
+                        R"(","seq":)" << pos.sequence.toString() <<
+                        R"(","offset":)" << pos.fileOffset.toString() << "}";
+            }
+            ss << "]";
+        }
         if (metadata->minSequence != Seq::none()) {
             ss << R"(,"min-tran":{)" <<
                     R"("seq":)" << metadata->minSequence.toString() <<
@@ -93,6 +107,7 @@ namespace OpenLogReplicator {
         SERIALIZER_ENDL << R"("online-redo":[)";
 
         int64_t prevGroup = -2;
+        uint16_t prevThread = 0;
         for (const RedoLog* redoLog: metadata->redoLogs) {
             if (redoLog->group == 0)
                 continue;
@@ -100,11 +115,11 @@ namespace OpenLogReplicator {
             if (prevGroup == -2)
                 ss SERIALIZER_ENDL
             <<
-            R"({"group":)" << redoLog->group << R"(,"path":[)";
+            R"({"thread":)" << redoLog->thread << R"(","group":)" << redoLog->group << R"(","path":[)";
             else
-            if (prevGroup != redoLog->group)
+            if (prevThread != redoLog->thread || prevGroup != redoLog->group)
                 ss << "]},"
-            SERIALIZER_ENDL << R"({"group":)" << redoLog->group << R"(,"path":[)";
+            SERIALIZER_ENDL << R"({"thread":)" << redoLog->thread << R"(","group":)" << redoLog->group << R"(","path":[)";
             else
             ss << ",";
 
@@ -112,6 +127,7 @@ namespace OpenLogReplicator {
             Data::writeEscapeValue(ss, redoLog->path);
             ss << R"(")";
 
+            prevThread = redoLog->thread;
             prevGroup = redoLog->group;
         }
         if (prevGroup > 0)
@@ -588,6 +604,7 @@ namespace OpenLogReplicator {
                     "sys-tabsubpart",
                     "sys-ts",
                     "sys-user",
+                    "threads",
                     "time",
                     "users",
                     "xdb-ttset"
@@ -616,6 +633,36 @@ namespace OpenLogReplicator {
                 } else {
                     metadata->sequence = Ctx::getJsonFieldU32(fileName, document, "seq");
                     metadata->fileOffset = FileOffset(Ctx::getJsonFieldU64(fileName, document, "offset"));
+                }
+
+                // Per-thread positions (RAC); old format without "threads" falls back to thread 1
+                if (document.HasMember("threads")) {
+                    const rapidjson::Value& threadsJson = Ctx::getJsonFieldA(fileName, document, "threads");
+                    for (rapidjson::SizeType i = 0; i < threadsJson.Size(); ++i) {
+                        if (!metadata->ctx->isDisableChecksSet(Ctx::DISABLE_CHECKS::JSON_TAGS)) {
+                            static const std::vector<std::string> threadsChildNames{
+                                "offset",
+                                "seq",
+                                "thread"
+                            };
+                            Ctx::checkJsonFields(fileName, threadsJson[i], threadsChildNames);
+                        }
+
+                        const uint16_t threadNumber = static_cast<uint16_t>(Ctx::getJsonFieldU32(fileName, threadsJson[i], "thread"));
+                        ThreadPos& pos = metadata->threadPosGet(threadNumber);
+                        pos.sequence = Ctx::getJsonFieldU32(fileName, threadsJson[i], "seq");
+                        pos.fileOffset = FileOffset(Ctx::getJsonFieldU64(fileName, threadsJson[i], "offset"));
+                    }
+                    // Never resume ahead of the oldest unfinished transaction (min-tran wins for thread 1)
+                    auto thread1It = metadata->threadPos.find(1);
+                    if (thread1It != metadata->threadPos.end() && thread1It->second.sequence > metadata->sequence) {
+                        thread1It->second.sequence = metadata->sequence;
+                        thread1It->second.fileOffset = metadata->fileOffset;
+                    }
+                } else {
+                    ThreadPos& pos = metadata->threadPosGet(1);
+                    pos.sequence = metadata->sequence;
+                    pos.fileOffset = metadata->fileOffset;
                 }
 
                 if (unlikely(!metadata->fileOffset.matchesBlockSize(Ctx::MIN_BLOCK_SIZE)))
@@ -678,17 +725,21 @@ namespace OpenLogReplicator {
                         if (!metadata->ctx->isDisableChecksSet(Ctx::DISABLE_CHECKS::JSON_TAGS)) {
                             static const std::vector<std::string> onlineRedoChildNames{
                                 "group",
-                                "path"
+                                "path",
+                                "thread"
                             };
                             Ctx::checkJsonFields(fileName, onlineRedoJson[i], onlineRedoChildNames);
                         }
 
                         const int group = Ctx::getJsonFieldI(fileName, onlineRedoJson[i], "group");
+                        uint16_t thread = 1;
+                        if (onlineRedoJson[i].HasMember("thread"))
+                            thread = static_cast<uint16_t>(Ctx::getJsonFieldU32(fileName, onlineRedoJson[i], "thread"));
                         const rapidjson::Value& path = Ctx::getJsonFieldA(fileName, onlineRedoJson[i], "path");
 
                         for (rapidjson::SizeType j = 0; j < path.Size(); ++j) {
                             const rapidjson::Value& pathVal = path[j];
-                            auto* redoLog = new RedoLog(group, pathVal.GetString());
+                            auto* redoLog = new RedoLog(thread, group, pathVal.GetString());
                             metadata->redoLogs.insert(redoLog);
                         }
                     }

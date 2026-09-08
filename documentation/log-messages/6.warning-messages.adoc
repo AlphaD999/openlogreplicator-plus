@@ -185,3 +185,9 @@ Remediation: Verify XML content and source XML dictionary metadata.
 
 DDL-related system data is malformed or unexpected.
 Remediation: Inspect raw DDL records and source metadata; report if reproducible.
+
+==== code 60038: "couldn't find archive log for thread: <number> seq: <number>, found: <number>, thread is closed - waiting for delayed archival (instance recovery), sleeping <number> us"
+
+On a RAC source, the archive of a closed (stopped) instance's thread is missing while later sequences exist.
+The tail archive may still be produced by instance recovery on a surviving node; OpenLogReplicator keeps waiting instead of failing.
+Remediation: Verify instance recovery/archival on the remaining nodes; if the archive never appears, restore it manually (report this issue if it persists).

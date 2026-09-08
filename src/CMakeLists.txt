@@ -70,6 +70,7 @@ list(APPEND ListBuilder
         builder/SystemTransaction.cpp)
 
 list(APPEND ListParser
+        parser/CommitSorter.cpp
         parser/Parser.cpp
         parser/Transaction.cpp
         parser/TransactionBuffer.cpp)

@@ -53,8 +53,12 @@ namespace OpenLogReplicator {
         xidTransactionMap.clear();
     }
 
+    XidMap TransactionBuffer::makeXidMap(Xid xid, typeConId conId, uint16_t thread) {
+        return (xid.getData() >> 32) | (static_cast<uint64_t>(conId) << 32) | (static_cast<uint64_t>(thread) << 48);
+    }
+
     Transaction* TransactionBuffer::findTransaction(XmlCtx* xmlCtx, Xid xid, typeConId conId, uint16_t thread, bool old, bool add, bool rollback) {
-        const XidMap xidMap = (xid.getData() >> 32) | ((static_cast<uint64_t>(conId)) << 32);
+        const XidMap xidMap = makeXidMap(xid, conId, thread);
         Transaction* transaction;
 
         auto xidTransactionMapIt = xidTransactionMap.find(xidMap);
@@ -66,7 +70,7 @@ namespace OpenLogReplicator {
             if (!add)
                 return nullptr;
 
-            transaction = new Transaction(xid, &orphanedLobs, xmlCtx, thread);
+            transaction = new Transaction(xid, conId, &orphanedLobs, xmlCtx, thread);
             {
                 ctx->parserThread->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::TRANSACTION_FIND);
                 std::unique_lock const lck(mtx);
@@ -82,8 +86,8 @@ namespace OpenLogReplicator {
         return transaction;
     }
 
-    void TransactionBuffer::dropTransaction(Xid xid, typeConId conId) {
-        const XidMap xidMap = (xid.getData() >> 32) | (static_cast<uint64_t>(conId) << 32);
+    void TransactionBuffer::dropTransaction(Xid xid, typeConId conId, uint16_t thread) {
+        const XidMap xidMap = makeXidMap(xid, conId, thread);
         {
             ctx->parserThread->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::TRANSACTION_DROP);
             std::unique_lock const lck(mtx);

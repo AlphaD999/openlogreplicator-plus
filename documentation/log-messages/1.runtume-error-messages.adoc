@@ -395,3 +395,8 @@ The file will be partially read.
 
 A message exceeds the writer buffer.
 Increase `write-buffer-max-mb` and possibly `max-mb`.
+
+==== code 10073: "RAC database detected but no archived redo logs on filesystem found - configure log_archive_dest_2 to archive redo logs to a filesystem"
+
+The source database runs in RAC mode, but no archived redo log copy is available on a regular filesystem (all copies reside in ASM).
+Remediation: Configure `log_archive_dest_2` with `LOCATION` pointing to a filesystem directory visible to OpenLogReplicator, then archive the current logs (`ALTER SYSTEM ARCHIVE LOG CURRENT` on each node).

@@ -42,7 +42,7 @@ Supported source database versions and platforms:
 * Required database options: none
 * Supports single-tenant and multi-tenant configurations
 * Supports reading from standby (Data Guard)
-* Database must run in single-instance mode (non-RAC)
+* Supports Oracle RAC source databases in archives-only mode (see xref:#rac-support[Oracle RAC deployment] below); online redo logs of a RAC database must be readable from a regular file system to be read in online mode
 
 === Database configuration
 
@@ -250,6 +250,46 @@ OpenLogReplicator uses an OCI connection (ONLINE reader) for:
 
 During active replication from online redo logs the connection is typically idle.
 No user-table data is queried at runtime; only metadata is accessed at startup.
+
+
+[[rac-support]]
+== Oracle RAC deployment
+
+OpenLogReplicator supports Oracle RAC (Real Application Clusters) source databases.
+Because online redo logs of a RAC database typically reside in ASM and cannot be read from outside the cluster, OpenLogReplicator automatically switches to *archives-only mode* when it detects a RAC database (`cluster_database = TRUE`):
+
+* Redo logs of all instances (threads) are consumed from archived log copies stored on a regular file system.
+* Transactions from all threads are delivered in a globally consistent order, sorted by commit SCN (low-water-mark model, equivalent to LogMiner).
+* Checkpoints store per-thread replication positions and remain loadable by older and newer versions.
+
+Prerequisites:
+
+. Configure an additional archive destination writing to a file system visible to OpenLogReplicator, for example:
++
+[source,sql]
+----
+ALTER SYSTEM SET LOG_ARCHIVE_DEST_2 = 'LOCATION=/archive/olr VALID_FOR=(ONLINE_LOGFILES,ALL_ROLES)' SCOPE=BOTH;
+----
++
+If no filesystem copy exists, OpenLogReplicator terminates with error code 10073.
+
+. Grant the OpenLogReplicator user access to `SYS.V_$THREAD` (in addition to the standard grants).
+
+. Run periodic archive switches on **every** node of the cluster so that transactions are archived promptly:
++
+[source,sql]
+----
+ALTER SYSTEM ARCHIVE LOG CURRENT;
+----
+
+IMPORTANT: Replication delay is bound to the archive switch interval of each node.
+Schedule frequent log switches (for example via `DBMS_SCHEDULER`) if lower latency is required.
+
+Behavior notes:
+
+* A stopped instance (closed thread) stops holding back the global output; if its tail archive is missing after a crash, OpenLogReplicator keeps waiting and emits warning 60038 until the archive is delivered by instance recovery or restored manually.
+* The `reader` parameter `"archives-only"` explicitly forces archives-only mode and overrides the automatic detection.
+* `start-seq` is interpreted with thread 1 semantics on a RAC database.
 
 
 == Source code compilation

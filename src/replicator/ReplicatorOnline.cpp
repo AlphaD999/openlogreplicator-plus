@@ -95,6 +95,7 @@ namespace OpenLogReplicator {
                 "SYS.V_$LOGFILE",
                 "SYS.V_$PARAMETER",
                 "SYS.V_$STANDBY_LOG",
+                "SYS.V_$THREAD",
                 "SYS.V_$TRANSPORTABLE_PLATFORM"
             };
             for (const auto& tableName: tables)
@@ -232,6 +233,34 @@ namespace OpenLogReplicator {
         metadata->nlsCharacterSet = getPropertyValue("NLS_CHARACTERSET");
         metadata->nlsNcharCharacterSet = getPropertyValue("NLS_NCHAR_CHARACTERSET");
 
+        // RAC detection: online redo logs in ASM are not readable from outside, switch to archives-only mode
+        const std::string clusterDatabase = getParameterValue("cluster_database");
+        if (clusterDatabase == "TRUE") {
+            metadata->rac = true;
+            ctx->info(0, "RAC database detected (cluster_database = TRUE) - switching to archives-only mode; "
+                      "redo logs must be archived to a filesystem destination (log_archive_dest_2)");
+            if (metadata->startSequence != Seq::none())
+                ctx->info(0, "start-seq is interpreted for thread 1 on a RAC database");
+
+            {
+                DatabaseStatement stmt(conn);
+                if (unlikely(ctx->isTraceSet(Ctx::TRACE::SQL)))
+                    ctx->logTrace(Ctx::TRACE::SQL, std::string(SQL_CHECK_FS_ARCHIVED_LOG));
+                stmt.createStatement(SQL_CHECK_FS_ARCHIVED_LOG);
+                uint fsArchivedLogs;
+                stmt.defineUInt(1, fsArchivedLogs);
+
+                if (stmt.executeQuery() != 0 && fsArchivedLogs == 0) {
+                    ctx->hint("run: ALTER SYSTEM SET LOG_ARCHIVE_DEST_2 = 'LOCATION=<filesystem path> VALID_FOR=(ONLINE_LOGFILES,ALL_ROLES)' SCOPE=BOTH;");
+                    throw RuntimeException(10073, "RAC database detected but no archived redo logs on filesystem found - "
+                                               "configure log_archive_dest_2 to archive redo logs to a filesystem");
+                }
+            }
+
+            if (!ctx->isFlagSet(Ctx::REDO_FLAGS::ARCH_ONLY))
+                ctx->flags |= static_cast<uint>(Ctx::REDO_FLAGS::ARCH_ONLY);
+        }
+
         ctx->info(0, "loading character mapping for " + metadata->nlsCharacterSet);
         ctx->info(0, "loading character mapping for " + metadata->nlsNcharCharacterSet);
         metadata->setNlsCharset(metadata->nlsCharacterSet, metadata->nlsNcharCharacterSet);
@@ -319,14 +348,21 @@ namespace OpenLogReplicator {
                 stmt.bindUInt(2, metadata->firstDataScn);
                 stmt.bindUInt(3, metadata->resetlogs);
             }
+            uint32_t thread;
+            stmt.defineUInt(1, thread);
             Seq sequence;
-            stmt.defineUInt(1, sequence);
+            stmt.defineUInt(2, sequence);
 
-            if (stmt.executeQuery() == 0)
+            int ret = stmt.executeQuery();
+            if (ret == 0)
                 throw BootException(10030, "getting database sequence for scn: " + metadata->firstDataScn.toString());
 
-            metadata->setSeqFileOffset(sequence, FileOffset::zero());
-            ctx->info(0, "starting sequence not found - starting with new batch with seq: " + metadata->sequence.toString());
+            // Per-thread starting sequence (single instance returns a single row for thread 1)
+            while (ret != 0) {
+                metadata->setSeqFileOffset(sequence, FileOffset::zero(), static_cast<uint16_t>(thread));
+                ctx->info(0, "starting sequence for thread: " + std::to_string(thread) + " is: " + sequence.toString());
+                ret = stmt.next();
+            }
         }
 
         if (metadata->firstDataScn == Scn::none())
@@ -1538,6 +1574,8 @@ namespace OpenLogReplicator {
             stmt.defineInt(1, group);
             std::array < char, 513 > pathStr{};
             stmt.defineString(2, pathStr.data(), pathStr.size());
+            uint32_t thread = 1;
+            stmt.defineUInt(3, thread);
             Reader* onlineReader = nullptr;
             int lastGroup = -1;
 
@@ -1550,7 +1588,7 @@ namespace OpenLogReplicator {
                 }
                 const std::string path(pathStr.data());
                 onlineReader->paths.push_back(path);
-                auto* redoLog = new RedoLog(group, pathStr.data());
+                auto* redoLog = new RedoLog(static_cast<uint16_t>(thread), group, pathStr.data());
                 metadata->redoLogs.insert(redoLog);
 
                 ret = stmt.next();
@@ -1574,17 +1612,45 @@ namespace OpenLogReplicator {
         if (!replicatorOnline->checkConnection())
             return;
 
+        // Bind the minimum expected sequence across all threads (single instance: thread 1 only)
+        Seq sequenceStart = Seq::zero();
+        for (const auto& [_, pos]: replicator->metadata->threadPos) {
+            if (pos.sequence != Seq::none() && (sequenceStart == Seq::zero() || pos.sequence < sequenceStart))
+                sequenceStart = pos.sequence;
+        }
+        if (sequenceStart == Seq::zero())
+            sequenceStart = replicator->metadata->sequence;
+
+        // Refresh RAC thread state (open/closed) for the scheduling layer
+        if (replicator->metadata->rac) {
+            DatabaseStatement stmtThread(replicatorOnline->conn);
+            if (unlikely(replicator->ctx->isTraceSet(Ctx::TRACE::SQL)))
+                replicator->ctx->logTrace(Ctx::TRACE::SQL, std::string(SQL_GET_THREAD_INFO));
+            stmtThread.createStatement(SQL_GET_THREAD_INFO);
+            uint32_t threadNumber;
+            stmtThread.defineUInt(1, threadNumber);
+            std::array < char, 33 > statusStr{};
+            stmtThread.defineString(2, statusStr.data(), statusStr.size());
+
+            int retThread = stmtThread.executeQuery();
+            while (retThread != 0) {
+                replicator->threadClosed.insert_or_assign(static_cast<uint16_t>(threadNumber),
+                                                          std::string(statusStr.data()) != "OPEN");
+                retThread = stmtThread.next();
+            }
+        }
+
         {
             DatabaseStatement stmt(replicatorOnline->conn);
             if (unlikely(replicator->ctx->isTraceSet(Ctx::TRACE::SQL))) {
                 replicator->ctx->logTrace(Ctx::TRACE::SQL, std::string(SQL_GET_ARCHIVE_LOG_LIST));
                 replicator->ctx->logTrace(Ctx::TRACE::SQL, "PARAM1: " +
-                                          replicatorOnline->metadata->sequence.toString());
+                                          sequenceStart.toString());
                 replicator->ctx->logTrace(Ctx::TRACE::SQL, "PARAM2: " + std::to_string(replicator->metadata->resetlogs));
             }
 
             stmt.createStatement(SQL_GET_ARCHIVE_LOG_LIST);
-            stmt.bindUInt(1, replicator->metadata->sequence);
+            stmt.bindUInt(1, sequenceStart);
             stmt.bindUInt(2, replicator->metadata->resetlogs);
 
             std::array < char, 513 > path{};
@@ -1595,6 +1661,8 @@ namespace OpenLogReplicator {
             stmt.defineUInt(3, firstScn);
             Scn nextScn;
             stmt.defineUInt(4, nextScn);
+            uint32_t thread;
+            stmt.defineUInt(5, thread);
 
             int ret = stmt.executeQuery();
             while (ret != 0) {
@@ -1606,6 +1674,7 @@ namespace OpenLogReplicator {
                 parser->firstScn = firstScn;
                 parser->nextScn = nextScn;
                 parser->sequence = sequence;
+                parser->thread = static_cast<uint16_t>(thread);
                 replicator->archiveRedoQueue.push(parser);
                 ret = stmt.next();
             }

@@ -38,14 +38,17 @@ namespace OpenLogReplicator {
             ",  SEQUENCE#"
             ",  FIRST_CHANGE#"
             ",  NEXT_CHANGE#"
+            ",  THREAD#"
             " FROM"
             "   SYS.V_$ARCHIVED_LOG"
             " WHERE"
             "   SEQUENCE# >= :i"
             "   AND RESETLOGS_ID = :j"
             "   AND NAME IS NOT NULL"
+            "   AND NAME NOT LIKE '+%'"
             " ORDER BY"
-            "   SEQUENCE#"
+            "   THREAD#"
+            ",  SEQUENCE#"
             ",  DEST_ID"
             ",  IS_RECOVERY_DEST_FILE DESC"
         };
@@ -120,40 +123,46 @@ namespace OpenLogReplicator {
 
         static constexpr std::string_view SQL_GET_SEQUENCE_FROM_SCN
         {
-            "SELECT MAX(SEQUENCE#) FROM ("
+            "SELECT THREAD#, MAX(SEQUENCE#) FROM ("
             "  SELECT"
-            "     SEQUENCE#"
+            "     THREAD#"
+            "   ,  SEQUENCE#"
             "   FROM"
             "     SYS.V_$LOG"
             "   WHERE"
             "     FIRST_CHANGE# - 1 <= :i"
             " UNION"
             "  SELECT"
-            "     SEQUENCE#"
+            "     THREAD#"
+            "   ,  SEQUENCE#"
             "   FROM"
             "     SYS.V_$ARCHIVED_LOG"
             "   WHERE"
             "     FIRST_CHANGE# - 1 <= :i"
             "     AND RESETLOGS_ID = :j)"
+            " GROUP BY THREAD#"
         };
 
         static constexpr std::string_view SQL_GET_SEQUENCE_FROM_SCN_STANDBY
         {
-            "SELECT MAX(SEQUENCE#) FROM ("
+            "SELECT THREAD#, MAX(SEQUENCE#) FROM ("
             "  SELECT"
-            "     SEQUENCE#"
+            "     THREAD#"
+            "   ,  SEQUENCE#"
             "   FROM"
             "     SYS.V_$STANDBY_LOG"
             "   WHERE"
             "     FIRST_CHANGE# - 1 <= :i"
             " UNION"
             "  SELECT"
-            "     SEQUENCE#"
+            "     THREAD#"
+            "   ,  SEQUENCE#"
             "   FROM"
             "     SYS.V_$ARCHIVED_LOG"
             "   WHERE"
             "     FIRST_CHANGE# - 1 <= :i"
             "     AND RESETLOGS_ID = :j)"
+            " GROUP BY THREAD#"
         };
 
         static constexpr std::string_view SQL_GET_LOGFILE_LIST
@@ -161,14 +170,36 @@ namespace OpenLogReplicator {
             "SELECT"
             "   LF.GROUP#"
             ",  LF.MEMBER"
+            ",  NVL(L.THREAD#, 1)"
             " FROM"
             "   SYS.V_$LOGFILE LF"
+            "   LEFT JOIN SYS.V_$LOG L ON"
+            "     L.GROUP# = LF.GROUP#"
             " WHERE"
-            "   TYPE = :i"
+            "   LF.TYPE = :i"
             " ORDER BY"
-            "   LF.GROUP# ASC"
+            "   NVL(L.THREAD#, 1) ASC"
+            ",  LF.GROUP# ASC"
             ",  LF.IS_RECOVERY_DEST_FILE DESC"
             ",  LF.MEMBER ASC"
+        };
+
+        static constexpr std::string_view SQL_GET_THREAD_INFO
+        {
+            "SELECT"
+            "   THREAD#"
+            ",  STATUS"
+            " FROM"
+            "   SYS.V_$THREAD"
+        };
+
+        static constexpr std::string_view SQL_CHECK_FS_ARCHIVED_LOG
+        {
+            "SELECT COUNT(*) FROM"
+            "   SYS.V_$ARCHIVED_LOG"
+            " WHERE"
+            "   NAME IS NOT NULL"
+            "   AND NAME NOT LIKE '+%'"
         };
 
         static constexpr std::string_view SQL_GET_PARAMETER

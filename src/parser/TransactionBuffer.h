@@ -72,9 +72,11 @@ namespace OpenLogReplicator {
         explicit TransactionBuffer(Ctx* newCtx);
         ~TransactionBuffer();
 
+        // Key: thread (bits 48-63), conId (bits 32-47), xid usn+slt (bits 0-31); RAC threads have independent undo usn spaces
+        static XidMap makeXidMap(Xid xid, typeConId conId, uint16_t thread);
         void purge();
         [[nodiscard]] Transaction* findTransaction(XmlCtx* xmlCtx, Xid xid, typeConId conId, uint16_t thread, bool old, bool add, bool rollback);
-        void dropTransaction(Xid xid, typeConId conId);
+        void dropTransaction(Xid xid, typeConId conId, uint16_t thread);
         void addTransactionChunk(Transaction* transaction, RedoLogRecord* redoLogRecord);
         void addTransactionChunk(Transaction* transaction, RedoLogRecord* redoLogRecord1, const RedoLogRecord* redoLogRecord2);
         void rollbackTransactionChunk(Transaction* transaction);

@@ -50,9 +50,11 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include "TransactionBuffer.h"
 
 namespace OpenLogReplicator {
-    Transaction::Transaction(Xid newXid, std::map<LobKey, uint8_t*>* newOrphanedLobs, XmlCtx* newXmlCtx, uint16_t newThread):
+    Transaction::Transaction(Xid newXid, typeConId newConId, std::map<LobKey, uint8_t*>* newOrphanedLobs, XmlCtx* newXmlCtx,
+                             uint16_t newThread):
         xmlCtx(newXmlCtx),
         xid(newXid),
+        conId(newConId),
         thread(newThread) {
         lobCtx.orphanedLobs = newOrphanedLobs;
     }

@@ -59,6 +59,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include "metadata/Metadata.h"
 #include "metadata/SchemaElement.h"
 #include "metadata/SerializerJson.h"
+#include "parser/CommitSorter.h"
 #include "parser/TransactionBuffer.h"
 #include "replicator/Replicator.h"
 #include "replicator/ReplicatorBatch.h"
@@ -494,6 +495,7 @@ namespace OpenLogReplicator {
 
             if (!ctx->isDisableChecksSet(Ctx::DISABLE_CHECKS::JSON_TAGS)) {
                 static const std::vector<std::string> readerNames {
+                    "archives-only",
                     "db-timezone",
                     "disable-checks",
                     "host-timezone",
@@ -521,6 +523,22 @@ namespace OpenLogReplicator {
                                                  ", expected: one of {0 .. 524287}");
                 if (ctx->isFlagSet(Ctx::REDO_FLAGS::DIRECT_DISABLE))
                     ctx->redoVerifyDelayUs = 500000;
+            }
+
+            // Explicit archives-only override (RAC auto-detection can set the same flag at runtime)
+            if (readerJson.HasMember("archives-only")) {
+                const rapidjson::Value& archivesOnlyJson = readerJson["archives-only"];
+                bool archivesOnly;
+                if (archivesOnlyJson.IsBool())
+                    archivesOnly = archivesOnlyJson.GetBool();
+                else if (archivesOnlyJson.IsUint64())
+                    archivesOnly = archivesOnlyJson.GetUint64() != 0;
+                else
+                    throw ConfigurationException(30001, "bad JSON, invalid \"archives-only\" value, expected: boolean or one of {0, 1}");
+                if (archivesOnly)
+                    ctx->flags |= static_cast<uint>(Ctx::REDO_FLAGS::ARCH_ONLY);
+                else
+                    ctx->flags &= ~static_cast<uint>(Ctx::REDO_FLAGS::ARCH_ONLY);
             }
 
             if (readerJson.HasMember("disable-checks")) {
@@ -608,6 +626,7 @@ namespace OpenLogReplicator {
             // METADATA
             auto* metadata = new Metadata(ctx, locales, name, startScn, startSequence, startTime, startTimeRel);
             metadatas.push_back(metadata);
+            metadata->commitSorter = new CommitSorter();
             metadata->resetElements();
             if (!debugOwner.empty())
                 metadata->users.insert(debugOwner);

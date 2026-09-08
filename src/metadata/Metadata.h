@@ -23,6 +23,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <rapidjson/document.h>
 #include <rapidjson/error/en.h>
@@ -38,6 +39,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include "../common/types/Xid.h"
 
 namespace OpenLogReplicator {
+    class CommitSorter;
     class Ctx;
     class DbIncarnation;
     class Locales;
@@ -48,6 +50,15 @@ namespace OpenLogReplicator {
     class State;
     class StateDisk;
     class Thread;
+
+    // Per-thread replication position (RAC support); single instance keeps only thread 1
+    struct ThreadPos {
+        Seq sequence{Seq::none()};
+        FileOffset fileOffset;
+        Scn firstScn{Scn::none()};
+        Scn nextScn{Scn::none()};
+        bool closed{false};
+    };
 
     class Metadata final {
     protected:
@@ -68,6 +79,7 @@ namespace OpenLogReplicator {
         State* state{nullptr};
         State* stateDisk{nullptr};
         Serializer* serializer{nullptr};
+        CommitSorter* commitSorter{nullptr};
         std::atomic<STATUS> status{STATUS::READY};
 
         // Startup parameters
@@ -79,6 +91,7 @@ namespace OpenLogReplicator {
 
         // Database parameters
         bool onlineData{false};
+        bool rac{false};
         bool suppLogDbPrimary{false};
         bool suppLogDbAll{false};
         bool logArchiveFormatCustom{false};
@@ -135,6 +148,8 @@ namespace OpenLogReplicator {
         uint64_t schemaInterval{0};
         std::set<Scn> checkpointScnList;
         std::unordered_map<Scn, bool> checkpointSchemaMap;
+        // Per-thread positions; legacy single-instance fields below are the thread 1 view
+        std::map<uint16_t, ThreadPos> threadPos;
 
         std::vector<SchemaElement*> newSchemaElements;
 
@@ -149,11 +164,16 @@ namespace OpenLogReplicator {
 
         void setNlsCharset(const std::string& nlsCharset, const std::string& nlsNcharCharset);
         void purgeRedoLogs();
-        void setSeqFileOffset(Seq newSequence, FileOffset newFileOffset);
+        void setSeqFileOffset(Seq newSequence, FileOffset newFileOffset, uint16_t thread = 1);
         void setResetlogs(typeResetlogs newResetlogs);
         void setActivation(typeActivation newActivation);
-        void setFirstNextScn(Scn newFirstScn, Scn newNextScn);
-        void setNextSequence();
+        void setFirstNextScn(Scn newFirstScn, Scn newNextScn, uint16_t thread = 1);
+        void setNextSequence(uint16_t thread = 1);
+        ThreadPos& threadPosGet(uint16_t thread);
+        [[nodiscard]] Seq threadSequence(uint16_t thread) const;
+        // Parser thread accessors (called from the parser thread itself, no locking needed)
+        FileOffset takeFileOffset(uint16_t thread);
+        void saveFileOffset(uint16_t thread, FileOffset newFileOffset);
         [[nodiscard]] bool stateRead(const std::string& name, uint64_t maxSize, std::string& in) const;
         [[nodiscard]] bool stateDiskRead(const std::string& name, uint64_t maxSize, std::string& in) const;
         [[nodiscard]] bool stateWrite(const std::string& name, Scn scn, const std::ostringstream& out) const;
