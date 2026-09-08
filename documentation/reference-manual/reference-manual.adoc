@@ -1,0 +1,85 @@
+= Reference Manual
+:author: Adam Leszczyński <aleszczynski@bersler.com>
+:revnumber: 2.0.0
+:revdate: 2026-07-17
+:icons: font
+:toc: preamble
+
+[frame="none",grid="none"]
+|====
+|[.small]#Author: {author}, version: {revnumber}, date: {revdate}#
+|====
+
+This reference manual describes runtime options, directory permissions and the main configuration for OpenLogReplicator.
+It is intended as a concise operational guide; detailed element descriptions are available in the referenced files.
+
+== Quickstart
+
+* Place the configuration file `OpenLogReplicator.json` in the process working directory (or provide it with `-f`).
+* Ensure the process user can read and write directories referenced by the configuration (checkpoints, swap, dumps).
+* Start the program with appropriate CLI options (examples below).
+
+== Command line parameters
+
+OpenLogReplicator is non-interactive.
+Supported command-line options:
+
+* `-f|--file <config file>` — path to configuration file (default: `OpenLogReplicator.json`).
+* `-p <process name>` — process name visible in system process lists (default: `OpenLogReplicator`).
+* `-r|--root` — disable the startup root-check (not recommended for production).
+* `-v|--version` — print version and exit.
+
+Example invocation:
+
+[source,bash]
+----
+./OpenLogReplicator -f ./configs/OpenLogReplicator.json -p OLReplicator
+----
+
+== Configuration
+
+All runtime configuration is defined in `OpenLogReplicator.json`.
+Refer to the configuration reference for full details: xref:../json/json.adoc[OpenLogReplicator.json].
+
+- Configuration is a single JSON object containing top-level elements such as `source`, `target`, `memory`, `format`, `filter`, and `debug`.
+- Example configuration files and templates are available in the `scripts` directory in the repository.
+
+== Output and logging
+
+- All program diagnostic and error messages are written to _stderr_.
+- Some internal JSON output may be written to _stdout_ when a test/debug option is enabled in the configuration.
+- Use conservative `log-level` and `trace` settings in production; enable higher verbosity only for troubleshooting.
+
+== Directory and file permissions
+
+The process requires appropriate filesystem permissions for directories used by the configuration:
+
+* Checkpoint directory
+- The application periodically writes checkpoint files named like `<database>-chkpt.json` and `<database>-chkpt-<scn>.json`.
+- The process user must have read, write and execute permissions on the checkpoint directory.
+
+* Swap and dump paths
+- If swapping is enabled (`swap-path`) or dumps are produced (`dump-path`), ensure those directories are writable and have sufficient free space and I/O performance.
+
+_CAUTION:_ Insufficient permissions or lack of space may cause unexpected process termination.
+
+== Runtime behavior notes
+
+* The `min-mb` / `max-mb` memory settings in the `memory` element control resident allocations and buffer sizing.
+Verify buffer minima sum remains below `max-mb`.
+* When enabling swap, prefer fast local storage to avoid high latency and unpredictable throughput.
+* Changing configuration settings in production (especially `source`/`target`, `filter` or memory parameters) should be validated in a staging environment and may require resetting checkpoints.
+
+== Troubleshooting
+
+* Use `debug` element options sparingly; `stop-*` settings will terminate the process for diagnostic capture.
+* Use `dump-redo-log` and `dump-raw-data` only when diagnosing specific issues; dumps can be large and are intended for debugging.
+* Increase `log-level` or add `trace` flags to obtain more detailed runtime information when investigating problems.
+
+== See also
+
+* xref:../json/json.adoc[OpenLogReplicator.json] — main configuration reference
+* xref:../json/4.format.adoc[format element] — output serialization options
+* xref:../json/9.memory.adoc[memory element] — memory and buffering
+* xref:../json/5.filter.adoc[filter element] — table selection and filtering rules
+* xref:../json/3.debug.adoc[debug element] — debug and diagnostics options

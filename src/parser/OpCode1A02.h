@@ -1,0 +1,55 @@
+/* Redo Log OP Code 26.2
+   Copyright (C) 2018-2026 Adam Leszczynski (aleszczynski@bersler.com)
+
+This file is part of OpenLogReplicator.
+
+This program is free software: you can redistribute it and/or
+modify it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public
+License along with this program; see the file LICENSE;
+If not, see <http://www.gnu.org/licenses/>. */
+
+#ifndef OP_CODE_1A_02_H_
+#define OP_CODE_1A_02_H_
+
+#include "../common/RedoLogRecord.h"
+#include "OpCode.h"
+
+namespace OpenLogReplicator {
+    class OpCode1A02 final : public OpCode {
+    public:
+        static void process1A02(const Ctx* ctx, RedoLogRecord* redoLogRecord) {
+            process(ctx, redoLogRecord);
+            typePos fieldPos = 0;
+            typeField fieldNum = 0;
+            typeSize fieldSize = 0;
+
+            RedoLogRecord::nextField(ctx, redoLogRecord, fieldNum, fieldPos, fieldSize, 0x1A0201);
+            // Field: 1
+            ktbRedo(ctx, redoLogRecord, fieldPos, fieldSize);
+
+            RedoLogRecord::nextField(ctx, redoLogRecord, fieldNum, fieldPos, fieldSize, 0x1A0202);
+            // Field: 2
+            kdliCommon(ctx, redoLogRecord, fieldPos, fieldSize);
+
+            RedoLogRecord::nextField(ctx, redoLogRecord, fieldNum, fieldPos, fieldSize, 0x1A0203);
+            // Field: 3`
+            kdli(ctx, redoLogRecord, fieldPos, fieldSize);
+
+            if (!RedoLogRecord::nextFieldOpt(ctx, redoLogRecord, fieldNum, fieldPos, fieldSize, 0x1A0204))
+                return;
+            // Field: 4
+            kdli(ctx, redoLogRecord, fieldPos, fieldSize);
+        }
+    };
+}
+
+#endif

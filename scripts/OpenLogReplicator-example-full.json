@@ -1,0 +1,120 @@
+{
+  "version": "2.0.0",
+  "dump-redo-log": 0,
+  "dump-raw-data": 0,
+  "dump-path": "/opt/dump",
+  "log-level": 3,
+  "trace": 0,
+  "memory": {
+    "min-mb": 64,
+    "max-mb": 1024,
+    "read-buffer-max-mb": 64,
+    "read-buffer-min-mb": 4,
+    "swap-mb": 768,
+    "swap-path": ".",
+    "unswap-buffer-min-mb": 4,
+    "write-buffer-max-mb": 64,
+    "write-buffer-min-mb": 4
+  },
+  "metrics": {
+    "type": "prometheus",
+    "bind": "127.0.0.1:8080",
+    "tag-names": "all"
+  },
+  "state": {
+    "type": "disk",
+    "path": "checkpoint",
+    "interval-s": 600,
+    "interval-mb": 100,
+    "keep-checkpoints": 100,
+    "schema-force-interval": 20
+  },
+  "source": [
+    {
+      "alias": "SOURCE",
+      "name": "DBNAME",
+      "reader": {
+        "type": "online",
+        "path-mapping": ["/db/fra", "/opt/fast-recovery-area"],
+        "redo-copy-path": "copy",
+        "user": "user1",
+        "password": "Password1",
+        "server": "//host:1521/SERVICE",
+        "host-timezone": "+00:00",
+        "log-timezone": "+00:00",
+        "db-timezone": "+00:00",
+        "disable-checks": 0
+      },
+      "format": {
+        "type": "json",
+        "db": 0,
+        "interval-dts": 0,
+        "interval-ytm": 0,
+        "attributes": 0,
+        "message": 0,
+        "xid": 0,
+        "timestamp": 0,
+        "timestamp-metadata": 0,
+        "timestamp-tz": 0,
+        "timestamp-type": 0,
+        "user-type": 0,
+        "char": 0,
+        "scn": 0,
+        "scn-type": 0,
+        "rid": 0,
+        "redo-thread": 0,
+        "unknown": 0,
+        "schema": 0,
+        "column": 0,
+        "unknown-type": 0,
+        "flush-buffer": 1048576
+      },
+      "debug": {
+        "owner": "SYSTEM",
+        "table": "OPENLOGREPLICATOR",
+        "stop-log-switches": 0,
+        "stop-checkpoints": 0,
+        "stop-transactions": 0
+      },
+      "arch": "online",
+      "flags": 0,
+      "redo-read-sleep-us": 250000,
+      "arch-read-sleep-us": 10000000,
+      "arch-read-tries": 10,
+      "redo-verify-delay-us": 250000,
+      "refresh-interval-us": 10000000,
+      "transaction-max-mb": 1000,
+      "filter": {
+        "separator": ";",
+        "table": [
+          {"owner": "OWNER1", "table": "TABLENAME1", "key": "COL1,COL2,COL3"},
+          {"owner": "OWNER1", "table": "TABLENAME2", "condition": "!([op] == 'd' && [login username] == 'USER1')"},
+          {"owner": "OWNER1", "table": "K.*", "key": "COL1,COL2,COL3", "tag": "[pk]"},
+          {"owner": "OWNER1", "table": "L.*", "tag": "[all]"},
+          {"owner": "OWNER1", "table": "M.*", "key": "COL1,COL2,COL3", "tag": "COL1,COL2"},
+          {"owner": "OWNER2", "table": "TAB.*"}
+        ],
+        "skip-xid": ["1234.ABC.12345678", "1234.0ABC.12345678", "09000D001D050000"],
+        "dump-xid": ["1234.ABC.12345679", "1234.0ABC.12345679", "09000D001D050001"]
+      }
+    }
+  ],
+  "target": [
+    {
+      "alias": "KAFKA",
+      "source": "SOURCE",
+      "writer": {
+        "type": "kafka",
+        "topic": "TOPIC",
+        "max-message-mb": 500,
+        "properties": {
+          "bootstrap.servers": "localhost:9092",
+          "properties": "enable.idempotence:true",
+          "queue.buffering.max.messages": "200000"
+        },
+        "poll-interval-us": 100000,
+        "queue-size": 65536
+      }
+    }
+  ]
+}

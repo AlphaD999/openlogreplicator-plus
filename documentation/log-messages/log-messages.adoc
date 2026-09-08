@@ -1,0 +1,45 @@
+= Log Messages Guide
+:author: Adam Leszczyński <aleszczynski@bersler.com>
+:revnumber: 2.0.0
+:revdate: 2026-07-17
+
+[frame="none",grid="none"]
+|====
+a|[.small]#Author: {author}, version: {revnumber}, date: {revdate}#
+|====
+
+This document describes log messages produced by OpenLogReplicator and explains how to interpret them.
+
+== Introduction
+
+OpenLogReplicator uses the following message levels:
+
+1. *Errors* — A feature or operation failed.
+The user should review the message and take corrective action.
+In some cases the program may abort.
+Errors can be suppressed by setting the `trace` parameter to `0`.
+Details: xref:./1.runtume-error-messages.adoc[euntime errors], xref:./2.data-error-messages.adoc[data errors], xref:./3.configuration-error-messages.adoc[configuration errors], xref:./4.redo-log-error-messages.adoc[redo-log errors], xref:./5.internal-error-messages.adoc[internal errors]
+
+2. *Warnings* — Unexpected or potentially problematic conditions that do not necessarily stop processing.
+Warnings can be suppressed by setting the `trace` parameter to `1`.
+Details: xref:./6.warning-messages.adoc[warnings], xref:./7.internal-warning-messages.adoc[internal warnings].
+
+3. *Information* — High-level program status and progress information.
+Can be suppressed by setting `trace` to `2`.
+
+4. *Debug* — Diagnostic messages useful for debugging.
+Can be suppressed by setting `trace` to `3`.
+
+5. *Trace* — Very detailed internal information for developers.
+Controlled by the `trace` parameter; `log-level` does not affect trace messages.
+
+[IMPORTANT]
+====
+By default, errors, warnings and informational messages are printed.
+The default `trace` level used by the program may include additional debug output depending on the build and startup parameters.
+====
+
+[TIP]
+====
+Trace-level messages are intended for developers and may change format without notice.
+====

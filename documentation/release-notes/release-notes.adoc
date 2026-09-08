@@ -1,0 +1,242 @@
+= Release Notes
+:author: Adam Leszczyński <aleszczynski@bersler.com>
+:revnumber: 2.0.0
+:revdate: 2026-07-17
+:url-github: https://github.com/bersler/OpenLogReplicator
+:url-db-engines: https://db-engines.com/en/ranking_trend
+:toc: preamble
+
+[frame="none",grid="none"]
+|====
+a|[.small]#Author: {author}, version: {revnumber}, date: {revdate}#
+|====
+
+This document describes the release notes of OpenLogReplicator.
+
+== Major Release 2.x - development version
+
+=== Version 2.0.0
+- fix: empty command line argument prints help message
+- documentation refresh
+- enhancement: added service state metrics
+- OpenLogReplicator.json: move memory, metrics, state parameters to global
+- fix: lowercase owner/table names in config file were not handled properly
+- enhancement: added new format for Debezium output
+- enhancement: printing information about new client network connection
+- fix: false-positive warnings appearing in offline mode:
+- enhancement: added support for big endian systems (like Arm64) for streaming to Debezium
+- enhancement: extended tracing options and updated trace-related messages
+- enhancement: new format for XID field in output
+- enhancement: unified transaction attribute names
+- enhancement: new formatting options for timestamp values
+- enhancement: printing hint about permissions for log files when file access error is encountered
+- enhancement: immediate graceful shutdown when interrupt signal is received
+- enhancement: new format parameter: redo-thread
+- enhancement: changed config field content for "scn-type", removed "timestamp-all" and added new field "timestamp-type"
+- enhancement: new format parameter: "user-type"
+- fix: multitenant db: transaction shared among PDBs causes replication to freeze
+- added support for database version 26.2 ai
+
+== Major Release 1.x - stable version
+
+=== Version 1.9.0
+- code style cleanup
+- fixed some logdump output
+- fix: data in subpartition might not be replicated in certain conditions
+- minor LOB processing fixes
+- enhancement: removed unused con-id parameter
+- updated default OCI library version to 23
+
+=== Version 1.8.7
+- minor documentation update
+- added support for database version 19.28
+- added support for database version 23ai, 26ai
+
+=== Version 1.8.6
+- fix: encrypted tablespace data causes program to stop
+- fix: in certain cases, the program might try to process data which is not available causing a crash
+
+=== Version 1.8.5
+- enhancement: the checkpoint file is updated during every redo log switch
+- fix: reading archived redo log fails when DB_RECOVERY_FILE_DEST is not set
+
+=== Version 1.8.4
+- fix: discard writer type
+- code style cleanup
+- fix: minor bug related to DDL processing
+- enhancement: print hint about incorrect file permissions
+- bug: file writer data is not flushed until the buffer is full
+- enhancement: new parameters for writer type "file": "write-buffer-flush-size"
+
+=== Version 1.8.3
+- performance improvements
+- minor documentation update
+- fix: compiler warnings
+- fix: information about changed schema
+
+=== Version 1.8.2
+- fix: IOT tables not properly skipped
+
+=== Version 1.8.1
+- fix: archived redo logs are not fully processed
+
+=== Version 1.8.0
+- code style cleanup
+- changed parameters "scn" and "scn-all" -> "scn-key"
+- enhancement: add key data to messages
+- fix: minor bug related to swapping
+- enhancement: performance optimizations
+- enhancement: add support for DDL text > 4k
+- fix: sometimes direct IO was not working
+
+=== Version 1.7.0
+- fix: welcome banner
+- code style cleanup
+- fix: dump information populated when not enabled
+- enhancement: add dictionary values for TIMEZONE database parameter
+- enhancement: add parameter -r|--root to disable root check on startup
+- fix: in rare cases column value is null instead of actual value
+- fix: when a redo log file is truncated, read error might appear
+- documentation update
+- fix: missing include for some systems
+- enhancement: thread performance information
+- enhancement: swap memory to disk in low memory situations
+
+=== Version 1.6.0
+- enhancement: add parameter -p
+- enhancement: performance optimizations
+- enhancement: add offset to payload for debugging purposes
+- enhancement: support UPDATE operations for NOT NULL columns with occasional NULL values (experimental)
+- enhancement: add JSON validation for invalid tags
+- fix: context field contains invalid value
+- fix: invalid tag in example json config file
+- fix: online redo logs are read in rare cases for archived redo log only mode
+- fix: don't write checkpoint file until the first data chunk is processed
+- fix: minor bug related to crash with large number of columns
+- fix: error: "parse error, attribute xid: not expected"
+- fix: in rare cases, the AFTER value for UPDATE is missing
+- code style cleanup
+- documentation update
+
+=== Version 1.5.0
+- code style cleanup
+- enhancement: new writer type: discard
+- minor code optimizations
+- fix: minor bug related to binary xmltype
+- fix: correctly display database error codes
+- fix: static code analyzer warnings
+- fix: checkpointing is not working for online mode after restart
+- enhancement: add an option to build statically linked binary
+- fix: don't require flag 64 to use experimental XMLTYPE support
+- fix: minor bugs related to timestamp formatting
+- minor documentation fixes
+- enhancement: refactor timestamps, add more output options
+- enhancement: collecting metrics using Prometheus
+- configuration change: moved memory options "memory-max-mb", "memory-min-mb", "read-buffer-max-mb" to "memory" group and renamed to "max-mb", "min-mb"
+
+=== Version 1.4.0
+
+- fix: date and timestamp with year before 1900 or after 2262 produce incorrect values
+- enhancement: unify gencfg.sql script for 11g and 12+
+- fix: bad checkpoint file causes startup to fail with no explanation
+- fix: fail with a too short field length message
+- code style cleanup
+- fix: LOB data handling
+- enhancement: add session information to output
+- enhancement: add row filtering based on condition
+- experimental: support for binary xmltype, added document about experimental features
+- enhancement: added support for BOOLEAN data type
+- enhancement: added support for database version 23c
+- database version 23c: set column limit to 4096
+- clang-tidy code reformatting
+
+=== Version 1.3.0
+
+- doc: updated README.md, added reference to a tutorial GitHub project
+- fix: PDB/CDB support
+- fix: unified comment style
+- fix: checkpoint file is not created when no data is replicated after start
+- fix: offline startup failed to read redo log files
+- fix: DDL operation that rearranges columns is not handled properly
+- enhancement: reload config file for schema update after the file is updated
+- fix: stacktrace when processing DDL data to protobuf format
+- fix: typo in trace message
+- enhancement: added more timestamp formatting options
+- enhancement: added support for UROWID format
+- fix: LOB handing improvement for database version 19c
+- enhancement: added timezone field for timestamp with a time zone type
+- fix: file writer path handling and file handling fixes
+- enhancement: add database name to payload data
+- enhancement: add schema information for ddl events
+- fix: correctly handling of non-ASCII characters in DDL text
+- enhancement: added support for an interval type
+- enhancement: added xmltype support
+- enhancement: added support for type timestamp with local time zone
+- fix: client stream disconnect causes replication to stop
+- enhancement: added options interval-ytm and interval-dts to control interval type output format
+- fix: minor style fixes
+- fix: network client date was not consistent when reconnected
+- fix: scn information inconsistency in transaction fix
+- enhancement: added flag 2 for "scn-format" field type to control scn values
+- enhancement: changed checkpointing mechanism to allow more frequent checkpoints
+- experimental: added partial support for binary XMLType data
+- enhancement: performance optimizations
+
+=== Version 1.2.0
+
+- doc: Introduction to OpenLogReplicator
+- fix: minor bug related to sending ddl operations to output
+- fix: minor parameter validation bug
+- fix: minor issue related to sending character data in hex format for debug purposes
+- cleanup in parameter names: renamed "max-size" "max-file-size" and "format" to "timestamp-format" for better understanding
+- doc: Command Reference Manual
+- doc: Log Messages Guide
+- doc: Installation Guide
+- doc: Release Notes
+- doc: Troubleshooting Guide
+- doc: User Manual
+- fix: treat character decoding issues as warnings
+- fix: removed obsolete example file
+- fix: removed obsolete files
+- changed "trace" parameter to "log-level"
+- changed "trace2" parameter to "trace"
+- fix: unification of log messages
+- change: config file version is "1.2.0"
+- fix: changed type of nullable field from numeric to boolean
+- fix: uncaught exception in writer module
+- fix: protocol buffer message missing scn data
+- fix: allow server to handle bad start requests for network mode
+- fix: network client display fixes and handle big messages
+- fix: network client memory release on error
+- change: removed "max-messages", "enable-idempotence" and "brokers" parameters and added "properties" parameter instead
+- change: by default checkpoint messages are not sent to output
+- fix: compilation error when Kafka is disabled
+- fix: checkpoint did not advance when no data was replicated
+
+=== Version 1.1.0
+
+- debug: trace formatting changes
+- enhancement: add handling of OP 26.2 for experimental LOB support
+- fix: experimental LOB support
+- enhancement: code style corrections
+- fix: error handling of incorrect config file
+- fix: experimental LOB supports Unicode character decoding
+- new feature: basicfile LOB (removed being experimental)
+
+==== Version 1.0.1
+
+- fix: incorrect checkpoint file when non-ascii characters are used in schema files
+- fix: incorrect message printed on error
+- fix: allow using stop-* parameters without using schemaless mode
+- enhancement: added consistency checks for experimental LOB support
+- fix: standardization of output messages
+- fix: race condition might result in transaction data loss
+- fix: experimental LOB support schema script error
+- enhancement: optimized DDL processing speed
+- enhancement: added debug info for release builds
+- enhancement: added support for database version 19.18 and 21.8
+- fix: experimental LOB data missing
+
+=== Version 1.0
+
+This is the first public release of OpenLogReplicator.

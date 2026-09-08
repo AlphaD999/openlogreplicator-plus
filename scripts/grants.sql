@@ -1,0 +1,58 @@
+/* List of grants required for user in the database
+   Copyright (C) 2018-2026 Adam Leszczynski (aleszczynski@bersler.com)
+
+This file is part of OpenLogReplicator.
+
+This program is free software: you can redistribute it and/or
+modify it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public
+License along with this program; see the file LICENSE;
+If not, see <http://www.gnu.org/licenses/>. */
+
+GRANT SELECT, FLASHBACK ON SYS.CCOL$ TO <USER>;
+GRANT SELECT, FLASHBACK ON SYS.CDEF$ TO <USER>;
+GRANT SELECT, FLASHBACK ON SYS.COL$ TO <USER>;
+GRANT SELECT, FLASHBACK ON SYS.DEFERRED_STG$ TO <USER>;
+GRANT SELECT, FLASHBACK ON SYS.ECOL$ TO <USER>;
+GRANT SELECT, FLASHBACK ON SYS.LOB$ TO <USER>;
+GRANT SELECT, FLASHBACK ON SYS.LOBCOMPPART$ TO <USER>;
+GRANT SELECT, FLASHBACK ON SYS.LOBFRAG$ TO <USER>;
+GRANT SELECT, FLASHBACK ON SYS.OBJ$ TO <USER>;
+GRANT SELECT, FLASHBACK ON SYS.TAB$ TO <USER>;
+GRANT SELECT, FLASHBACK ON SYS.TABCOMPART$ TO <USER>;
+GRANT SELECT, FLASHBACK ON SYS.TABPART$ TO <USER>;
+GRANT SELECT, FLASHBACK ON SYS.TABSUBPART$ TO <USER>;
+GRANT SELECT, FLASHBACK ON SYS.TS$ TO <USER>;
+GRANT SELECT, FLASHBACK ON SYS.USER$ TO <USER>;
+GRANT SELECT ON SYS.V_$ARCHIVED_LOG TO <USER>;
+GRANT SELECT ON SYS.V_$DATABASE TO <USER>;
+GRANT SELECT ON SYS.V_$DATABASE_INCARNATION TO <USER>;
+GRANT SELECT ON SYS.V_$LOG TO <USER>;
+GRANT SELECT ON SYS.V_$LOGFILE TO <USER>;
+GRANT SELECT ON SYS.V_$PARAMETER TO <USER>;
+GRANT SELECT ON SYS.V_$PDBS TO <USER>;
+GRANT SELECT ON SYS.V_$STANDBY_LOG TO <USER>;
+GRANT SELECT ON SYS.V_$TRANSPORTABLE_PLATFORM TO <USER>;
+GRANT SELECT, FLASHBACK ON XDB.XDB$TTSET TO <USER>;
+DECLARE
+    CURSOR C1 IS SELECT TOKSUF FROM XDB.XDB$TTSET;
+    CMD VARCHAR2(2000);
+BEGIN
+    FOR C IN C1 LOOP
+        CMD := 'GRANT SELECT, FLASHBACK ON XDB.X$NM' || C.TOKSUF || ' TO <USER>';
+        EXECUTE IMMEDIATE CMD;
+        CMD := 'GRANT SELECT, FLASHBACK ON XDB.X$QN' || C.TOKSUF || ' TO <USER>';
+        EXECUTE IMMEDIATE CMD;
+        CMD := 'GRANT SELECT, FLASHBACK ON XDB.X$PT' || C.TOKSUF || ' TO <USER>';
+        EXECUTE IMMEDIATE CMD;
+    END LOOP;
+END;
+/

@@ -1,0 +1,202 @@
+= Metrics
+:author: Adam Leszczyński <aleszczynski@bersler.com>
+:revnumber: 2.0.0
+:revdate: 2026-07-17
+:toc: preamble
+
+[frame="none",grid="none"]
+|====
+a|[.small]#Author: {author}, version: {revnumber}, date: {revdate}#
+|====
+
+This document describes the metrics published by OpenLogReplicator and how to expose them to Prometheus.
+Prometheus is the only supported metrics backend.
+
+== Prometheus
+
+OpenLogReplicator publishes the following metrics to Prometheus.
+Types are either *counter* (monotonic increase) or *gauge* (instantaneous value).
+Labels are shown where applicable.
+
+[cols="1,1,2,4",options="header"]
+|===
+| Metric name
+| Type
+| Labels
+| Description
+
+| bytes_confirmed
+| counter
+|
+| Number of bytes confirmed as processed by the output subsystem.
+
+| bytes_parsed
+| counter
+|
+| Number of bytes parsed that contained redo-log data.
+
+| bytes_read
+| counter
+|
+| Number of bytes read from redo log files.
+
+| bytes_sent
+| counter
+|
+| Number of bytes sent to outputs (for example, Kafka or network writer).
+
+| checkpoints
+| counter
+| filter={out,skip}
+| Total number of checkpoint records emitted.
+Label `filter=out` indicates checkpoints for processed streams; `filter=skip` indicates checkpoints skipped due to filtering.
+
+| checkpoint_lag
+| gauge
+|
+| Processing lag of the last checkpoint in seconds.
+Checkpoint timestamps have only 1-second precision, and clocks must be synchronized between the database host and the machine running OpenLogReplicator for this metric to be meaningful.
+
+_CAUTION:_ A reported value of `1` second can be misleading: a checkpoint created just before the current second may appear as 1s lag even if actual lag is smaller.
+
+| ddl_ops
+| counter
+| type={alter,create,drop,other,truncate}
+| Number of DDL operations observed, grouped by `type`.
+DDL events that belong to transactions skipped by filtering are *not* counted.
+
+| dml_ops
+| counter
+| type={insert,update,delete},filter={out,skip}
+| Number of DML operations observed.
+Label `filter` indicates whether the operation was processed (`out`) or skipped (`skip`) by the configured filters.
+
+_IMPORTANT:_ DML operations inside transactions that are skipped are not counted.
+
+| log_switches
+| counter
+| type={online,archived}
+| Number of redo log switches.
+Label `online` for current logs, `archived` for archived logs.
+
+| log_switches_lag
+| gauge
+| type={online,archived}
+| Lag in seconds between the timestamp of the last operation in a redo log file and the time the file was processed.
+
+| memory_allocated_mb
+| gauge
+|
+| Total memory allocated by the process in megabytes.
+
+| memory_used_total_mb
+| gauge
+|
+| Total memory currently in use in megabytes.
+
+| memory_used_mb
+| gauge
+| type={builder,parser,reader,transactions}
+| Memory used by a specific module (in megabytes).
+Modules:
+
+* `builder` — memory for building output messages;
+
+* `parser` — additional memory used by the parser;
+
+* `reader` — read buffers for redo log files;
+
+* `transactions` — memory used to track transaction state.
+
+| messages_confirmed
+| counter
+|
+| Number of messages confirmed by the output subsystem.
+
+| messages_sent
+| counter
+|
+| Number of message bytes sent to outputs (for example, Kafka or network writer).
+
+| service_state
+| gauge
+| state={initializing}
+| Value 1: Service is initializing.
+
+| service_state
+| gauge
+| state={ready}
+| Value 1: Waiting to start processing (for example, waiting for a start SCN).
+
+| service_state
+| gauge
+| state={starting}
+| Value 1: Client defined startup parameters.
+Processing has started, metadata is read from the database, and redo log reading is about to begin.
+
+| service_state
+| gauge
+| state={replicating}
+| Value 1: Replicating (normal processing state).
+
+| service_state
+| gauge
+| state={finishing}
+| Value 1: Batch processing or user has requested shutdown; all output data is purged and process is terminating.
+
+| service_state
+| gauge
+| state={aborting}
+| Value 1: Encountered a fatal error; process is terminating.
+
+| swap_operations_mb
+| counter
+| type={discard,read,write}
+| Swap space activity in megabytes.
+Types:
+
+* `discard` — 1 MB block written to swap but never read (e.g., due to rollback);
+
+* `read` — 1 MB block read from swap into memory;
+
+* `write` — 1 MB block written to swap.
+
+| swap_usage_mb
+| gauge
+|
+| Current swap usage in megabytes.
+
+| transactions
+| counter
+| type={commit,rollback},filter={out,partial,skip}
+| Number of transactions observed, labeled by outcome and filter status:
+
+* `commit` / `rollback` — transaction outcome;
+
+* `filter=out` — processed transactions;
+
+* `filter=partial` — transactions that were partially observed (typically at startup); these should produce a log message;
+
+* `filter=skip` — transactions skipped because they were already confirmed or otherwise not processed.
+
+_IMPORTANT:_ `partial` and `skip` cases normally appear only at startup or during recovery; consult logs for details.
+
+|===
+
+=== Configuration
+
+OpenLogReplicator exposes metrics via an HTTP endpoint consumable by Prometheus.
+Example configuration (JSON) enabling Prometheus metrics:
+
+[source,json]
+----
+{"metrics": {"type": "prometheus", "bind": "0.0.0.0:8080", "tag-names": "all"}}
+----
+
+Ensure Prometheus is configured to scrape the configured endpoint.
+
+=== Troubleshooting
+
+* Verify clocks are synchronized (NTP) between the database host and OpenLogReplicator for accurate time-based metrics.
+* Use logging at trace or debug level to correlate metric values with processing events.
+* Monitor memory and swap metrics to detect resource pressure that can affect performance.

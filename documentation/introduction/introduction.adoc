@@ -1,0 +1,68 @@
+= Introduction to OpenLogReplicator
+:author: Adam Leszczyński <aleszczynski@bersler.com>
+:revnumber: 2.0.0
+:revdate: 2026-07-17
+:imagesdir: ./images
+:url-github: https://github.com/bersler/OpenLogReplicator
+:url-db-engines: https://db-engines.com/en/ranking_trend
+:toc: preamble
+
+[frame="none",grid="none"]
+|====
+a|[.small]#Author: {author}, version: {revnumber}, date: {revdate}#
+|====
+
+This document introduces OpenLogReplicator and explains its role in change data capture (CDC).
+No prior knowledge is required.
+
+== Big picture
+
+Databases evolve continuously: rows are inserted, updated, and deleted by many users and processes.
+Tracking these changes reliably is essential for replication, analytics, auditing, and downstream integrations.
+OpenLogReplicator captures those changes from the database redo logs and publishes them to message systems so downstream consumers can process them in near real time.
+
+== Change data capture
+
+Change Data Capture (CDC) is the process of detecting and recording data changes so they can be propagated to other systems.
+CDC enables use cases such as replication, caching updates, audit trails, and feeding event-driven architectures without modifying application logic or requiring bulk extracts.
+
+== CDC elements
+
+A typical CDC pipeline contains:
+
+1. Change capture: read and record changes from the source system in a processable format.
+2. Storage and transformation: persist captured events and apply optional filtering, mapping, or format conversion.
+3. Delivery: transmit events to downstream systems (message brokers, streaming platforms, or other sinks).
+4. Monitoring and management: observe progress, handle failures, and manage configuration and checkpoints.
+
+.CDC Architecture
+image:cdc-architecture.png[CDC Architecture,,,]
+
+== The source database
+
+Oracle Database is a widely used commercial relational database.
+It stores transactional data and maintains consistency for concurrent workloads.
+According to {url-db-engines}[DB-Engines], Oracle Database ranks among the most popular database systems.
+
+.Oracle Database rank
+image:db-engines.png[DB Engines rank,,,link={url-db-engines}]
+
+== OpenLogReplicator
+
+OpenLogReplicator is a GPL‑licensed, open-source change-capture component developed by {author} and hosted on {url-github}[GitHub].
+It reads Oracle redo log files directly (binary read) and emits change events to message systems such as Kafka.
+Key characteristics:
+
+* Reads redo logs without relying on Oracle LogMiner.
+* Designed for minimal impact on the source database and can operate without a continuous database connection.
+* Focused on change capture and event emission; downstream storage, transformation and consumption are handled by other components.
+* Extensible - additional sinks beyond Kafka can be implemented.
+
+.Program architecture
+image:architecture.png[Program architecture,,,]
+
+[TIP]
+====
+OpenLogReplicator provides the capture and emission stage of a CDC pipeline.
+It does not implement long-term storage, complex transformations, or end-to-end delivery orchestration — those responsibilities belong to downstream components.
+====
