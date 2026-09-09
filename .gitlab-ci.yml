@@ -1,0 +1,20 @@
+stages:
+- ".pre"
+- docker-build-be
+- ".post"
+
+docker-build-be:
+  stage: docker-build-be
+  image:
+    name: "uaes-acr-registry-vpc.cn-shanghai.cr.aliyuncs.com/api-gateway/olr-realtime-env:1.0"
+    entrypoint:
+    - ''
+  tags:
+  - shared
+  script:
+  - "cd proto; /opt/protobuf/bin/protoc  OraProtoBuf.proto --cpp_out=. ; mv OraProtoBuf.pb.cc ../src/common/OraProtoBuf.pb.cpp; mv OraProtoBuf.pb.h ../src/common/OraProtoBuf.pb.h; cd .. ; mkdir cmake-build-release-amd64; cd cmake-build-release-amd64; cmake ${BUILDARGS}; cmake --build ./ --target OpenLogReplicator -j ;"
+  artifacts:
+    when: on_success
+    paths:
+      - cmake-build-release-amd64/OpenLogReplicator
+    expire_in: 2 days
