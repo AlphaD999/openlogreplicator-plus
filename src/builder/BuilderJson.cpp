@@ -17,6 +17,7 @@ You should have received a copy of the GNU Affero General Public
 License along with this program; see the file LICENSE;
 If not, see <http://www.gnu.org/licenses/>. */
 
+#include "../common/Clock.h"
 #include "../common/DbTable.h"
 #include "../common/types/RowId.h"
 #include "../metadata/Metadata.h"
@@ -24,8 +25,15 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include "BuilderJson.h"
 
 namespace OpenLogReplicator {
-    BuilderJson::BuilderJson(Ctx* newCtx, Locales* newLocales, Metadata* newMetadata, Format& newFormat, uint64_t newFlushBuffer):
-            Builder(newCtx, newLocales, newMetadata, newFormat, newFlushBuffer) {}
+    BuilderJson::BuilderJson(Ctx* newCtx, Locales* newLocales, Metadata* newMetadata, Format& newFormat, uint64_t newFlushBuffer,
+                             bool newEnvelopeOutput, std::string newTopicPrefix, std::string newSchemaChangeTopic):
+            Builder(newCtx, newLocales, newMetadata, newFormat, newFlushBuffer),
+            envelopeOutput(newEnvelopeOutput),
+            topicPrefix(std::move(newTopicPrefix)),
+            schemaChangeTopic(std::move(newSchemaChangeTopic)) {
+        // A configured schema-change topic means DDL events must be collected/reported without SHOW_DDL
+        ddlEnabled = envelopeOutput && !schemaChangeTopic.empty();
+    }
 
     void BuilderJson::columnFloat(const std::string& columnName, double value) {
         comma(hasPreviousColumn);
@@ -505,6 +513,26 @@ namespace OpenLogReplicator {
         if (newTran)
             processBeginMessage(sequence, timestamp);
 
+        // Debezium envelope: one message per DML, flat structure, no schema block
+        if (envelopeOutput) {
+            builderBegin(sequence, scn, obj, BuilderMsg::OUTPUT_BUFFER::NONE);
+            addTagData(lobCtx, xmlCtx, table, Format::VALUE_TYPE::AFTER, fileOffset);
+
+            // Debezium semantics: ts_ms is the processing time (wall clock), not the Oracle commit time
+            processTsUs = ctx->clock->getTimeUt();
+            append('{');
+            hasPreviousValue = false;
+            appendNullBefore();
+            appendAfter(lobCtx, xmlCtx, table, fileOffset);
+            appendSource(table, obj, scn, dataObj, bdba, slot);
+            append(std::string_view(R"(,"op":"c","ts_ms":)"));
+            appendDec(static_cast<uint64_t>(processTsUs) / 1000);
+            append('}');
+            builderCommit();
+            ++num;
+            return;
+        }
+
         if (format.isMessageFormatFull()) {
             comma(hasPreviousRedo);
         } else {
@@ -544,6 +572,26 @@ namespace OpenLogReplicator {
                                     typeObj obj, typeDataObj dataObj, typeDba bdba, typeSlot slot, FileOffset fileOffset) {
         if (newTran)
             processBeginMessage(sequence, timestamp);
+
+        // Debezium envelope: one message per DML, flat structure, no schema block
+        if (envelopeOutput) {
+            builderBegin(sequence, scn, obj, BuilderMsg::OUTPUT_BUFFER::NONE);
+            addTagData(lobCtx, xmlCtx, table, Format::VALUE_TYPE::AFTER, fileOffset);
+
+            // Debezium semantics: ts_ms is the processing time (wall clock), not the Oracle commit time
+            processTsUs = ctx->clock->getTimeUt();
+            append('{');
+            hasPreviousValue = false;
+            appendBefore(lobCtx, xmlCtx, table, fileOffset, true);
+            appendAfter(lobCtx, xmlCtx, table, fileOffset);
+            appendSource(table, obj, scn, dataObj, bdba, slot);
+            append(std::string_view(R"(,"op":"u","ts_ms":)"));
+            appendDec(static_cast<uint64_t>(processTsUs) / 1000);
+            append('}');
+            builderCommit();
+            ++num;
+            return;
+        }
 
         if (format.isMessageFormatFull()) {
             comma(hasPreviousRedo);
@@ -586,6 +634,26 @@ namespace OpenLogReplicator {
         if (newTran)
             processBeginMessage(sequence, timestamp);
 
+        // Debezium envelope: one message per DML, flat structure, no schema block
+        if (envelopeOutput) {
+            builderBegin(sequence, scn, obj, BuilderMsg::OUTPUT_BUFFER::NONE);
+            addTagData(lobCtx, xmlCtx, table, Format::VALUE_TYPE::BEFORE, fileOffset);
+
+            // Debezium semantics: ts_ms is the processing time (wall clock), not the Oracle commit time
+            processTsUs = ctx->clock->getTimeUt();
+            append('{');
+            hasPreviousValue = false;
+            appendBefore(lobCtx, xmlCtx, table, fileOffset, true);
+            appendNullAfter();
+            appendSource(table, obj, scn, dataObj, bdba, slot);
+            append(std::string_view(R"(,"op":"d","ts_ms":)"));
+            appendDec(static_cast<uint64_t>(processTsUs) / 1000);
+            append('}');
+            builderCommit();
+            ++num;
+            return;
+        }
+
         if (format.isMessageFormatFull()) {
             comma(hasPreviousRedo);
         } else {
@@ -624,6 +692,41 @@ namespace OpenLogReplicator {
     void BuilderJson::processDdl(Seq sequence, Scn scn, Time timestamp, const DbTable* table, typeObj obj) {
         if (newTran)
             processBeginMessage(sequence, timestamp);
+
+        // Envelope mode: DDL events must never mix into data topics (Flink's debezium-json cannot parse them).
+        // When a schema-change topic is configured they are published there as {"source":{...},"ddl":"..."};
+        // otherwise they are dropped (OLR schema tracking is driven by redo system-table changes independently).
+        if (envelopeOutput) {
+            if (schemaChangeTopic.empty())
+                return;
+
+            // Report DDL only for tables that are actually replicated (present in the dictionary/filter);
+            // DDL on system or unlisted objects is never emitted into the schema-change topic
+            if (table == nullptr)
+                return;
+
+            processTsUs = ctx->clock->getTimeUt();
+            builderBegin(sequence, scn, obj, BuilderMsg::OUTPUT_BUFFER::SCHEMA);
+            append('{');
+            hasPreviousValue = false;
+            appendDdlSource(table, obj, scn);
+            append(std::string_view(R"(,"ddl":")"));
+            if (ddlFirst != nullptr) {
+                uint8_t* chunk = ddlFirst;
+                while (chunk != nullptr) {
+                    uint8_t* chunkNext = *reinterpret_cast<uint8_t**>(chunk);
+                    const typeTransactionSize* chunkSize = reinterpret_cast<typeTransactionSize*>(chunk + sizeof(uint8_t*));
+                    const uint8_t* chunkData = chunk + sizeof(uint8_t*) + sizeof(uint64_t);
+                    appendEscape(reinterpret_cast<const char*>(chunkData), *chunkSize);
+                    chunk = chunkNext;
+                }
+            }
+            append('"');
+            append('}');
+            builderCommit();
+            ++num;
+            return;
+        }
 
         if (format.isMessageFormatFull()) {
             comma(hasPreviousRedo);
@@ -693,6 +796,10 @@ namespace OpenLogReplicator {
 
         const uint64_t messagePositionOld = messagePosition;
         hasPreviousColumn = false;
+        // Envelope mode: emit tag columns as a JSON object (Debezium-compatible Kafka key)
+        if (envelopeOutput)
+            append('{');
+
         for (uint x = 0; x < table->tagCols.size(); ++x) {
             const typeCol column = table->tagCols[x] - 1;
             if (values[column][static_cast<uint>(valueType)] == nullptr)
@@ -705,9 +812,188 @@ namespace OpenLogReplicator {
                 columnNull(table, column, true);
         }
 
+        if (envelopeOutput)
+            append('}');
+
         if (messagePosition >= messagePositionOld)
             msg->tagSize = messagePosition - messagePositionOld;
         else
             msg->tagSize = messageSize + messagePosition;
+    }
+
+    void BuilderJson::appendDdlSource(const DbTable* table, typeObj obj, Scn scn) {
+        append(std::string_view(R"("source":{)"));
+        bool prev = false;
+
+        comma(prev);
+        append(std::string_view(R"("version":"3.6.1.Final")"));
+        comma(prev);
+        append(std::string_view(R"("connector":"oracle")"));
+        comma(prev);
+        append(std::string_view(R"("name":")"));
+        appendEscape(topicPrefix);
+        append('"');
+        comma(prev);
+        append(std::string_view(R"("ts_ms":)"));
+        appendDec(static_cast<uint64_t>(processTsUs) / 1000);
+        comma(prev);
+        append(std::string_view(R"("snapshot":"false")"));
+        comma(prev);
+        append(std::string_view(R"("db":")"));
+        appendEscape(metadata->context);
+        append('"');
+
+        comma(prev);
+        if (table != nullptr) {
+            append(std::string_view(R"("schema":")"));
+            appendEscape(table->owner);
+            append(std::string_view(R"(","table":")"));
+            appendEscape(table->name);
+            append('"');
+        } else {
+            // DDL on an unknown object: report the object id
+            append(std::string_view(R"("schema":null,"table":")"));
+            append(std::string_view("OBJ_"));
+            appendDec(obj);
+            append('"');
+        }
+
+        comma(prev);
+        append(std::string_view(R"("scn":")"));
+        appendDec(scn.getData());
+        append('"');
+        comma(prev);
+        append(std::string_view(R"("commit_scn":")"));
+        appendDec(commitScn.getData());
+        append('"');
+        comma(prev);
+        append(std::string_view(R"("ts_us":)"));
+        appendDec(static_cast<uint64_t>(processTsUs));
+        comma(prev);
+        append(std::string_view(R"("ts_ns":)"));
+        appendDec(static_cast<uint64_t>(processTsUs) * 1000);
+        append('}');
+    }
+
+    void BuilderJson::appendNullBefore() {
+        append(std::string_view(R"("before":null)"));
+    }
+
+    void BuilderJson::appendNullAfter() {
+        append(std::string_view(R"(,"after":null)"));
+    }
+
+    void BuilderJson::appendSource(const DbTable* table, typeObj obj, Scn scn, typeDataObj dataObj, typeDba bdba, typeSlot slot) {
+        const time_t commitTm = commitTimestamp.toEpoch(ctx->hostTimezone);
+        const uint64_t commitMs = static_cast<uint64_t>(commitTm) * 1000;
+        const time_t beginTm = beginTimestamp.toEpoch(ctx->hostTimezone);
+        const uint64_t beginMs = static_cast<uint64_t>(beginTm) * 1000;
+
+        append(std::string_view(R"(,"source":{)"));
+        bool prev = false;
+
+        comma(prev);
+        append(std::string_view(R"("version":"3.6.1.Final")"));
+        comma(prev);
+        append(std::string_view(R"("connector":"oracle")"));
+        comma(prev);
+        append(std::string_view(R"("name":")"));
+        appendEscape(topicPrefix);
+        append('"');
+        comma(prev);
+        append(std::string_view(R"("ts_ms":)"));
+        appendDec(static_cast<uint64_t>(processTsUs) / 1000);
+        comma(prev);
+        append(std::string_view(R"("snapshot":"false")"));
+        comma(prev);
+        append(std::string_view(R"("db":")"));
+        appendEscape(metadata->context);
+        append('"');
+        comma(prev);
+        append(std::string_view(R"("sequence":null)"));
+        comma(prev);
+        append(std::string_view(R"("ts_us":)"));
+        appendDec(static_cast<uint64_t>(processTsUs));
+        comma(prev);
+        append(std::string_view(R"("ts_ns":)"));
+        appendDec(static_cast<uint64_t>(processTsUs) * 1000);
+
+        comma(prev);
+        if (table != nullptr) {
+            append(std::string_view(R"("schema":")"));
+            appendEscape(table->owner);
+            append(std::string_view(R"(","table":")"));
+            appendEscape(table->name);
+            append('"');
+        } else {
+            // No schema information: Debezium reports the table name, OLR only knows the object id
+            append(std::string_view(R"("schema":null,"table":")"));
+            append(std::string_view("OBJ_"));
+            appendDec(obj);
+            append('"');
+        }
+
+        comma(prev);
+        append(std::string_view(R"("txId":")"));
+        appendHex16Reversed(lastXid.getData());
+        append('"');
+
+        comma(prev);
+        append(std::string_view(R"("scn":")"));
+        appendDec(scn.getData());
+        append('"');
+        comma(prev);
+        append(std::string_view(R"("commit_scn":")"));
+        appendDec(commitScn.getData());
+        append('"');
+
+        // Not available from redo log
+        comma(prev);
+        append(std::string_view(R"("lcr_position":null)"));
+        comma(prev);
+        append(std::string_view(R"("rs_id":null)"));
+        comma(prev);
+        append(std::string_view(R"("ssn":0)"));
+
+        comma(prev);
+        append(std::string_view(R"("redo_thread":)"));
+        appendDec(thread);
+
+        comma(prev);
+        const auto itUserName = attributes->find(Attribute::KEY::LOGIN_USER_NAME);
+        if (itUserName != attributes->end()) {
+            append(std::string_view(R"("user_name":")"));
+            appendEscape(itUserName->second);
+            append('"');
+        } else {
+            append(std::string_view(R"("user_name":null)"));
+        }
+
+        comma(prev);
+        append(std::string_view(R"("redo_sql":null)"));
+
+        comma(prev);
+        const RowId rowId(dataObj, bdba, slot);
+        char rowIdStr[RowId::SIZE + 1];
+        rowId.toString(rowIdStr);
+        append(std::string_view(R"("row_id":")"));
+        appendArr(rowIdStr, 18);
+        append('"');
+
+        comma(prev);
+        append(std::string_view(R"("commit_ts_ms":)"));
+        appendDec(commitMs);
+        comma(prev);
+        append(std::string_view(R"("start_scn":")"));
+        appendDec(beginScn.getData());
+        append('"');
+        comma(prev);
+        append(std::string_view(R"("start_ts_ms":)"));
+        appendDec(beginMs);
+        comma(prev);
+        append(std::string_view(R"("txSeq":)"));
+        appendDec(num);
+
+        append('}');
     }
 }

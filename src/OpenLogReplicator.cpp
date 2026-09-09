@@ -482,6 +482,7 @@ namespace OpenLogReplicator {
                     "redo-verify-delay-us",
                     "refresh-interval-us",
                     "state",
+                    "topic-prefix",
                     "transaction-max-mb"
                 };
                 Ctx::checkJsonFields(configFileName, sourceJson, sourceNames);
@@ -710,7 +711,33 @@ namespace OpenLogReplicator {
             Format::XID_FORMAT xidFormat = Format::XID_FORMAT::TEXT_HEX;
 
             const std::string formatType = Ctx::getJsonFieldS(configFileName, Ctx::JSON_PARAMETER_LENGTH, formatJson, "type");
-            if (formatType == "debezium") {
+            bool envelopeOutput = false;
+            std::string topicPrefix;
+            std::string schemaChangeTopic;
+            if (formatType == "debezium-json") {
+                // Debezium-compatible flat envelope output: one message per DML, no schema block,
+                // Kafka message key is a JSON object built from the primary key columns
+                columnFormat = Format::COLUMN_FORMAT::FULL_UPD;
+                dbFormat = Format::DB_FORMAT::ALL;
+                intervalDtsFormat = Format::INTERVAL_DTS_FORMAT::ISO8601_COMMA;
+                intervalYtmFormat = Format::INTERVAL_YTM_FORMAT::STRING_YM_DASH;
+                redoThreadFormat = Format::REDO_THREAD_FORMAT::TEXT;
+                ridFormat = Format::RID_FORMAT::TEXT;
+                scnType = Format::SCN_TYPE::DEBEZIUM;
+                timestampMetadataFormat = Format::TIMESTAMP_FORMAT::UNIX_MILLI;
+                timestampType = Format::TIMESTAMP_TYPE::DEBEZIUM;
+                userType = Format::USER_TYPE::DEBEZIUM;
+                xidFormat = Format::XID_FORMAT::TEXT_REVERSED;
+                // Skip begin/commit messages: each DML is published as a standalone envelope message
+                messageFormat = static_cast<Format::MESSAGE_FORMAT>(12);
+                envelopeOutput = true;
+                if (sourceJson.HasMember("topic-prefix"))
+                    topicPrefix = Ctx::getJsonFieldS(configFileName, Ctx::JSON_PARAMETER_LENGTH, sourceJson, "topic-prefix");
+                // Optional dedicated topic for DDL/schema-change events (flat {"source":..,"ddl":..} envelope).
+                // When not set, DDL events are dropped and never mixed into data topics.
+                if (sourceJson.HasMember("schema-change-topic"))
+                    schemaChangeTopic = Ctx::getJsonFieldS(configFileName, Ctx::JSON_PARAMETER_LENGTH, sourceJson, "schema-change-topic");
+            } else if (formatType == "debezium") {
                 columnFormat = Format::COLUMN_FORMAT::FULL_UPD;
                 dbFormat = Format::DB_FORMAT::ALL;
                 intervalDtsFormat = Format::INTERVAL_DTS_FORMAT::ISO8601_COMMA;
@@ -888,8 +915,8 @@ namespace OpenLogReplicator {
             Format format(dbFormat, attributesFormat, intervalDtsFormat, intervalYtmFormat, messageFormat, ridFormat, redoThreadFormat, xidFormat,
                 timestampFormat, timestampMetadataFormat, timestampTzFormat, timestampType, charFormat, scnFormat, scnType, unknownFormat,
                 schemaFormat, columnFormat, unknownType, userType);
-            if (formatType == "json" || formatType == "debezium") {
-                builder = new BuilderJson(ctx, locales, metadata, format, flushBuffer);
+            if (formatType == "json" || formatType == "debezium" || formatType == "debezium-json") {
+                builder = new BuilderJson(ctx, locales, metadata, format, flushBuffer, envelopeOutput, topicPrefix, schemaChangeTopic);
             } else if (formatType == "protobuf") {
 #ifdef LINK_LIBRARY_PROTOBUF
                 builder = new BuilderProtobuf(ctx, locales, metadata, format, flushBuffer);
@@ -898,7 +925,7 @@ namespace OpenLogReplicator {
                                              ", expected: not \"protobuf\" since the code is not compiled");
 #endif /* LINK_LIBRARY_PROTOBUF */
             } else
-                throw ConfigurationException(30001, "bad JSON, invalid \"format\" value: " + formatType + R"(, expected: "protobuf", "json" or "debezium")");
+                throw ConfigurationException(30001, "bad JSON, invalid \"format\" value: " + formatType + R"(, expected: "protobuf", "json", "debezium" or "debezium-json")");
             builders.push_back(builder);
 
             // READER
@@ -1045,6 +1072,9 @@ namespace OpenLogReplicator {
                         if (tableElementJson.HasMember("tag")) {
                             element->tag = Ctx::getJsonFieldS(configFileName, Ctx::JSON_TAG_LENGTH, tableElementJson, "tag");
                             element->parseTag(element->tag, separator);
+                        } else if (envelopeOutput) {
+                            // Debezium-compatible: without an explicit tag, default to the primary key as Kafka key
+                            element->tagType = SchemaElement::TAG_TYPE::PK;
                         }
                     }
                 }
@@ -1190,9 +1220,25 @@ namespace OpenLogReplicator {
                 }
                 replicator2->builder->setMaxMessageMb(maxMessageMb);
 
-                const std::string topic = Ctx::getJsonFieldS(configFileName, Ctx::JSON_TOPIC_LENGTH, writerJson, "topic");
+                // Debezium-envelope mode: publish each table into its own topic [<prefix>.]<SCHEMA>.<TABLE>
+                bool writerEnvelope = false;
+                std::string writerTopicPrefix;
+                std::string writerSchemaChangeTopic;
+                if (const auto* jsonBuilder = dynamic_cast<const BuilderJson*>(replicator2->builder)) {
+                    writerEnvelope = jsonBuilder->isEnvelopeOutput();
+                    writerTopicPrefix = jsonBuilder->getTopicPrefix();
+                    writerSchemaChangeTopic = jsonBuilder->getSchemaChangeTopic();
+                }
 
-                writer = new WriterKafka(ctx, alias + "-writer", replicator2->database, replicator2->builder, replicator2->metadata, topic);
+                std::string topic;
+                if (writerJson.HasMember("topic"))
+                    topic = Ctx::getJsonFieldS(configFileName, Ctx::JSON_TOPIC_LENGTH, writerJson, "topic");
+                if (!writerEnvelope && topic.empty())
+                    throw ConfigurationException(30001, "bad JSON, missing \"topic\" for kafka writer");
+
+                writer = new WriterKafka(ctx, alias + "-writer", replicator2->database, replicator2->builder, replicator2->metadata, topic,
+                                         writerEnvelope ? writerTopicPrefix : "", writerEnvelope, writerEnvelope,
+                                         writerEnvelope ? writerSchemaChangeTopic : "");
 
                 if (writerJson.HasMember("properties")) {
                     const rapidjson::Value& propertiesJson = Ctx::getJsonFieldO(configFileName, writerJson, "properties");

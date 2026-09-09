@@ -31,6 +31,18 @@ If not, see <http://www.gnu.org/licenses/>. */
 namespace OpenLogReplicator {
     class BuilderJson final : public Builder {
     protected:
+        // Debezium-compatible envelope output: flat JSON, no schema block, one message per DML
+        bool envelopeOutput{false};
+        // Logical name reported as source.name (Debezium topic.prefix); empty when not configured
+        std::string topicPrefix;
+        // Debezium semantics: ts_ms/ts_us/ts_ns carry the wall-clock processing time (when OLR built the
+        // event), NOT the Oracle commit time. Captured in microseconds at the start of each envelope message.
+        int64_t processTsUs{0};
+        // Dedicated topic for DDL/schema-change events (Debezium schema-change topic). Empty = DDL events
+        // are dropped in envelope mode (they must never mix into data topics). Configured = DDL envelope
+        // messages {"source":{...},"ddl":"..."} are emitted and routed to this topic.
+        std::string schemaChangeTopic;
+
         bool hasPreviousValue{false};
         bool hasPreviousRedo{false};
         bool hasPreviousColumn{false};
@@ -834,8 +846,11 @@ namespace OpenLogReplicator {
             }
         }
 
-        void appendAfter(LobCtx* lobCtx, const XmlCtx* xmlCtx, const DbTable* table, FileOffset fileOffset) {
-            append(std::string_view(R"(,"after":{)"));
+        void appendAfter(LobCtx* lobCtx, const XmlCtx* xmlCtx, const DbTable* table, FileOffset fileOffset, bool first = false) {
+            if (first)
+                append(std::string_view(R"("after":{)"));
+            else
+                append(std::string_view(R"(,"after":{)"));
 
             hasPreviousColumn = false;
             if (format.columnFormat > Format::COLUMN_FORMAT::CHANGED && table != nullptr) {
@@ -872,8 +887,11 @@ namespace OpenLogReplicator {
             append('}');
         }
 
-        void appendBefore(LobCtx* lobCtx, const XmlCtx* xmlCtx, const DbTable* table, FileOffset fileOffset) {
-            append(std::string_view(R"(,"before":{)"));
+        void appendBefore(LobCtx* lobCtx, const XmlCtx* xmlCtx, const DbTable* table, FileOffset fileOffset, bool first = false) {
+            if (first)
+                append(std::string_view(R"("before":{)"));
+            else
+                append(std::string_view(R"(,"before":{)"));
 
             hasPreviousColumn = false;
             if (format.columnFormat > Format::COLUMN_FORMAT::CHANGED && table != nullptr) {
@@ -911,6 +929,14 @@ namespace OpenLogReplicator {
         }
 
 
+        // Debezium envelope: emits the "source" object (field-by-field copy of Debezium Oracle output)
+        void appendSource(const DbTable* table, typeObj obj, Scn scn, typeDataObj dataObj, typeDba bdba, typeSlot slot);
+        // Debezium schema-change envelope: emits a source object for a DDL event (no row/change context)
+        void appendDdlSource(const DbTable* table, typeObj obj, Scn scn);
+        // Emit "after"/"before" as null (insert has no before, delete has no after)
+        void appendNullBefore();
+        void appendNullAfter();
+
         void columnFloat(const std::string& columnName, double value) override;
         void columnDouble(const std::string& columnName, long double value) override;
         void columnString(const std::string& columnName) override;
@@ -930,7 +956,18 @@ namespace OpenLogReplicator {
         void addTagData(LobCtx* lobCtx, const XmlCtx* xmlCtx, const DbTable* table, Format::VALUE_TYPE valueType, FileOffset fileOffset);
 
     public:
-        BuilderJson(Ctx* newCtx, Locales* newLocales, Metadata* newMetadata, Format& newFormat, uint64_t newFlushBuffer);
+        BuilderJson(Ctx* newCtx, Locales* newLocales, Metadata* newMetadata, Format& newFormat, uint64_t newFlushBuffer,
+                    bool newEnvelopeOutput = false, std::string newTopicPrefix = "", std::string newSchemaChangeTopic = "");
+
+        [[nodiscard]] bool isEnvelopeOutput() const {
+            return envelopeOutput;
+        }
+        [[nodiscard]] const std::string& getTopicPrefix() const {
+            return topicPrefix;
+        }
+        [[nodiscard]] const std::string& getSchemaChangeTopic() const {
+            return schemaChangeTopic;
+        }
 
         void processCommit() override;
         void processCheckpoint(Seq sequence, Scn scn, Time timestamp, FileOffset fileOffset, bool redo) override;

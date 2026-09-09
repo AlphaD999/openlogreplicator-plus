@@ -23,12 +23,22 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include <librdkafka/rdkafka.h>
 
 #include <map>
+#include <unordered_map>
 #include "Writer.h"
 
 namespace OpenLogReplicator {
     class WriterKafka final : public Writer {
     protected:
         std::string topic;
+        // Per-table topic routing (Debezium-compatible naming): [<prefix>.]<SCHEMA>.<TABLE>
+        std::string topicPrefix;
+        bool dynamicTopic{false};
+        // Debezium-envelope mode: checkpoint messages are internal (position only), never published
+        bool envelopeOutput{false};
+        // Dedicated topic receiving DDL/schema-change envelope messages (empty = such messages are dropped upstream)
+        std::string schemaChangeTopic;
+        rd_kafka_topic_t* schemaChangeRkt{nullptr};
+        std::unordered_map<typeObj, rd_kafka_topic_t*> topicCache;
         char errStr[512]{};
         std::map<std::string, std::string> properties;
         rd_kafka_t* rk{nullptr};
@@ -38,6 +48,7 @@ namespace OpenLogReplicator {
         static void error_cb(rd_kafka_t* rkCb, int err, const char* reason, void* opaque);
         static void logger_cb(const rd_kafka_t* rkCb, int level, const char* fac, const char* buf);
 
+        rd_kafka_topic_t* getTopicForObj(typeObj obj);
         void sendMessage(BuilderMsg* msg) override;
         std::string getType() const override;
         void pollQueue() override;
@@ -45,7 +56,8 @@ namespace OpenLogReplicator {
     public:
         static constexpr uint64_t MAX_KAFKA_MESSAGE_MB = 953;
 
-        WriterKafka(Ctx* newCtx, std::string newAlias, std::string newDatabase, Builder* newBuilder, Metadata* newMetadata, std::string newTopic);
+        WriterKafka(Ctx* newCtx, std::string newAlias, std::string newDatabase, Builder* newBuilder, Metadata* newMetadata, std::string newTopic,
+                   std::string newTopicPrefix = "", bool newDynamicTopic = false, bool newEnvelopeOutput = false, std::string newSchemaChangeTopic = "");
         ~WriterKafka() override;
 
         void addProperty(std::string key, std::string value);

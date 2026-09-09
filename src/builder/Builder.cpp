@@ -1752,7 +1752,9 @@ namespace OpenLogReplicator {
         if (!RedoLogRecord::nextFieldOpt(ctx, redoLogRecord1, fieldNum, fieldPos, fieldSize, 0x00000A))
             return;
 
-        if (ctx->isFlagSet(Ctx::REDO_FLAGS::SHOW_DDL)) {
+        // DDL text is collected (and forwarded to the output) when SHOW_DDL is set by the user, or when the
+        // envelope/schema-change-topic mode enables DDL reporting independently of that flag (Builder::ddlEnabled)
+        if (ctx->isFlagSet(Ctx::REDO_FLAGS::SHOW_DDL) || ddlEnabled) {
             if (seq == 1) {
                 if (ddlFirst != nullptr) {
                     ctx->warning(60037, "incorrect DDL data, offset: " + redoLogRecord1->fileOffset.toString());
@@ -1796,7 +1798,7 @@ namespace OpenLogReplicator {
             return;
 
         // Field: 8
-        if (ctx->isFlagSet(Ctx::REDO_FLAGS::SHOW_DDL)) {
+        if (ctx->isFlagSet(Ctx::REDO_FLAGS::SHOW_DDL) || ddlEnabled) {
             appendDdlChunk(redoLogRecord1->data(fieldPos), fieldSize - 1U);
             if (seq == cnt) {
                 processDdl(sequence, scn, timestamp, table, redoLogRecord1->obj);

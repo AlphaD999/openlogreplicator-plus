@@ -18,21 +18,37 @@ License along with this program; see the file LICENSE;
 If not, see <http://www.gnu.org/licenses/>. */
 
 #include "../builder/Builder.h"
+#include "../common/DbTable.h"
 #include "../common/exception/ConfigurationException.h"
 #include "../common/exception/RuntimeException.h"
 #include "../metadata/Metadata.h"
+#include "../metadata/Schema.h"
 #include "WriterKafka.h"
 
 namespace OpenLogReplicator {
-    WriterKafka::WriterKafka(Ctx* newCtx, std::string newAlias, std::string newDatabase, Builder* newBuilder, Metadata* newMetadata, std::string newTopic):
+    WriterKafka::WriterKafka(Ctx* newCtx, std::string newAlias, std::string newDatabase, Builder* newBuilder, Metadata* newMetadata,
+                             std::string newTopic, std::string newTopicPrefix, bool newDynamicTopic, bool newEnvelopeOutput,
+                             std::string newSchemaChangeTopic):
             Writer(newCtx, std::move(newAlias), std::move(newDatabase), newBuilder, newMetadata),
-            topic(std::move(newTopic)) {
+            topic(std::move(newTopic)),
+            topicPrefix(std::move(newTopicPrefix)),
+            dynamicTopic(newDynamicTopic),
+            envelopeOutput(newEnvelopeOutput),
+            schemaChangeTopic(std::move(newSchemaChangeTopic)) {
         errStr[0] = 0;
     }
 
     WriterKafka::~WriterKafka() {
         if (conf != nullptr)
             rd_kafka_conf_destroy(conf);
+
+        for (auto& [_, cachedRkt]: topicCache)
+            if (cachedRkt != nullptr)
+                rd_kafka_topic_destroy(cachedRkt);
+        topicCache.clear();
+
+        if (schemaChangeRkt != nullptr)
+            rd_kafka_topic_destroy(schemaChangeRkt);
 
         if (rkt != nullptr)
             rd_kafka_topic_destroy(rkt);
@@ -83,7 +99,9 @@ namespace OpenLogReplicator {
             throw RuntimeException(10060, "Kafka failed to create producer, message: " + std::string(errStr));
         conf = nullptr;
 
-        rkt = rd_kafka_topic_new(rk, topic.c_str(), nullptr);
+        // In dynamic per-table mode the default topic is never used for data messages
+        if (!dynamicTopic)
+            rkt = rd_kafka_topic_new(rk, topic.c_str(), nullptr);
         streaming = true;
     }
 
@@ -120,20 +138,84 @@ namespace OpenLogReplicator {
                                   ", fac: " + fac + ", err: " + buf);
     }
 
+    rd_kafka_topic_t* WriterKafka::getTopicForObj(typeObj obj) {
+        if (!dynamicTopic)
+            return rkt;
+
+        auto it = topicCache.find(obj);
+        if (it != topicCache.end())
+            return it->second;
+
+        if (rk == nullptr)
+            return rkt;
+
+        // Resolve <owner>.<table> for this object. Schema::checkTableDict covers both regular tables and
+        // partition segments: Schema::addTableToDict registers the table object id, as well as every
+        // partition segment object id, into tablePartitionMap.
+        std::string topicName;
+        if (metadata != nullptr && metadata->schema != nullptr) {
+            const DbTable* table = metadata->schema->checkTableDict(obj);
+            if (table != nullptr) {
+                if (topicPrefix.empty())
+                    topicName = table->owner + "." + table->name;
+                else
+                    topicName = topicPrefix + "." + table->owner + "." + table->name;
+            }
+        }
+
+        if (topicName.empty())
+            return nullptr;
+
+        rd_kafka_topic_t* newRkt = rd_kafka_topic_new(rk, topicName.c_str(), nullptr);
+        if (newRkt == nullptr) {
+            ctx->info(0, "couldn't create Kafka topic handle: " + topicName);
+            return nullptr;
+        }
+
+        topicCache.insert_or_assign(obj, newRkt);
+        ctx->info(0, "using Kafka topic: " + topicName);
+        return newRkt;
+    }
+
     void WriterKafka::sendMessage(BuilderMsg* msg) {
         msg->ptr = reinterpret_cast<void*>(this);
+
+        // Envelope mode: checkpoint messages only advance the local replication position (LWN);
+        // they must never be published to data topics (Flink's debezium-json cannot parse them)
+        if (envelopeOutput && msg->isFlagSet(BuilderMsg::OUTPUT_BUFFER::CHECKPOINT)) {
+            confirmMessage(msg);
+            return;
+        }
+
+        rd_kafka_topic_t* targetRkt;
+        if (msg->isFlagSet(BuilderMsg::OUTPUT_BUFFER::SCHEMA)) {
+            // DDL/schema-change event: route to the dedicated schema-change topic, never to a data topic
+            if (schemaChangeRkt == nullptr && rk != nullptr && !schemaChangeTopic.empty())
+                schemaChangeRkt = rd_kafka_topic_new(rk, schemaChangeTopic.c_str(), nullptr);
+            targetRkt = schemaChangeRkt;
+        } else {
+            targetRkt = getTopicForObj(msg->obj);
+        }
+
+        if (targetRkt == nullptr) {
+            // Unknown object, or a schema-change message without a configured topic: confirm and drop (never published)
+            ctx->info(0, "dropping message that cannot be routed to a topic, object id: " + std::to_string(msg->obj));
+            confirmMessage(msg);
+            return;
+        }
+
         for (;;) {
             rd_kafka_resp_err_t err;
             if (msg->tagSize > 0)
                 err = rd_kafka_producev(rk,
-                                        RD_KAFKA_VTYPE_TOPIC, topic.c_str(),
+                                        RD_KAFKA_VTYPE_RKT, targetRkt,
                                         RD_KAFKA_VTYPE_KEY, reinterpret_cast<void*>(msg->data), static_cast<size_t>(msg->tagSize),
                                         RD_KAFKA_VTYPE_VALUE, reinterpret_cast<void*>(msg->data + msg->tagSize), static_cast<size_t>(msg->size - msg->tagSize),
                                         RD_KAFKA_VTYPE_OPAQUE, reinterpret_cast<void*>(msg),
                                         RD_KAFKA_VTYPE_END);
             else
                 err = rd_kafka_producev(rk,
-                                        RD_KAFKA_VTYPE_TOPIC, topic.c_str(),
+                                        RD_KAFKA_VTYPE_RKT, targetRkt,
                                         RD_KAFKA_VTYPE_VALUE, reinterpret_cast<void*>(msg->data), static_cast<size_t>(msg->size),
                                         RD_KAFKA_VTYPE_OPAQUE, reinterpret_cast<void*>(msg),
                                         RD_KAFKA_VTYPE_END);

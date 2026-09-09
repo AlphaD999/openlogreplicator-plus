@@ -1474,9 +1474,56 @@ namespace OpenLogReplicator {
 
         readSystemDictionaries(metadata->schema, targetScn, owner, table, options);
 
-        metadata->schema->buildMaps(owner, table, keyList, key, tagType, tagList, tag, condition, options, tablesUpdated, metadata->suppLogDbPrimary,
+        // Debezium-compatible key inference (online mode): when no explicit key is configured, fall
+        // back to the first standalone UNIQUE index of the table. Indexes backing PK/UNIQUE constraints
+        // are excluded by the query and are already resolved by Schema::buildMaps (isPK / isUnique).
+        std::vector<std::string> effectiveKeyList = keyList;
+        if (effectiveKeyList.empty()) {
+            readUniqueIndexColumns(owner, table, effectiveKeyList);
+            if (!effectiveKeyList.empty())
+                ctx->info(0, "table " + owner + "." + table + " has no primary key; using unique index columns as key");
+        }
+
+        metadata->schema->buildMaps(owner, table, effectiveKeyList, key, tagType, tagList, tag, condition, options, tablesUpdated, metadata->suppLogDbPrimary,
                                     metadata->suppLogDbAll, metadata->defaultCharacterMapId,
                                     metadata->defaultCharacterNcharMapId);
+    }
+
+    void ReplicatorOnline::readUniqueIndexColumns(const std::string& owner, const std::string& table, std::vector<std::string>& keyCols) {
+        keyCols.clear();
+        if (!checkConnection())
+            return;
+
+        try {
+            DatabaseStatement stmt(conn);
+            if (unlikely(ctx->isTraceSet(Ctx::TRACE::SQL)))
+                ctx->logTrace(Ctx::TRACE::SQL, std::string(SQL_GET_UNIQUE_INDEX_COLUMNS));
+            stmt.createStatement(SQL_GET_UNIQUE_INDEX_COLUMNS);
+            stmt.bindString(1, owner);
+            stmt.bindString(2, table);
+
+            std::array<char, SysObj::NAME_LENGTH + 1> indexName{};
+            std::array<char, SysCol::NAME_LENGTH + 1> columnName{};
+            stmt.defineString(1, indexName.data(), indexName.size());
+            stmt.defineString(2, columnName.data(), columnName.size());
+
+            // Debezium semantics: only the first fully mapped unique index is used
+            std::string firstIndexName;
+            int ret = stmt.executeQuery();
+            while (ret != 0) {
+                const std::string currentIndex(indexName.data());
+                if (firstIndexName.empty())
+                    firstIndexName = currentIndex;
+                else if (currentIndex != firstIndexName)
+                    break;
+
+                keyCols.emplace_back(columnName.data());
+                ret = stmt.next();
+            }
+        } catch (RuntimeException& ex) {
+            ctx->warning(70005, "failed to read unique index columns for " + owner + "." + table + ": " + ex.msg);
+            keyCols.clear();
+        }
     }
 
     void ReplicatorOnline::updateOnlineRedoLogData() {

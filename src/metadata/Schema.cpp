@@ -645,6 +645,23 @@ namespace OpenLogReplicator {
                 }
             }
 
+            // Pre-scan: does this table have any primary-key constraint column?
+            // If not, PK detection falls back to UNIQUE constraint columns (Debezium-compatible behavior)
+            bool hasPrimaryKey = false;
+            {
+                const SysCColKey sysCColKeyFirst(sysObj->obj, 0, 0);
+                for (auto sysCColMapKeyIt = sysCColPack.mapKey.upper_bound(sysCColKeyFirst);
+                     sysCColMapKeyIt != sysCColPack.mapKey.end() && sysCColMapKeyIt->first.obj == sysObj->obj && !hasPrimaryKey;
+                     ++sysCColMapKeyIt) {
+                    const SysCCol* sysCCol = sysCColMapKeyIt->second;
+                    const auto sysCDefMapConIt = sysCDefPack.unorderedMapKey.find(SysCDefCon(sysCCol->con));
+                    if (sysCDefMapConIt == sysCDefPack.unorderedMapKey.end())
+                        continue;
+                    if (sysCDefMapConIt->second->isPK())
+                        hasPrimaryKey = true;
+                }
+            }
+
             const RowId rowId;
             const SysColSeg sysColSegFirst(sysObj->obj, 0, rowId);
             for (auto sysColMapSegIt = sysColPack.mapKey.upper_bound(sysColSegFirst); sysColMapSegIt != sysColPack.mapKey.end() &&
@@ -698,7 +715,8 @@ namespace OpenLogReplicator {
                         continue;
                     }
                     const SysCDef* sysCDef = sysCDefMapConIt->second;
-                    if (sysCDef->isPK())
+                    // Debezium-compatible: a table without a primary key falls back to UNIQUE constraint columns
+                    if (sysCDef->isPK() || (!hasPrimaryKey && sysCDef->isUnique()))
                         ++numPk;
 
                     // Supplemental logging

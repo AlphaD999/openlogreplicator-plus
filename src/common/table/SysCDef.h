@@ -68,6 +68,10 @@ namespace OpenLogReplicator {
             return (type == CDEFTYPE::PK);
         }
 
+        [[nodiscard]] bool isUnique() const {
+            return (type == CDEFTYPE::UNIQUE);
+        }
+
         [[nodiscard]] bool isSupplementalLog() const {
             return (type == CDEFTYPE::SUPPLEMENTAL_LOG);
         }

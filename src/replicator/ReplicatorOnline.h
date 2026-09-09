@@ -613,6 +613,39 @@ namespace OpenLogReplicator {
             "   REGEXP_LIKE(U.NAME, :j)"
         };
 
+        // Debezium-compatible key inference: first standalone UNIQUE index of a table.
+        // Indexes backing PRIMARY KEY / UNIQUE constraints are excluded -- those are handled
+        // by the schema itself (SysCDef::isPK / isUnique fallback in Schema::buildMaps).
+        static constexpr std::string_view SQL_GET_UNIQUE_INDEX_COLUMNS
+        {
+            "SELECT"
+            "   IC.INDEX_NAME"
+            ",  IC.COLUMN_NAME"
+            " FROM"
+            "   SYS.ALL_IND_COLUMNS IC"
+            "   JOIN SYS.ALL_INDEXES I ON"
+            "     I.OWNER = IC.INDEX_OWNER"
+            "     AND I.INDEX_NAME = IC.INDEX_NAME"
+            "     AND I.TABLE_OWNER = IC.TABLE_OWNER"
+            "     AND I.TABLE_NAME = IC.TABLE_NAME"
+            " WHERE"
+            "   IC.TABLE_OWNER = :i"
+            "   AND IC.TABLE_NAME = :j"
+            "   AND I.UNIQUENESS = 'UNIQUE'"
+            "   AND I.STATUS = 'VALID'"
+            "   AND I.INDEX_TYPE = 'NORMAL'"
+            "   AND NOT EXISTS ("
+            "     SELECT 1 FROM SYS.ALL_CONSTRAINTS C"
+            "     WHERE C.OWNER = IC.TABLE_OWNER"
+            "       AND C.TABLE_NAME = IC.TABLE_NAME"
+            "       AND C.CONSTRAINT_TYPE IN ('P', 'U')"
+            "       AND C.INDEX_NAME = I.INDEX_NAME"
+            "   )"
+            " ORDER BY"
+            "   IC.INDEX_NAME ASC"
+            ",  IC.COLUMN_POSITION ASC"
+        };
+
         static constexpr std::string_view SQL_GET_XDB_TTSET
         {
             "SELECT"
@@ -639,6 +672,7 @@ namespace OpenLogReplicator {
         void readSystemDictionariesMetadata(Schema* schema, Scn targetScn);
         void readSystemDictionariesDetails(Schema* schema, Scn targetScn, typeUser user, typeObj obj);
         void readSystemDictionaries(Schema* schema, Scn targetScn, const std::string& owner, const std::string& table, DbTable::OPTIONS options);
+        void readUniqueIndexColumns(const std::string& owner, const std::string& table, std::vector<std::string>& keyCols);
         void createSchemaForTable(Scn targetScn, const std::string& owner, const std::string& table, const std::vector<std::string>& keyList,
                                   const std::string& key, SchemaElement::TAG_TYPE tagType, const std::vector<std::string>& tagList, const std::string& tag,
                                   const std::string& condition, DbTable::OPTIONS options, std::unordered_map<typeObj, std::string>& tablesUpdated);

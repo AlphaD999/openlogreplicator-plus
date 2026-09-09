@@ -75,7 +75,8 @@ namespace OpenLogReplicator {
             ALLOCATED  = 1 << 0,
             CONFIRMED  = 1 << 1,
             CHECKPOINT = 1 << 2,
-            REDO       = 1 << 3
+            REDO       = 1 << 3,
+            SCHEMA     = 1 << 4
         };
 
         void* ptr;
@@ -162,6 +163,7 @@ namespace OpenLogReplicator {
         uint8_t* ddlFirst{nullptr};
         uint8_t* ddlLast{nullptr};
         uint64_t ddlSize{0};
+        bool ddlEnabled{false}; // Collect & forward DDL events without requiring the SHOW_DDL flag (envelope mode)
         uint64_t id{0};
         uint64_t num{0};
         uint64_t maxMessageMb{0}; // Maximum message size able to handle by writer
