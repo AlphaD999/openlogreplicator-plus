@@ -1,0 +1,17 @@
+stages:
+- ".pre"
+- docker-build-be
+- ".post"
+
+docker-build-be:
+  stage: docker-build-be
+  image:
+    name: "uaes-acr-registry-vpc.cn-shanghai.cr.aliyuncs.com/api-gateway/olr-realtime-env:1.0"
+    entrypoint:
+    - ''
+  tags:
+  - shared
+  only:
+  - master
+  script:
+  - "ls -l"
