@@ -481,6 +481,7 @@ namespace OpenLogReplicator {
                     "redo-read-sleep-us",
                     "redo-verify-delay-us",
                     "refresh-interval-us",
+                    "schema-change-topic",
                     "state",
                     "topic-prefix",
                     "transaction-max-mb"
