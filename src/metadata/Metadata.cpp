@@ -449,16 +449,23 @@ namespace OpenLogReplicator {
         t->contextSet(Thread::CONTEXT::CPU);
     }
 
-    void Metadata::checkpoint(Thread* t, Scn newCheckpointScn, Time newCheckpointTime, Seq newCheckpointSequence, FileOffset newCheckpointFileOffset,
-                              uint64_t newCheckpointBytes, Seq newMinSequence, FileOffset newMinFileOffset, Xid newMinXid) {
+    void Metadata::checkpoint(Thread* t, uint16_t thread, Scn newCheckpointScn, Time newCheckpointTime, Seq newCheckpointSequence,
+                              FileOffset newCheckpointFileOffset, uint64_t newCheckpointBytes, Seq newMinSequence, FileOffset newMinFileOffset,
+                              Xid newMinXid) {
         {
             t->contextSet(Thread::CONTEXT::CHKPT, Thread::REASON::CHKPT);
             std::unique_lock const lck(mtxCheckpoint);
 
             checkpointScn = newCheckpointScn;
             checkpointTime = newCheckpointTime;
-            checkpointSequence = newCheckpointSequence;
-            checkpointFileOffset = newCheckpointFileOffset;
+            // checkpointSequence/checkpointFileOffset are the thread 1 view written to the checkpoint file for
+            // older versions. They must stay a matched (seq, offset) pair, so only a thread 1 event may update
+            // them - an event from another RAC thread must not reposition thread 1. If thread 1 never produced
+            // an event, no state file is written; thread 1 position is preserved in threads[] anyway.
+            if (thread == 1) {
+                checkpointSequence = newCheckpointSequence;
+                checkpointFileOffset = newCheckpointFileOffset;
+            }
             checkpointBytes += newCheckpointBytes;
             minSequence = newMinSequence;
             minFileOffset = newMinFileOffset;

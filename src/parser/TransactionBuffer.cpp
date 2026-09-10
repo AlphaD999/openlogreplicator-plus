@@ -54,7 +54,9 @@ namespace OpenLogReplicator {
     }
 
     XidMap TransactionBuffer::makeXidMap(Xid xid, typeConId conId, uint16_t thread) {
-        return (xid.getData() >> 32) | (static_cast<uint64_t>(conId) << 32) | (static_cast<uint64_t>(thread) << 48);
+        // conId is a signed 16 bit type: widen through uint16_t so that a negative value can not sign extend
+        // into the thread bits (48-63) and collide keys of separate threads
+        return (xid.getData() >> 32) | (static_cast<uint64_t>(static_cast<uint16_t>(conId)) << 32) | (static_cast<uint64_t>(thread) << 48);
     }
 
     Transaction* TransactionBuffer::findTransaction(XmlCtx* xmlCtx, Xid xid, typeConId conId, uint16_t thread, bool old, bool add, bool rollback) {

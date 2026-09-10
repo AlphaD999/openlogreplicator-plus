@@ -890,7 +890,7 @@ namespace OpenLogReplicator {
         FileOffset minFileOffset;
         Xid minXid;
         transactionBuffer->checkpoint(minSequence, minFileOffset, minXid);
-        metadata->checkpoint(ctx->parserThread, event.scn, event.timestamp, event.sequence, event.fileOffset, event.bytes,
+        metadata->checkpoint(ctx->parserThread, event.thread, event.scn, event.timestamp, event.sequence, event.fileOffset, event.bytes,
                              minSequence, minFileOffset, minXid);
 
         if (ctx->stopCheckpoints > 0 && metadata->isNewData(event.scn, builder->lwnIdx)) {
@@ -1553,6 +1553,7 @@ namespace OpenLogReplicator {
                             CheckpointEvent event;
                             event.sequence = sequence;
                             event.scn = lwnScn;
+                            event.thread = thread;
                             event.timestamp = lwnTimestamp;
                             event.fileOffset = FileOffset(currentBlock, reader->getBlockSize());
                             event.bytes = static_cast<uint64_t>(currentBlock - lwnConfirmedBlock) * reader->getBlockSize();
@@ -1570,9 +1571,10 @@ namespace OpenLogReplicator {
                             transactionBuffer->checkpoint(minSequence, minFileOffset, minXid);
                             if (unlikely(ctx->isTraceSet(Ctx::TRACE::LWN)))
                                 ctx->logTrace(Ctx::TRACE::LWN, "* checkpoint: " + lwnScn.toString());
-                            metadata->checkpoint(ctx->parserThread, lwnScn, lwnTimestamp, sequence, FileOffset(currentBlock, reader->getBlockSize()),
-                                                 static_cast<uint64_t>(currentBlock - lwnConfirmedBlock) * reader->getBlockSize(), minSequence,
-                                                 minFileOffset, minXid);
+                            metadata->checkpoint(ctx->parserThread, thread, lwnScn, lwnTimestamp, sequence,
+                                                 FileOffset(currentBlock, reader->getBlockSize()),
+                                                 static_cast<uint64_t>(currentBlock - lwnConfirmedBlock) * reader->getBlockSize(),
+                                                 minSequence, minFileOffset, minXid);
 
                             if (ctx->stopCheckpoints > 0 && metadata->isNewData(lwnScn, builder->lwnIdx)) {
                                 --ctx->stopCheckpoints;
@@ -1615,6 +1617,7 @@ namespace OpenLogReplicator {
                         CheckpointEvent event;
                         event.sequence = sequence;
                         event.scn = lwnScn;
+                        event.thread = thread;
                         event.timestamp = lwnTimestamp;
                         event.fileOffset = FileOffset(currentBlock, reader->getBlockSize());
                         event.bytes = static_cast<uint64_t>(currentBlock - lwnConfirmedBlock) * reader->getBlockSize();
@@ -1640,6 +1643,7 @@ namespace OpenLogReplicator {
                     CheckpointEvent event;
                     event.sequence = sequence;
                     event.scn = lwnScn;
+                    event.thread = thread;
                     event.timestamp = lwnTimestamp;
                     event.fileOffset = FileOffset(currentBlock, reader->getBlockSize());
                     event.bytes = static_cast<uint64_t>(currentBlock - lwnConfirmedBlock) * reader->getBlockSize();

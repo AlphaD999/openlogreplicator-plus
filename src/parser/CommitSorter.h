@@ -40,6 +40,9 @@ namespace OpenLogReplicator {
         FileOffset fileOffset;
         uint64_t bytes{0};
         bool switchRedo{false};
+        // Redo thread the event was produced by: only thread 1 may update the legacy scalar
+        // checkpoint fields (the thread 1 view), other threads update threads[] only
+        uint16_t thread{1};
     };
 
     /* Sorts commit and checkpoint events by SCN across redo threads and flushes them in a

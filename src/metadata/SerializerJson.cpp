@@ -54,13 +54,13 @@ namespace OpenLogReplicator {
         ss << R"({"database":")";
         Data::writeEscapeValue(ss, metadata->database);
         ss << R"(","scn":)" << metadata->checkpointScn.toString() <<
-                R"(","resetlogs":)" << std::dec << metadata->resetlogs <<
-                R"(","activation":)" << std::dec << metadata->activation <<
-                R"(","time":)" << std::dec << metadata->checkpointTime.getVal() << // not read
-                R"(","seq":)" << metadata->checkpointSequence.toString() <<
-                R"(","offset":)" << metadata->checkpointFileOffset.toString();
+                R"(,"resetlogs":)" << std::dec << metadata->resetlogs <<
+                R"(,"activation":)" << std::dec << metadata->activation <<
+                R"(,"time":)" << std::dec << metadata->checkpointTime.getVal() << // not read
+                R"(,"seq":)" << metadata->checkpointSequence.toString() <<
+                R"(,"offset":)" << metadata->checkpointFileOffset.toString();
         if (!metadata->threadPos.empty()) {
-            ss << R"(","threads":[)";
+            ss << R"(,"threads":[)";
             bool hasThread = false;
             for (const auto& [threadNumber, pos]: metadata->threadPos) {
                 if (hasThread)
@@ -68,8 +68,8 @@ namespace OpenLogReplicator {
                 else
                     hasThread = true;
                 ss << R"({"thread":)" << std::dec << threadNumber <<
-                        R"(","seq":)" << pos.sequence.toString() <<
-                        R"(","offset":)" << pos.fileOffset.toString() << "}";
+                        R"(,"seq":)" << pos.sequence.toString() <<
+                        R"(,"offset":)" << pos.fileOffset.toString() << "}";
             }
             ss << "]";
         }
@@ -115,11 +115,11 @@ namespace OpenLogReplicator {
             if (prevGroup == -2)
                 ss SERIALIZER_ENDL
             <<
-            R"({"thread":)" << redoLog->thread << R"(","group":)" << redoLog->group << R"(","path":[)";
+            R"({"thread":)" << redoLog->thread << R"(,"group":)" << redoLog->group << R"(,"path":[)";
             else
             if (prevThread != redoLog->thread || prevGroup != redoLog->group)
                 ss << "]},"
-            SERIALIZER_ENDL << R"({"thread":)" << redoLog->thread << R"(","group":)" << redoLog->group << R"(","path":[)";
+            SERIALIZER_ENDL << R"({"thread":)" << redoLog->thread << R"(,"group":)" << redoLog->group << R"(,"path":[)";
             else
             ss << ",";
 

@@ -190,8 +190,9 @@ namespace OpenLogReplicator {
         void setStatusStarting(Thread* t);
         void setStatusReplicating(Thread* t);
         void wakeUp(Thread* t);
-        void checkpoint(Thread* t, Scn newCheckpointScn, Time newCheckpointTime, Seq newCheckpointSequence, FileOffset newCheckpointFileOffset,
-                        uint64_t newCheckpointBytes, Seq newMinSequence, FileOffset newMinFileOffset, Xid newMinXid);
+        void checkpoint(Thread* t, uint16_t thread, Scn newCheckpointScn, Time newCheckpointTime, Seq newCheckpointSequence,
+                        FileOffset newCheckpointFileOffset, uint64_t newCheckpointBytes, Seq newMinSequence, FileOffset newMinFileOffset,
+                        Xid newMinXid);
         void writeCheckpoint(Thread* t, bool force);
         void readCheckpoints();
         void readCheckpoint(Scn scn);
