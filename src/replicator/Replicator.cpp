@@ -170,6 +170,12 @@ namespace OpenLogReplicator {
             metadata->readCheckpoints();
             if (!ctx->isFlagSet(Ctx::REDO_FLAGS::ARCH_ONLY))
                 updateOnlineRedoLogData();
+            else if (metadata->resetlogs == 0)
+                // Archives-only mode (configured explicitly, or a RAC database detected automatically): online
+                // redo log data is not read, but the resetlogs of the current incarnation is still needed to
+                // locate the starting sequence. Read it from V$DATABASE_INCARNATION - a view query, no online
+                // redo log file is touched. A resetlogs already known from a checkpoint file wins.
+                loadIncarnations();
             ctx->info(0, "timezone: " + Data::timezoneToString(-timezone) + ", db-timezone: " + Data::timezoneToString(metadata->dbTimezone) +
                       ", log-timezone: " + Data::timezoneToString(ctx->logTimezone) + ", host-timezone: " + Data::timezoneToString(ctx->hostTimezone));
 
@@ -637,6 +643,10 @@ namespace OpenLogReplicator {
         return p1->sequence > p2->sequence;
     }
 
+    void Replicator::loadIncarnations() {
+        // No database connection in this mode (offline / batch): a checkpoint file has to provide everything
+    }
+
     void Replicator::updateResetlogs() {
         contextSet(CONTEXT::MUTEX, REASON::REPLICATOR_UPDATE);
         std::unique_lock const lck(metadata->mtxCheckpoint);
@@ -648,18 +658,21 @@ namespace OpenLogReplicator {
             }
         }
 
-        // Resetlogs is changed
-        for (const DbIncarnation* oi: metadata->dbIncarnations) {
-            if (oi->resetlogsScn == metadata->nextScn &&
-                metadata->dbIncarnationCurrent->resetlogs == metadata->resetlogs &&
-                oi->priorIncarnation == metadata->dbIncarnationCurrent->incarnation) {
-                ctx->info(0, "new resetlogs detected: " + std::to_string(oi->resetlogs));
-                metadata->setResetlogs(oi->resetlogs);
-                metadata->sequence = Seq::zero();
-                metadata->fileOffset = FileOffset::zero();
-                metadata->threadPos.clear();
-                contextSet(CONTEXT::CPU);
-                return;
+        // Resetlogs is changed. Guard against a null current incarnation (the list can be non-empty while
+        // nothing matched) - that case is reported as error 10045 below instead of dereferencing a null pointer.
+        if (metadata->dbIncarnationCurrent != nullptr) {
+            for (const DbIncarnation* oi: metadata->dbIncarnations) {
+                if (oi->resetlogsScn == metadata->nextScn &&
+                    metadata->dbIncarnationCurrent->resetlogs == metadata->resetlogs &&
+                    oi->priorIncarnation == metadata->dbIncarnationCurrent->incarnation) {
+                    ctx->info(0, "new resetlogs detected: " + std::to_string(oi->resetlogs));
+                    metadata->setResetlogs(oi->resetlogs);
+                    metadata->sequence = Seq::zero();
+                    metadata->fileOffset = FileOffset::zero();
+                    metadata->threadPos.clear();
+                    contextSet(CONTEXT::CPU);
+                    return;
+                }
             }
         }
 

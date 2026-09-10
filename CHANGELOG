@@ -3,6 +3,8 @@
 - enhancement: new reader parameter "archives-only" to force reading only archived redo logs
 - enhancement: checkpoint files store per-thread replication positions (backward compatible with single-instance format)
 - enhancement: archived log discovery skips ASM copies (NAME starting with '+') and selects filesystem copies
+- fix: archives-only mode reads the current incarnation (resetlogs) from V$DATABASE_INCARNATION, so a RAC database (or an explicit archives-only reader) starts without a manually prepared state file - previously failing with error 10030
+- fix: warning 60039 when the reader parameter "archives-only": false is ignored on a RAC source database
 
 2.0.0
 - fix: empty command line argument prints help message

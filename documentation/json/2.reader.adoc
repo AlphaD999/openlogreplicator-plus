@@ -56,6 +56,7 @@ Use with caution and prefer enabling checks in production.
 |Force (`true`) or forbid (`false`) reading archived redo logs only, skipping online redo logs.
 Equivalent to flag `0x0001` in `flags`.
 When unset, a RAC source database automatically enables archives-only mode (online redo logs in ASM are not readable externally); single-instance databases keep the default online mode.
+A RAC database can not leave archives-only mode: `false` is ignored there and warning 60039 is emitted.
 
 |`host-timezone`
 |_string_, format: `+HH:MM` or `-HH:MM`, default: host timezone

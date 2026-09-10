@@ -191,3 +191,9 @@ Remediation: Inspect raw DDL records and source metadata; report if reproducible
 On a RAC source, the archive of a closed (stopped) instance's thread is missing while later sequences exist.
 The tail archive may still be produced by instance recovery on a surviving node; OpenLogReplicator keeps waiting instead of failing.
 Remediation: Verify instance recovery/archival on the remaining nodes; if the archive never appears, restore it manually (report this issue if it persists).
+
+==== code 60039: "RAC database detected - archives-only mode can not be disabled, the reader parameter \"archives-only\": false is ignored"
+
+A RAC source database always runs in archives-only mode, because online redo logs of a RAC database reside in ASM and are not readable from outside the cluster.
+An explicit `"archives-only": false` in the reader configuration therefore has no effect on a RAC database.
+Remediation: Remove the parameter to silence the warning; only a non-RAC database can use online mode.

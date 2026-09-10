@@ -239,6 +239,8 @@ namespace OpenLogReplicator {
             metadata->rac = true;
             ctx->info(0, "RAC database detected (cluster_database = TRUE) - switching to archives-only mode; "
                       "redo logs must be archived to a filesystem destination (log_archive_dest_2)");
+            if (ctx->archivesOnlyConfigured && !ctx->isFlagSet(Ctx::REDO_FLAGS::ARCH_ONLY))
+                ctx->warning(60039, "RAC database detected - archives-only mode can not be disabled, the reader parameter \"archives-only\": false is ignored");
             if (metadata->startSequence != Seq::none())
                 ctx->info(0, "start-seq is interpreted for thread 1 on a RAC database");
 
@@ -1526,14 +1528,20 @@ namespace OpenLogReplicator {
         }
     }
 
-    void ReplicatorOnline::updateOnlineRedoLogData() {
+    void ReplicatorOnline::loadIncarnations() {
         if (!checkConnection())
             return;
 
         contextSet(CONTEXT::CHKPT, REASON::CHKPT);
-        std::unique_lock const lck(metadata->mtxCheckpoint);
+        {
+            std::unique_lock const lck(metadata->mtxCheckpoint);
+            loadIncarnationsLocked();
+        }
+        contextSet(CONTEXT::CPU);
+    }
 
-        // Reload incarnation ctx
+    void ReplicatorOnline::loadIncarnationsLocked() {
+        // Reload incarnation ctx (also refreshes the primary/standby role)
         typeResetlogs const oldResetlogs = metadata->resetlogs;
         for (DbIncarnation* oi: metadata->dbIncarnations)
             delete oi;
@@ -1601,6 +1609,17 @@ namespace OpenLogReplicator {
                 ret = stmt.next();
             }
         }
+    }
+
+    void ReplicatorOnline::updateOnlineRedoLogData() {
+        if (!checkConnection())
+            return;
+
+        contextSet(CONTEXT::CHKPT, REASON::CHKPT);
+        std::unique_lock const lck(metadata->mtxCheckpoint);
+
+        // Reload incarnation ctx
+        loadIncarnationsLocked();
 
         // Reload online redo log ctx
         {

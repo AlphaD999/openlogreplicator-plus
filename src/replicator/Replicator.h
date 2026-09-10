@@ -75,6 +75,10 @@ namespace OpenLogReplicator {
         virtual void verifySchema(Scn currentScn);
         virtual void createSchema();
         virtual void updateOnlineRedoLogData();
+        // Loads the incarnation list from the database. Needed on the archives-only / RAC path as well: online
+        // redo log data is not read there, but the resetlogs of the current incarnation is still required to
+        // locate the starting redo sequence, otherwise no checkpoint file has to be prepared by hand.
+        virtual void loadIncarnations();
 
     public:
         Replicator(Ctx* newCtx, void (*newArchGetLog)(Replicator* replicator), Builder* newBuilder, Metadata* newMetadata,

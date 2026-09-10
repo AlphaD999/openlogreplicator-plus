@@ -677,6 +677,9 @@ namespace OpenLogReplicator {
                                   const std::string& key, SchemaElement::TAG_TYPE tagType, const std::vector<std::string>& tagList, const std::string& tag,
                                   const std::string& condition, DbTable::OPTIONS options, std::unordered_map<typeObj, std::string>& tablesUpdated);
         void updateOnlineRedoLogData() override;
+        void loadIncarnations() override;
+        // Requires mtxCheckpoint to be held by the caller (updateOnlineRedoLogData holds it for its whole body)
+        void loadIncarnationsLocked();
 
     public:
         DatabaseEnvironment* env;

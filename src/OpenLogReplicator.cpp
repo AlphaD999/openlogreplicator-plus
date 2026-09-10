@@ -529,6 +529,7 @@ namespace OpenLogReplicator {
 
             // Explicit archives-only override (RAC auto-detection can set the same flag at runtime)
             if (readerJson.HasMember("archives-only")) {
+                ctx->archivesOnlyConfigured = true;
                 const rapidjson::Value& archivesOnlyJson = readerJson["archives-only"];
                 bool archivesOnly;
                 if (archivesOnlyJson.IsBool())

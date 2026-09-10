@@ -157,6 +157,9 @@ namespace OpenLogReplicator {
 
         uint trace{0};
         uint flags{0};
+        // Set when the reader parameter "archives-only" is present in the configuration (either true or false),
+        // so that RAC auto-detection can warn when it overrides an explicit value
+        bool archivesOnlyConfigured{false};
         uint disableChecks{0};
         LOG logLevel{LOG::INFO};
 

@@ -42,7 +42,7 @@ Supported source database versions and platforms:
 * Required database options: none
 * Supports single-tenant and multi-tenant configurations
 * Supports reading from standby (Data Guard)
-* Supports Oracle RAC source databases in archives-only mode (see xref:#rac-support[Oracle RAC deployment] below); online redo logs of a RAC database must be readable from a regular file system to be read in online mode
+* Supports Oracle RAC source databases in archives-only mode (see xref:#rac-support[Oracle RAC deployment] below); redo logs of every instance must be archived to a regular file system, a RAC database is always read in archives-only mode
 
 === Database configuration
 
@@ -288,8 +288,10 @@ Schedule frequent log switches (for example via `DBMS_SCHEDULER`) if lower laten
 Behavior notes:
 
 * A stopped instance (closed thread) stops holding back the global output; if its tail archive is missing after a crash, OpenLogReplicator keeps waiting and emits warning 60038 until the archive is delivered by instance recovery or restored manually.
-* The `reader` parameter `"archives-only"` explicitly forces archives-only mode and overrides the automatic detection.
+* The `reader` parameter `"archives-only"` forces archives-only mode; on a single instance database it is optional and equivalent to flag `0x0001` in `flags`.
+* A RAC database always runs in archives-only mode: `"archives-only": false` has no effect and emits warning 60039.
 * `start-seq` is interpreted with thread 1 semantics on a RAC database.
+* No state file has to be prepared for the first start: when no previous checkpoint exists, the current incarnation `resetlogs` is read from `SYS.V_$DATABASE_INCARNATION` (a view query, no online redo log file is touched).
 
 
 == Source code compilation
