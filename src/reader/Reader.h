@@ -112,6 +112,9 @@ namespace OpenLogReplicator {
         virtual void redoClose() = 0;
         virtual REDO_CODE redoOpen() = 0;
         virtual int redoRead(uint8_t* buf, uint64_t offset, uint size) = 0;
+        // Refresh the file size: the one taken at open time can be stale (a filesystem bridge such as asmfs
+        // reports 0 for a file that is not fully visible yet, an online redo log can have grown since)
+        virtual void refreshFileSize();
         virtual uint readSize(uint prevRead);
         virtual REDO_CODE reloadHeaderRead();
         REDO_CODE checkBlockHeader(uint8_t* buffer, typeBlk blockNumber, bool showHint);

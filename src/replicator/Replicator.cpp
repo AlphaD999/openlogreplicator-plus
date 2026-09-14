@@ -55,11 +55,13 @@ namespace OpenLogReplicator {
     Replicator::~Replicator() {
         readerDropAll();
 
-        while (!archiveRedoQueue.empty()) {
-            const Parser* parser = archiveRedoQueue.top();
-            archiveRedoQueue.pop();
+        for (const Parser* parser: archiveRedoQueue)
             delete parser;
-        }
+        archiveRedoQueue.clear();
+
+        for (const Parser* parser: gapArchives)
+            delete parser;
+        gapArchives.clear();
 
         for (const Parser* parser: onlineRedoSet)
             delete parser;
@@ -72,11 +74,42 @@ namespace OpenLogReplicator {
     void Replicator::initialize() {}
 
     void Replicator::cleanArchList() {
-        while (!archiveRedoQueue.empty()) {
-            const Parser* parser = archiveRedoQueue.top();
-            archiveRedoQueue.pop();
+        for (const Parser* parser: archiveRedoQueue)
             delete parser;
+        archiveRedoQueue.clear();
+
+        for (const Parser* parser: gapArchives)
+            delete parser;
+        gapArchives.clear();
+    }
+
+    size_t Replicator::bestArchiveIndex() const {
+        size_t best = 0;
+
+        for (size_t i = 1; i < archiveRedoQueue.size(); ++i) {
+            const Parser* p1 = archiveRedoQueue[i];
+            const Parser* p2 = archiveRedoQueue[best];
+            const Scn scn1 = p1->orderScn();
+            const Scn scn2 = p2->orderScn();
+
+            bool better;
+            if (scn1 == scn2) {
+                if (p1->thread != p2->thread)
+                    better = p1->thread < p2->thread;
+                else
+                    better = p1->sequence < p2->sequence;
+            } else if (scn1 == Scn::none())
+                better = false;
+            else if (scn2 == Scn::none())
+                better = true;
+            else
+                better = scn1 < scn2;
+
+            if (better)
+                best = i;
         }
+
+        return best;
     }
 
     void Replicator::updateOnlineLogs() const {
@@ -533,7 +566,7 @@ namespace OpenLogReplicator {
                 parser->nextScn = Scn::none();
                 parser->sequence = sequence;
                 parser->thread = fileThread;
-                replicator->archiveRedoQueue.push(parser);
+                replicator->archiveRedoQueue.emplace_back(parser);
             }
             closedir(dir2);
 
@@ -590,7 +623,7 @@ namespace OpenLogReplicator {
                 parser->nextScn = Scn::none();
                 parser->sequence = sequence;
                 parser->thread = fileThread;
-                replicator->archiveRedoQueue.push(parser);
+                replicator->archiveRedoQueue.emplace_back(parser);
                 if (sequenceStart == Seq::none() || sequenceStart > sequence)
                     sequenceStart = sequence;
 
@@ -626,7 +659,7 @@ namespace OpenLogReplicator {
                     parser->nextScn = Scn::none();
                     parser->sequence = sequence;
                     parser->thread = fileThread;
-                    replicator->archiveRedoQueue.push(parser);
+                    replicator->archiveRedoQueue.emplace_back(parser);
                 }
                 closedir(dir);
             }
@@ -635,12 +668,6 @@ namespace OpenLogReplicator {
         if (sequenceStart != Seq::none() && replicator->metadata->sequence == Seq::zero())
             replicator->metadata->setSeqFileOffset(sequenceStart, FileOffset::zero());
         replicator->redoLogsBatch.clear();
-    }
-
-    bool parserCompare::operator()(const Parser* p1, const Parser* p2) const {
-        if (p1->thread != p2->thread)
-            return p1->thread > p2->thread;
-        return p1->sequence > p2->sequence;
     }
 
     void Replicator::loadIncarnations() {
@@ -745,7 +772,9 @@ namespace OpenLogReplicator {
                 ctx->logTrace(Ctx::TRACE::REDO, "searching archived redo log for seq: " + metadata->sequence.toString());
             }
             while (!archiveRedoQueue.empty() && !ctx->softShutdown) {
-                parser = archiveRedoQueue.top();
+                const size_t bestIndex = bestArchiveIndex();
+                parser = archiveRedoQueue[bestIndex];
+                archiveRedoQueue.erase(archiveRedoQueue.begin() + static_cast<std::ptrdiff_t>(bestIndex));
                 if (unlikely(ctx->isTraceSet(Ctx::TRACE::REDO)))
                     ctx->logTrace(Ctx::TRACE::REDO, parser->path + " is seq: " + parser->sequence.toString() + " thread: " +
                                   std::to_string(parser->thread) + ", scn: " + parser->firstScn.toString());
@@ -761,7 +790,6 @@ namespace OpenLogReplicator {
 
                 // Skip older archived redo logs
                 if (parser->sequence < expectedSequence) {
-                    archiveRedoQueue.pop();
                     delete parser;
                     continue;
                 }
@@ -785,11 +813,18 @@ namespace OpenLogReplicator {
                         ctx->warning(60027, "couldn't find archive log for seq: " + expectedSequence.toString() + ", found: " +
                                      parser->sequence.toString() + ", sleeping " + std::to_string(ctx->archReadSleepUs) + " us");
                     }
-                    contextSet(CONTEXT::SLEEP);
-                    ctx->usleepInt(ctx->archReadSleepUs);
-                    contextSet(CONTEXT::CPU);
-                    cleanArchList();
-                    archGetLog(this);
+                    // Park the archive instead of blocking here: another redo thread may still be parseable and
+                    // must not be held back by a missing archive of this one. When nothing else is left, the
+                    // parked archives are dropped together with the rest of the list and it is read again from
+                    // the database - a late archive is picked up as soon as it appears.
+                    gapArchives.emplace_back(parser);
+                    if (archiveRedoQueue.empty()) {
+                        contextSet(CONTEXT::SLEEP);
+                        ctx->usleepInt(ctx->archReadSleepUs);
+                        contextSet(CONTEXT::CPU);
+                        cleanArchList();
+                        archGetLog(this);
+                    }
                     continue;
                 }
 
@@ -827,12 +862,25 @@ namespace OpenLogReplicator {
                 ret = parser->parse();
                 metadata->setFirstNextScn(parser->firstScn, parser->nextScn, parser->thread);
 
-                if (ctx->softShutdown)
+                if (ctx->softShutdown) {
+                    delete parser;
                     break;
+                }
+
+                // Archive sliced: only a part of it was parsed and the position was saved in the metadata. Keep
+                // the parser and let the redo thread that is behind go first - this keeps the low-water-mark gap
+                // (and with it the transaction memory held by the commit sorter) small.
+                if (parser->slicePending) {
+                    parser->slicePending = false;
+                    if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
+                        ctx->logTrace(Ctx::TRACE::CHECKPOINT, "archive sliced, seq: " + parser->sequence.toString() + " thread: " +
+                                      std::to_string(parser->thread) + ", scn: " + parser->sliceScn.toString());
+                    archiveRedoQueue.emplace_back(parser);
+                    continue;
+                }
 
                 if (ret != Reader::REDO_CODE::FINISHED) {
                     if (ret == Reader::REDO_CODE::STOPPED) {
-                        archiveRedoQueue.pop();
                         delete parser;
                         break;
                     }
@@ -843,7 +891,6 @@ namespace OpenLogReplicator {
                 // verifySchema(metadata->nextScn);
 
                 metadata->setNextSequence(parser->thread);
-                archiveRedoQueue.pop();
                 delete parser;
 
                 if (ctx->stopLogSwitches > 0) {

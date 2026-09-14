@@ -40,11 +40,15 @@ If not, see <http://www.gnu.org/licenses/>. */
 auto OLR_LOCALES = OpenLogReplicator::Ctx::LOCALES::TIMESTAMP;
 
 namespace OpenLogReplicator {
+    // The order must match the MEMORY enum: BUILDER, MISC, PARSER, READER, TRANSACTIONS, WRITER.
+    // "misc" used to be missing, which shifted all the following names and made the error messages
+    // point at the wrong module (and the writer one fall back to an empty string).
     const std::string Ctx::memoryModules[MEMORY_COUNT] {
         "builder",
+        "misc",
         "parser",
         "reader",
-        "transaction",
+        "transactions",
         "writer"
     };
 
@@ -394,6 +398,39 @@ namespace OpenLogReplicator {
         return memoryChunksAllocated * MEMORY_CHUNK_SIZE_MB;
     }
 
+    uint64_t Ctx::getMaxMemory() const {
+        std::unique_lock const lck(memoryMtx);
+        return memoryChunksMax * MEMORY_CHUNK_SIZE_MB;
+    }
+
+    uint64_t Ctx::getBlockedThreads() const {
+        std::unique_lock const lck(memoryMtx);
+        return memoryBlockedThreads;
+    }
+
+    uint64_t Ctx::getReservedFreeChunks() const {
+        std::unique_lock const lck(memoryMtx);
+        // The same reserved zone that getMemoryChunk() keeps for the reader, the writer and the unswap
+        // buffer: chunks below it are not handed out to a thread that can not swap memory itself
+        uint64_t ret = memoryChunksUnswapBufferMin;
+        if (memoryModulesAllocated[static_cast<uint>(MEMORY::READER)] < memoryChunksReadBufferMin)
+            ret += memoryChunksReadBufferMin - memoryModulesAllocated[static_cast<uint>(MEMORY::READER)];
+        if (memoryModulesAllocated[static_cast<uint>(MEMORY::BUILDER)] < memoryChunksWriteBufferMin)
+            ret += memoryChunksWriteBufferMin - memoryModulesAllocated[static_cast<uint>(MEMORY::BUILDER)];
+        return ret;
+    }
+
+    std::string Ctx::getMemoryModulesText() const {
+        std::unique_lock const lck(memoryMtx);
+        std::string ret;
+        for (uint i = 0; i < MEMORY_COUNT; ++i) {
+            if (i > 0)
+                ret += ", ";
+            ret += memoryModules[i] + ": " + std::to_string(memoryModulesAllocated[i] * MEMORY_CHUNK_SIZE_MB) + "MB";
+        }
+        return ret;
+    }
+
     uint64_t Ctx::getSwapMemory(Thread* t) const {
         uint64_t ret;
         {
@@ -450,7 +487,12 @@ namespace OpenLogReplicator {
                     }
                 }
 
-                if (module == MEMORY::PARSER)
+                // A blocked parser thread means a deadlock, not a delay: the commit sorter is flushed only
+                // by the parser itself (Parser::processRedoLog), so no other thread can release the
+                // transaction chunks it is waiting for. Marking only the PARSER module used to miss the
+                // case of a transaction chunk grow (MEMORY::TRANSACTIONS) - the pool was exhausted, the
+                // parser was blocked on memory and the whole run stalled without a single message.
+                if (module == MEMORY::PARSER || t == parserThread)
                     outOfMemoryParser = true;
 
                 if (hardShutdown)
@@ -459,7 +501,9 @@ namespace OpenLogReplicator {
                 if (unlikely(isTraceSet(TRACE::SLEEP)))
                     logTrace(TRACE::SLEEP, "Ctx:getMemoryChunk");
                 t->contextSet(Thread::CONTEXT::WAIT, Thread::REASON::MEMORY_EXHAUSTED);
+                ++memoryBlockedThreads;
                 condOutOfMemory.wait(lck);
+                --memoryBlockedThreads;
                 t->contextSet(Thread::CONTEXT::MEM, Thread::REASON::MEM);
             }
 
@@ -731,18 +775,35 @@ namespace OpenLogReplicator {
     }
 
     void Ctx::swappedMemoryRemove(Thread* t, Xid xid) {
-        SwapChunk* sc;
+        SwapChunk* sc = nullptr;
+        bool alreadyRemoved = false;
         {
             t->contextSet(Thread::CONTEXT::CPU);
             std::unique_lock const lck(swapMtx);
             const auto& it = swapChunks.find(xid);
-            if (unlikely(it == swapChunks.end()))
-                throw RuntimeException(50070, "swap chunk not found for xid: " + xid.toString() + " during memory remove");
-            sc = it->second;
-            sc->release = true;
-            swappedFlushXid = 0;
+            if (unlikely(it == swapChunks.end())) {
+                // The chunk can be legitimately gone already: MemoryManager::cleanOldTransactions() erases an
+                // entry as soon as the transaction has been released, so releasing the same xid twice is a race
+                // and not an error. Throwing 50070 here used to abort OpenLogReplicator while it was recovering
+                // from a burst of undo slot take-overs (see warning 60041): the recovery path releases the
+                // unfinished transaction, the memory manager may clean it up, and a later release of the same
+                // xid then failed the whole run.
+                if (swappedFlushXid == xid)
+                    swappedFlushXid = 0;
+                alreadyRemoved = true;
+            } else {
+                sc = it->second;
+                sc->release = true;
+                swappedFlushXid = 0;
+            }
         }
         t->contextSet(Thread::CONTEXT::CPU);
+
+        if (unlikely(alreadyRemoved)) {
+            if (unlikely(isTraceSet(TRACE::TRANSACTION)))
+                logTrace(TRACE::TRANSACTION, "swap memory already released for xid: " + xid.toString());
+            return;
+        }
 
         for (auto* tc: sc->chunks)
             if (tc != nullptr)
@@ -758,7 +819,7 @@ namespace OpenLogReplicator {
         t->contextSet(Thread::CONTEXT::CPU);
     }
 
-    void Ctx::wontSwap(Thread* t) const {
+    void Ctx::wontSwap(Thread* t, uint64_t openTransactions, uint64_t swappableTransactions) const {
         t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_SWAPPED_WONT);
         std::unique_lock const lck(memoryMtx);
 
@@ -777,6 +838,11 @@ namespace OpenLogReplicator {
         if (memoryModulesAllocated[static_cast<uint>(MEMORY::READER)] > 5)
             hint("amount of disk buffer is too high, try to decrease 'memory-read-buffer-max-mb' parameter, current utilization: " +
                     std::to_string(memoryModulesAllocated[static_cast<uint>(MEMORY::READER)] * MEMORY_CHUNK_SIZE_MB) + "MB");
+        if (swappableTransactions == 0 && openTransactions > 0)
+            hint("the memory is held by " + std::to_string(openTransactions) + " open transaction(s) and none of them can be swapped "
+                    "out: every open transaction takes at least " + std::to_string(MEMORY_CHUNK_SIZE_MB) + " MB and only transactions "
+                    "with more than one chunk are swappable, so \"max-mb\" has to cover the peak number of concurrently open "
+                    "transactions (currently: " + std::to_string(openTransactions) + " MB) plus the read/write buffers");
         throw RuntimeException(10017, "out of memory");
     }
 

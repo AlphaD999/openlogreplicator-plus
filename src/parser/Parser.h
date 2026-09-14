@@ -105,8 +105,21 @@ namespace OpenLogReplicator {
         Scn nextScn{Scn::none()};
         Reader* reader{nullptr};
 
+        // Archive slicing (low-water-mark control with more than one redo thread): when set, the archive was
+        // only parsed up to "sliceScn", the position was saved in the metadata and the scheduler has to keep
+        // this parser to resume it later. See Replicator::processArchivedRedoLogs.
+        bool slicePending{false};
+        Scn sliceScn{Scn::none()};
+
         Parser(Ctx* newCtx, Builder* newBuilder, Metadata* newMetadata, TransactionBuffer* newTransactionBuffer, int newGroup, std::string newPath);
         ~Parser();
+
+        // SCN still to be parsed from this archive: orders the archive list so that the redo threads stay
+        // aligned and the low-water-mark gap (and with it the transaction memory kept by the commit sorter)
+        // stays small
+        [[nodiscard]] Scn orderScn() const {
+            return sliceScn != Scn::none() ? sliceScn : firstScn;
+        }
 
         Reader::REDO_CODE parse();
         [[nodiscard]] std::string toString() const;

@@ -73,7 +73,7 @@ _CAUTION:_ Filters apply only to data rows, not to DDL.
 On first run the schema is loaded only for tables selected by the filter; changing the filter later may require resetting checkpoints and reloading schema.
 
 |`flags` [[flags]]
-|_integer_, min: 0, max: 524287, default: 0
+|_integer_, min: 0, max: 1048575, default: 0
 |Bitmask of runtime options.
 Common flags:
 
@@ -101,6 +101,10 @@ _TIP:_ Disabling direct IO reduces guarantees; use only when necessary.
 * `0x10000` — Decode binary XMLType (experimental).
 * `0x20000` — Emit JSON values in binary format (experimental).
 * `0x40000` — Support UPDATEs for NOT NULL columns with occasional NULLs (experimental).
+* `0x80000` — Recover a transaction that takes over an undo slot of an unfinished transaction (see warning 60041).
+
+_WARNING:_ Useful when reading starts in the middle of the redo stream.
+Without this flag the same condition aborts processing with error 50039.
 
 _NOTE:_ Refer to the xref:../user-manual/9.advanced-topics.adoc[User Manual] for details on schemaless and adaptive schema modes.
 

@@ -61,15 +61,32 @@ If not, see <http://www.gnu.org/licenses/>. */
 namespace OpenLogReplicator {
     ReplicatorOnline::ReplicatorOnline(Ctx * newCtx, void(*newArchGetLog)(Replicator * replicator), Builder * newBuilder, Metadata * newMetadata,
                                        TransactionBuffer * newTransactionBuffer, std::string newAlias, std::string newDatabase, std::string newUser,
-                                       std::string newPassword, std::string newConnectString, bool newKeepConnection):
+                                       std::string newPassword, std::string newConnectString, std::string newArchivesUser,
+                                       std::string newArchivesPassword, std::string newArchivesConnectString, bool newKeepConnection):
         Replicator(newCtx, newArchGetLog, newBuilder, newMetadata, newTransactionBuffer, std::move(newAlias), std::move(newDatabase)),
+        connArchives(nullptr),
         keepConnection(newKeepConnection) {
         env = new DatabaseEnvironment(ctx);
         env->initialize();
         conn = new DatabaseConnection(env, std::move(newUser), std::move(newPassword), std::move(newConnectString), false);
+
+        // The archive log list is read from another database when "archives-server" is configured: the names
+        // registered there (a standby that received the archived redo logs of the primary) carry a different
+        // db_unique_name directory and ASM incarnation number, so they can not be translated from the primary
+        // list - the file names have to come from the instance that owns them.
+        if (!newArchivesConnectString.empty()) {
+            ctx->info(0, "archived redo log list will be read from: " + newArchivesConnectString);
+            connArchives = new DatabaseConnection(env, std::move(newArchivesUser), std::move(newArchivesPassword),
+                                                  std::move(newArchivesConnectString), false);
+        }
     }
 
     ReplicatorOnline::~ReplicatorOnline() {
+        if (connArchives != nullptr) {
+            delete connArchives;
+            connArchives = nullptr;
+        }
+
         if (conn != nullptr) {
             delete conn;
             conn = nullptr;
@@ -98,8 +115,13 @@ namespace OpenLogReplicator {
                 "SYS.V_$THREAD",
                 "SYS.V_$TRANSPORTABLE_PLATFORM"
             };
-            for (const auto& tableName: tables)
-                checkTableForGrants(tableName);
+            for (const auto& tableName: tables) {
+                // The archive log list is read through the second connection when it is configured
+                if (tableName == "SYS.V_$ARCHIVED_LOG")
+                    checkTableForGrants(tableName, getArchivesConnection());
+                else
+                    checkTableForGrants(tableName);
+            }
         }
 
         archReader = readerCreate(0);
@@ -233,26 +255,41 @@ namespace OpenLogReplicator {
         metadata->nlsCharacterSet = getPropertyValue("NLS_CHARACTERSET");
         metadata->nlsNcharCharacterSet = getPropertyValue("NLS_NCHAR_CHARACTERSET");
 
+        if (ctx->asmArchives)
+            ctx->info(0, "archived redo log source is \"asm\" - paths from SYS.V_$ARCHIVED_LOG are expected to be "
+                      "rewritten by \"path-mapping\"");
+
         // RAC detection: online redo logs in ASM are not readable from outside, switch to archives-only mode
         const std::string clusterDatabase = getParameterValue("cluster_database");
         if (clusterDatabase == "TRUE") {
             metadata->rac = true;
-            ctx->info(0, "RAC database detected (cluster_database = TRUE) - switching to archives-only mode; "
-                      "redo logs must be archived to a filesystem destination (log_archive_dest_2)");
+            if (ctx->asmArchives)
+                ctx->info(0, "RAC database detected (cluster_database = TRUE) - switching to archives-only mode; "
+                          "archived redo logs are kept in ASM and read through the filesystem bridge declared in \"path-mapping\"");
+            else
+                ctx->info(0, "RAC database detected (cluster_database = TRUE) - switching to archives-only mode; "
+                          "redo logs must be archived to a filesystem destination (log_archive_dest_2)");
             if (ctx->archivesOnlyConfigured && !ctx->isFlagSet(Ctx::REDO_FLAGS::ARCH_ONLY))
                 ctx->warning(60039, "RAC database detected - archives-only mode can not be disabled, the reader parameter \"archives-only\": false is ignored");
             if (metadata->startSequence != Seq::none())
                 ctx->info(0, "start-seq is interpreted for thread 1 on a RAC database");
 
             {
-                DatabaseStatement stmt(conn);
+                const std::string_view checkStatement = ctx->asmArchives
+                        ? SQL_CHECK_ASM_ARCHIVED_LOG : SQL_CHECK_FS_ARCHIVED_LOG;
+                DatabaseStatement stmt(getArchivesConnection());
                 if (unlikely(ctx->isTraceSet(Ctx::TRACE::SQL)))
-                    ctx->logTrace(Ctx::TRACE::SQL, std::string(SQL_CHECK_FS_ARCHIVED_LOG));
-                stmt.createStatement(SQL_CHECK_FS_ARCHIVED_LOG);
-                uint fsArchivedLogs;
-                stmt.defineUInt(1, fsArchivedLogs);
+                    ctx->logTrace(Ctx::TRACE::SQL, std::string(checkStatement));
+                stmt.createStatement(checkStatement);
+                uint archivedLogs;
+                stmt.defineUInt(1, archivedLogs);
 
-                if (stmt.executeQuery() != 0 && fsArchivedLogs == 0) {
+                if (stmt.executeQuery() != 0 && archivedLogs == 0) {
+                    if (ctx->asmArchives) {
+                        ctx->hint("check that the archived redo log path recorded in SYS.V_$ARCHIVED_LOG is reachable: "
+                                  "the \"path-mapping\" prefix must match it and the filesystem bridge must be mounted");
+                        throw RuntimeException(10073, "RAC database detected with \"arch-source\": \"asm\" but no archived redo logs in ASM found");
+                    }
                     ctx->hint("run: ALTER SYSTEM SET LOG_ARCHIVE_DEST_2 = 'LOCATION=<filesystem path> VALID_FOR=(ONLINE_LOGFILES,ALL_ROLES)' SCOPE=BOTH;");
                     throw RuntimeException(10073, "RAC database detected but no archived redo logs on filesystem found - "
                                                "configure log_archive_dest_2 to archive redo logs to a filesystem");
@@ -372,22 +409,33 @@ namespace OpenLogReplicator {
     }
 
     bool ReplicatorOnline::checkConnection() {
-        if (!conn->connected) {
-            ctx->info(0, "connecting to the database instance of " + database + " to " + conn->connectString);
+        if (!checkConnectionFor(conn))
+            return false;
+
+        // Second connection to the database that keeps the archived redo log list (optional)
+        if (connArchives != nullptr && !checkConnectionFor(connArchives))
+            return false;
+
+        return true;
+    }
+
+    bool ReplicatorOnline::checkConnectionFor(DatabaseConnection* databaseConnection) {
+        if (!databaseConnection->connected) {
+            ctx->info(0, "connecting to the database instance of " + database + " to " + databaseConnection->connectString);
         }
 
         while (!ctx->softShutdown) {
-            if (!conn->connected) {
+            if (!databaseConnection->connected) {
                 try {
-                    conn->connect();
+                    databaseConnection->connect();
                 } catch (RuntimeException& ex) {
                     ctx->error(ex.code, ex.msg);
                 }
             }
 
-            if (conn->connected) {
+            if (databaseConnection->connected) {
                 try {
-                    DatabaseStatement stmt(conn);
+                    DatabaseStatement stmt(databaseConnection);
                     if (unlikely(ctx->isTraceSet(Ctx::TRACE::SQL)))
                         ctx->logTrace(Ctx::TRACE::SQL, std::string(SQL_CHECK_CONNECTION));
                     stmt.createStatement(SQL_CHECK_CONNECTION);
@@ -397,11 +445,11 @@ namespace OpenLogReplicator {
                     stmt.executeQuery();
                 } catch (RuntimeException& ex) {
                     ctx->error(ex.code, ex.msg);
-                    conn->disconnect();
+                    databaseConnection->disconnect();
                     contextSet(CONTEXT::SLEEP);
                     ctx->usleepInt(ctx->refreshIntervalUs);
                     contextSet(CONTEXT::CPU);
-                    ctx->info(0, "reconnecting to the database instance of " + database + " to " + conn->connectString);
+                    ctx->info(0, "reconnecting to the database instance of " + database + " to " + databaseConnection->connectString);
                     continue;
                 }
 
@@ -419,8 +467,12 @@ namespace OpenLogReplicator {
     }
 
     void ReplicatorOnline::goStandby() {
-        if (!keepConnection)
+        if (!keepConnection) {
             conn->disconnect();
+
+            if (connArchives != nullptr)
+                connArchives->disconnect();
+        }
     }
 
     std::string ReplicatorOnline::getParameterValue(std::string parameter) const {
@@ -459,10 +511,12 @@ namespace OpenLogReplicator {
         throw RuntimeException(10033, "can't get property value for " + property);
     }
 
-    void ReplicatorOnline::checkTableForGrants(const std::string& tableName) {
+    void ReplicatorOnline::checkTableForGrants(const std::string& tableName, DatabaseConnection* databaseConnection) {
+        if (databaseConnection == nullptr)
+            databaseConnection = conn;
         try {
             const std::string query("SELECT 1 FROM " + tableName + " WHERE 0 = 1");
-            DatabaseStatement stmt(conn);
+            DatabaseStatement stmt(databaseConnection);
             if (unlikely(ctx->isTraceSet(Ctx::TRACE::SQL)))
                 ctx->logTrace(Ctx::TRACE::SQL, query);
             stmt.createStatement(query);
@@ -474,9 +528,9 @@ namespace OpenLogReplicator {
             if (ex.supCode == 1031) {
                 if (metadata->conId > 0) {
                     ctx->hint("run: ALTER SESSION SET CONTAINER = " + metadata->conName + ";");
-                    ctx->hint("run: GRANT SELECT ON " + tableName + " TO " + conn->user + ";");
+                    ctx->hint("run: GRANT SELECT ON " + tableName + " TO " + databaseConnection->user + ";");
                 } else {
-                    ctx->hint("run: GRANT SELECT ON " + tableName + " TO " + conn->user + ";");
+                    ctx->hint("run: GRANT SELECT ON " + tableName + " TO " + databaseConnection->user + ";");
                 }
                 throw RuntimeException(10034, "grants missing for table " + tableName);
             }
@@ -1707,15 +1761,21 @@ namespace OpenLogReplicator {
         }
 
         {
-            DatabaseStatement stmt(replicatorOnline->conn);
+            const std::string_view listStatement = replicator->ctx->asmArchives
+                    ? SQL_GET_ARCHIVE_LOG_LIST_ASM : SQL_GET_ARCHIVE_LOG_LIST;
+
+            // The names of the archived redo logs have to come from the instance that owns the files: with
+            // "archives-server" configured the list is read there (it also acts as the arrival gate - a row
+            // only shows up once the archive has been received and registered on that side).
+            DatabaseStatement stmt(replicatorOnline->getArchivesConnection());
             if (unlikely(replicator->ctx->isTraceSet(Ctx::TRACE::SQL))) {
-                replicator->ctx->logTrace(Ctx::TRACE::SQL, std::string(SQL_GET_ARCHIVE_LOG_LIST));
+                replicator->ctx->logTrace(Ctx::TRACE::SQL, std::string(listStatement));
                 replicator->ctx->logTrace(Ctx::TRACE::SQL, "PARAM1: " +
                                           sequenceStart.toString());
                 replicator->ctx->logTrace(Ctx::TRACE::SQL, "PARAM2: " + std::to_string(replicator->metadata->resetlogs));
             }
 
-            stmt.createStatement(SQL_GET_ARCHIVE_LOG_LIST);
+            stmt.createStatement(listStatement);
             stmt.bindUInt(1, sequenceStart);
             stmt.bindUInt(2, replicator->metadata->resetlogs);
 
@@ -1730,8 +1790,24 @@ namespace OpenLogReplicator {
             uint32_t thread;
             stmt.defineUInt(5, thread);
 
+            // One archived redo log can be present in more than one destination, so the same (thread, sequence)
+            // can be returned several times. The result is ordered by THREAD#, SEQUENCE#, DEST_ID,
+            // IS_RECOVERY_DEST_FILE DESC, so the first row of a group is the preferred copy. The queue is ordered
+            // by (thread, sequence) only, so the remaining copies have to be dropped here - otherwise it would be
+            // undefined which of them gets read first.
+            bool firstRow = true;
+            uint32_t lastThread{};
+            Seq lastSequence;
             int ret = stmt.executeQuery();
             while (ret != 0) {
+                if (!firstRow && thread == lastThread && sequence == lastSequence) {
+                    ret = stmt.next();
+                    continue;
+                }
+                firstRow = false;
+                lastThread = thread;
+                lastSequence = sequence;
+
                 std::string mappedPath(path.data());
                 replicator->applyMapping(mappedPath);
 
@@ -1741,7 +1817,7 @@ namespace OpenLogReplicator {
                 parser->nextScn = nextScn;
                 parser->sequence = sequence;
                 parser->thread = static_cast<uint16_t>(thread);
-                replicator->archiveRedoQueue.push(parser);
+                replicator->archiveRedoQueue.emplace_back(parser);
                 ret = stmt.next();
             }
         }

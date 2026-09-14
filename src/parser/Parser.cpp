@@ -611,7 +611,7 @@ namespace OpenLogReplicator {
         if (ctx->transactionSizeMax > 0 &&
             transaction->size + redoLogRecord1->size + TransactionBuffer::ROW_HEADER_TOTAL >= ctx->transactionSizeMax) {
             transactionBuffer->skipXidList.insert(transaction->xid);
-            transactionBuffer->dropTransaction(redoLogRecord1->xid, redoLogRecord1->conId, redoLogRecord1->thread);
+            transactionBuffer->dropTransaction(redoLogRecord1->xid, redoLogRecord1->conId, redoLogRecord1->thread, transaction);
             transaction->purge(ctx);
             if (transaction == lastTransaction)
                 lastTransaction = nullptr;
@@ -717,7 +717,7 @@ namespace OpenLogReplicator {
         if (ctx->transactionSizeMax > 0 && transaction->size + redoLogRecord1->size + TransactionBuffer::ROW_HEADER_TOTAL >= ctx->transactionSizeMax) {
             transaction->log(ctx, "siz ", redoLogRecord1);
             transactionBuffer->skipXidList.insert(transaction->xid);
-            transactionBuffer->dropTransaction(redoLogRecord1->xid, redoLogRecord1->conId, redoLogRecord1->thread);
+            transactionBuffer->dropTransaction(redoLogRecord1->xid, redoLogRecord1->conId, redoLogRecord1->thread, transaction);
             transaction->purge(ctx);
             if (transaction == lastTransaction)
                 lastTransaction = nullptr;
@@ -780,6 +780,10 @@ namespace OpenLogReplicator {
 
         Transaction* transaction = transactionBuffer->findTransaction(metadata->schema->xmlCtxDefault, redoLogRecord1->xid, redoLogRecord1->conId,
                                                                       redoLogRecord1->thread, false, true, false);
+        if (unlikely(ctx->isTraceSet(Ctx::TRACE::TRANSACTION)))
+            ctx->logTrace(Ctx::TRACE::TRANSACTION, "begin  xid: " + redoLogRecord1->xid.toString() + " conId: " +
+                         std::to_string(redoLogRecord1->conId) + " usn: " + std::to_string(static_cast<uint64_t>(redoLogRecord1->usn)) +
+                         " cls: " + std::to_string(redoLogRecord1->cls));
         transaction->begin = true;
         transaction->beginSequence = redoLogRecord1->sequence;
         transaction->beginScn = redoLogRecord1->scn;
@@ -814,8 +818,22 @@ namespace OpenLogReplicator {
         Transaction* transaction = transactionBuffer->findTransaction(metadata->schema->xmlCtxDefault, redoLogRecord1->xid, redoLogRecord1->conId,
                                                                       redoLogRecord1->thread, true,
                                                                       ctx->isFlagSet(Ctx::REDO_FLAGS::SHOW_INCOMPLETE_TRANSACTIONS), false);
-        if (unlikely(transaction == nullptr))
+        if (unlikely(transaction == nullptr)) {
+            // A commit/rollback that does not match any transaction we hold. It used to be dropped in
+            // complete silence - and because the existing entry is then never released, the next
+            // transaction that reuses the undo slot is reported as taking over an unfinished
+            // transaction (warning 60041). Tracing this is the only way to connect the two.
+            if (unlikely(ctx->isTraceSet(Ctx::TRACE::TRANSACTION)))
+                ctx->logTrace(Ctx::TRACE::TRANSACTION, "commit not matched xid: " + redoLogRecord1->xid.toString() + " conId: " +
+                             std::to_string(redoLogRecord1->conId) + " usn: " + std::to_string(static_cast<uint64_t>(redoLogRecord1->usn)) +
+                             " cls: " + std::to_string(redoLogRecord1->cls));
             return;
+        }
+
+        if (unlikely(ctx->isTraceSet(Ctx::TRACE::TRANSACTION)))
+            ctx->logTrace(Ctx::TRACE::TRANSACTION, "commit xid: " + redoLogRecord1->xid.toString() + " conId: " +
+                         std::to_string(redoLogRecord1->conId) + " usn: " + std::to_string(static_cast<uint64_t>(redoLogRecord1->usn)) +
+                         " cls: " + std::to_string(redoLogRecord1->cls));
 
         transaction->log(ctx, "C   ", redoLogRecord1);
         transaction->commitSequence = redoLogRecord1->sequence;
@@ -823,6 +841,12 @@ namespace OpenLogReplicator {
         transaction->commitTimestamp = redoLogRecord1->timestamp;
         if ((redoLogRecord1->flg & OpCode::FLG_ROLLBACK_OP0504) != 0)
             transaction->rollback = true;
+
+        // The transaction is finished, so release the undo slot key already. The flush may still be deferred
+        // in the commit sorter (which keeps its own pointer to the transaction), but a short transaction can
+        // reuse the same undo slot immediately, and findTransaction() would then report a slot take-over
+        // (warning 60041 / error 50039) for a transaction that has in fact committed.
+        transactionBuffer->dropTransaction(transaction->xid, transaction->conId, transaction->thread, transaction);
 
         if (metadata->commitSorter != nullptr)
             // Defer the flush until the low-water-mark over all redo threads passes the commit SCN
@@ -877,7 +901,7 @@ namespace OpenLogReplicator {
                 ctx->logTrace(Ctx::TRACE::TRANSACTION, "skipping transaction already committed: " + transaction->toString(ctx));
         }
 
-        transactionBuffer->dropTransaction(transaction->xid, transaction->conId, transaction->thread);
+        transactionBuffer->dropTransaction(transaction->xid, transaction->conId, transaction->thread, transaction);
         transaction->purge(ctx);
         lastTransaction = nullptr;
         delete transaction;
@@ -995,7 +1019,7 @@ namespace OpenLogReplicator {
             transaction->log(ctx, "siz1", redoLogRecord1);
             transaction->log(ctx, "siz2", redoLogRecord2);
             transactionBuffer->skipXidList.insert(transaction->xid);
-            transactionBuffer->dropTransaction(redoLogRecord1->xid, redoLogRecord1->conId, redoLogRecord1->thread);
+            transactionBuffer->dropTransaction(redoLogRecord1->xid, redoLogRecord1->conId, redoLogRecord1->thread, transaction);
             transaction->purge(ctx);
             if (transaction == lastTransaction)
                 lastTransaction = nullptr;
@@ -1263,7 +1287,7 @@ namespace OpenLogReplicator {
         if (ctx->transactionSizeMax > 0 &&
             transaction->size + redoLogRecord1->size + redoLogRecord2->size + TransactionBuffer::ROW_HEADER_TOTAL >= ctx->transactionSizeMax) {
             transactionBuffer->skipXidList.insert(transaction->xid);
-            transactionBuffer->dropTransaction(redoLogRecord1->xid, redoLogRecord1->conId, redoLogRecord1->thread);
+            transactionBuffer->dropTransaction(redoLogRecord1->xid, redoLogRecord1->conId, redoLogRecord1->thread, transaction);
             transaction->purge(ctx);
             if (transaction == lastTransaction)
                 lastTransaction = nullptr;
@@ -1589,6 +1613,16 @@ namespace OpenLogReplicator {
                     } else {
                         if (ctx->metrics != nullptr)
                             ctx->metrics->emitCheckpointsSkip(1);
+
+                        // Commits enqueued in the commit sorter before the first data SCN have to be released
+                        // as well. The sorter holds a pointer to each finished transaction and the transaction
+                        // holds at least one memory chunk, so without this flush the whole part of the archive
+                        // before the start position (the reader always begins at the archive start, which can
+                        // be hundreds of megabytes earlier) stays in memory: every committed transaction is
+                        // reported as an open transaction, the pool is exhausted and the run stalls. The flush
+                        // itself is still gated by the low-water-mark, so the output order does not change.
+                        if (metadata->commitSorter != nullptr)
+                            metadata->commitSorter->flushReady(this);
                     }
 
                     lwnNumCnt = 0;
@@ -1597,6 +1631,26 @@ namespace OpenLogReplicator {
                     if (ctx->metrics != nullptr)
                         ctx->metrics->emitBytesParsed((currentBlock - lwnConfirmedBlock) * reader->getBlockSize());
                     lwnConfirmedBlock = currentBlock;
+
+                    // Slice boundary. The commit sorter keeps one memory chunk (1 MB) per finished transaction
+                    // that still waits for the low-water-mark - the minimum parsed SCN over the redo threads, so
+                    // it only moves once the other threads are parsed. Parsing one whole archive in one go
+                    // therefore keeps every committed transaction of that archive in memory (with thousands of
+                    // transactions in a window this is gigabytes of chunks that can not be swapped out - see
+                    // documentation/rac-asm-support-development-plan.md). Stop at a LWN boundary, save the
+                    // position and let the scheduler continue with the redo thread that is behind.
+                    if (!switchRedo && ctx->slicePendingCommits > 0 && metadata->commitSorter != nullptr &&
+                        metadata->commitSorter->getPendingEvents() >= ctx->slicePendingCommits &&
+                        lwnScn > metadata->commitSorter->getWatermark()) {
+                        slicePending = true;
+                        sliceScn = lwnScn;
+                        metadata->saveFileOffset(thread, FileOffset(currentBlock, reader->getBlockSize()));
+                        if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
+                            ctx->logTrace(Ctx::TRACE::CHECKPOINT, "slicing archive at scn: " + lwnScn.toString() + " (block " +
+                                          std::to_string(currentBlock) + "), pending commits: " +
+                                          std::to_string(metadata->commitSorter->getPendingEvents()));
+                        break;
+                    }
                 } else if (unlikely(lwnNumCnt > lwnNumMax))
                     throw RedoLogException(50055, "lwn overflow: " + std::to_string(lwnNumCnt) + "/" + std::to_string(lwnNumMax));
 
@@ -1606,6 +1660,11 @@ namespace OpenLogReplicator {
                     reader->confirmReadData(confirmedBufferStart);
                 }
             }
+
+            // Archive sliced: the position is saved and the scheduler will resume this parser after the other
+            // redo threads have been parsed (and released the memory held by the commit sorter)
+            if (slicePending)
+                break;
 
             // Processing finished
             if (!switchRedo && lwnScn > Scn::zero() && confirmedBufferStart == reader->getBufferEnd() && reader->getRet() == Reader::REDO_CODE::FINISHED) {

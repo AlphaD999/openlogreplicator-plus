@@ -102,7 +102,13 @@ namespace OpenLogReplicator {
             RAW_COLUMN_DATA               = 1 << 15,
             EXPERIMENTAL_XMLTYPE          = 1 << 16,
             EXPERIMENTAL_JSON             = 1 << 17,
-            EXPERIMENTAL_NOT_NULL_MISSING = 1 << 18
+            EXPERIMENTAL_NOT_NULL_MISSING = 1 << 18,
+            // Tolerate a transaction that takes over an undo slot whose previous transaction is still
+            // open in our state. That happens when replication starts mid-stream (the previous
+            // transaction's commit lies before the start position), and without this flag it aborts
+            // the whole redo log processing with 50039. With the flag the stale transaction is
+            // dropped and recorded as broken, and the new one takes the slot.
+            RECOVER_BROKEN_TRANSACTION    = 1 << 19
         };
 
         enum class TRACE : unsigned int {
@@ -160,6 +166,10 @@ namespace OpenLogReplicator {
         // Set when the reader parameter "archives-only" is present in the configuration (either true or false),
         // so that RAC auto-detection can warn when it overrides an explicit value
         bool archivesOnlyConfigured{false};
+        // Set when the reader parameter "arch-source" is "asm": archived redo logs stay in ASM and are reached
+        // through a filesystem bridge (asmfs, NFS, ...) declared in "path-mapping". Archived redo log paths then
+        // start with '+' and must not be filtered out by the SQL layer.
+        bool asmArchives{false};
         uint disableChecks{0};
         LOG logLevel{LOG::INFO};
 
@@ -173,6 +183,9 @@ namespace OpenLogReplicator {
         uint64_t memoryChunksAllocated{0};
         uint64_t memoryChunksFree{0};
         uint64_t memoryChunksHWM{0};
+        // Threads currently waiting for a free chunk. The memory manager reports a possible deadlock when
+        // somebody is blocked and no chunk can be swapped out to make room.
+        uint64_t memoryBlockedThreads{0};
         uint64_t memoryModulesAllocated[MEMORY_COUNT]{0, 0, 0, 0, 0, 0};
 
         mutable std::mutex mtx;
@@ -215,6 +228,11 @@ namespace OpenLogReplicator {
         uint64_t redoVerifyDelayUs{0};
         uint64_t archReadSleepUs{10000000};
         uint64_t refreshIntervalUs{10000000};
+        // Archive slicing: when this many finished transactions wait in the commit sorter for the low-water-mark,
+        // the current archive is sliced so that the other redo threads are parsed first. One memory chunk (1 MB)
+        // is held per waiting transaction, so this bounds the memory used by the transactions of one archive.
+        // 0 disables slicing (every archive is parsed in one go).
+        uint64_t slicePendingCommits{1024};
         // Writer
         uint64_t pollIntervalUs{100000};
         uint64_t queueSize{65536};
@@ -608,6 +626,10 @@ namespace OpenLogReplicator {
         [[nodiscard]] uint64_t getAllocatedMemory() const;
         [[nodiscard]] uint64_t getSwapMemory(Thread* t) const;
         [[nodiscard]] uint64_t getFreeMemory(Thread* t) const;
+        [[nodiscard]] uint64_t getMaxMemory() const;
+        [[nodiscard]] uint64_t getBlockedThreads() const;
+        [[nodiscard]] uint64_t getReservedFreeChunks() const;
+        [[nodiscard]] std::string getMemoryModulesText() const;
         [[nodiscard]] uint8_t* getMemoryChunk(Thread* t, MEMORY module, bool swap = false);
         void freeMemoryChunk(Thread* t, MEMORY module, uint8_t* chunk);
         void swappedMemoryInit(Thread* t, Xid xid);
@@ -618,7 +640,7 @@ namespace OpenLogReplicator {
         [[nodiscard]] uint8_t* swappedMemoryShrink(Thread* t, Xid xid);
         void swappedMemoryFlush(Thread* t, Xid xid);
         void swappedMemoryRemove(Thread* t, Xid xid);
-        void wontSwap(Thread* t) const;
+        void wontSwap(Thread* t, uint64_t openTransactions, uint64_t swappableTransactions) const;
 
         void stopHard();
         void stopSoft();

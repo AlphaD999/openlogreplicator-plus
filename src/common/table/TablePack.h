@@ -137,20 +137,49 @@ namespace OpenLogReplicator {
             return data;
         }
 
+        // Unlinks a row from all three structures and frees it. Unlike dropKeys() a missing index entry is
+        // not an error here: this is only used for rows that are being discarded anyway, so erase() is the
+        // right primitive - it silently does nothing when the entry is absent.
+        // setTouched has to be cleaned up too, otherwise the freed pointer would be dereferenced later by
+        // Schema::dropTable()/purgeDicts().
+        void evict(Data* data) {
+            if constexpr (!std::is_same_v<KeyMap, TabRowIdKeyDefault>) {
+                KeyMap key(data);
+                mapKey.erase(key);
+            }
+
+            if constexpr (!std::is_same_v<KeyUnorderedMap, TabRowIdUnorderedKeyDefault>) {
+                KeyUnorderedMap key(data);
+                unorderedMapKey.erase(key);
+            }
+
+            const auto& it = mapRowId.find(data->rowId);
+            if (it != mapRowId.end() && it->second == data)
+                mapRowId.erase(it);
+            setTouched.erase(data);
+            delete data;
+        }
+
         void add(const Ctx* ctx, Data* data) {
             if (unlikely(ctx->isTraceSet(Ctx::TRACE::SYSTEM)))
                 ctx->logTrace(Ctx::TRACE::SYSTEM, "add: " + Data::tableName() + " (" + data->toString() + ")");
 
             const auto& it = mapRowId.find(data->rowId);
-            if (unlikely(it != mapRowId.end()))
-                throw RuntimeException(50022, "duplicate " + Data::tableName() + " (" + data->toString() + ") for insert");
+            if (unlikely(it != mapRowId.end())) {
+                // Duplicate ROWID while loading the dictionary. The same dictionary row can legitimately be
+                // reached from several loading paths (per-object and per-user, and objects shared by the
+                // SYS user), so tolerate it unconditionally here: drop the stale entry and keep the new one.
+                // Note: this is the dictionary loading entry point only - redo parsing goes through
+                // forInsert(), which keeps its strict behaviour (controlled by ADAPTIVE_SCHEMA).
+                evict(it->second);
+            }
             mapRowId.insert_or_assign(data->rowId, data);
             setTouched.insert(data);
         }
 
         void addWithKeys(const Ctx* ctx, Data* data) {
             add(ctx, data);
-            addKeys(data);
+            addKeys(ctx, data);
         }
 
         void drop(const Ctx* ctx, RowId rowId, FileOffset fileOffset = FileOffset::zero(), bool deleteTouched = false) {
@@ -170,20 +199,35 @@ namespace OpenLogReplicator {
             mapRowId.erase(it);
         }
 
-        void addKeys(Data* data) {
+        // Indexes a row by its unique key. A key can already be taken by a different row when the same
+        // object is seen in more than one container of a CDB, or when the same redo is processed twice -
+        // the dictionary loading and the dictionary redo replay both end up here. With ADAPTIVE_SCHEMA the
+        // newly read row wins and the previous holder is dropped, which is what add() does for a duplicate
+        // ROWID. Without the flag the strict behaviour is kept, so nothing changes for existing setups.
+        void addKeys(const Ctx* ctx, Data* data) {
             if constexpr (!std::is_same_v<KeyMap, TabRowIdKeyDefault>) {
                 KeyMap key(data);
                 const auto& it = mapKey.find(key);
-                if (unlikely(it != mapKey.end()))
-                    throw DataException(50024, "duplicate " + Data::tableName() + " value for unique (" + data->toString() + ")");
+                if (unlikely(it != mapKey.end() && it->second != data)) {
+                    if (unlikely(!ctx->isFlagSet(Ctx::REDO_FLAGS::ADAPTIVE_SCHEMA)))
+                        throw DataException(50024, "duplicate " + Data::tableName() + " value for unique (" + data->toString() + ")");
+                    ctx->warning(60042, "duplicate " + Data::tableName() + " value for unique (" + data->toString() +
+                                 "), dropped: " + it->second->toString());
+                    evict(it->second);
+                }
                 mapKey.insert_or_assign(key, data);
             }
 
             if constexpr (!std::is_same_v<KeyUnorderedMap, TabRowIdUnorderedKeyDefault>) {
                 KeyUnorderedMap key(data);
                 const auto& it = unorderedMapKey.find(key);
-                if (unlikely(it != unorderedMapKey.end()))
-                    throw DataException(50024, "duplicate " + Data::tableName() + " value for unique (" + data->toString() + ")2");
+                if (unlikely(it != unorderedMapKey.end() && it->second != data)) {
+                    if (unlikely(!ctx->isFlagSet(Ctx::REDO_FLAGS::ADAPTIVE_SCHEMA)))
+                        throw DataException(50024, "duplicate " + Data::tableName() + " value for unique (" + data->toString() + ")2");
+                    ctx->warning(60042, "duplicate " + Data::tableName() + " value for unique (" + data->toString() +
+                                 ")2, dropped: " + it->second->toString());
+                    evict(it->second);
+                }
                 unorderedMapKey.insert_or_assign(key, data);
             }
         }
@@ -200,8 +244,10 @@ namespace OpenLogReplicator {
             if constexpr (!std::is_same_v<KeyUnorderedMap, TabRowIdUnorderedKeyDefault>) {
                 KeyUnorderedMap key(data);
                 const auto& it = unorderedMapKey.find(key);
+                // 50030 is "missing index" - this branch used to report 50024, which means "duplicate value
+                // for unique" and contradicted its own message.
                 if (unlikely(it == unorderedMapKey.end()))
-                    throw DataException(50024, "missing index for " + Data::tableName() + " value for unique (" + data->toString() + ")2");
+                    throw DataException(50030, "missing index for " + Data::tableName() + " value for unique (" + data->toString() + ")2");
                 unorderedMapKey.erase(it);
             }
         }

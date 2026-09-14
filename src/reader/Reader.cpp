@@ -168,6 +168,10 @@ namespace OpenLogReplicator {
         return REDO_CODE::OK;
     }
 
+    void Reader::refreshFileSize() {
+        // Subclass specific: nothing to refresh by default
+    }
+
     uint Reader::readSize(uint prevRead) {
         if (prevRead < blockSize)
             return blockSize;
@@ -287,9 +291,17 @@ namespace OpenLogReplicator {
         nextScnHeader = ctx->readScn(headerBuffer + blockSize + 192);
         nextTime = ctx->read32(headerBuffer + blockSize + 200);
 
-        if (numBlocksHeader != Ctx::ZERO_BLK && fileSize > static_cast<uint64_t>(numBlocksHeader) * blockSize && group == 0) {
-            fileSize = static_cast<uint64_t>(numBlocksHeader) * blockSize;
-            ctx->info(0, "updating redo log size to: " + std::to_string(fileSize) + " for: " + fileName);
+        if (numBlocksHeader != Ctx::ZERO_BLK && group == 0) {
+            // The block count from the redo header is authoritative for an archived redo log. The size from stat
+            // can be too big (padding) but also too small or zero: a filesystem bridge such as asmfs reports 0
+            // for a file that is not fully visible yet, and the reader would then poll forever on a position at
+            // or above the file size - without notifying the parser, which waits for the end of the archive in
+            // checkFinished, and without ever reading the rest of the archive.
+            const uint64_t fileSizeHeader = static_cast<uint64_t>(numBlocksHeader) * blockSize;
+            if (fileSize != fileSizeHeader) {
+                fileSize = fileSizeHeader;
+                ctx->info(0, "updating redo log size to: " + std::to_string(fileSize) + " for: " + fileName);
+            }
         }
 
         if (ctx->version == 0) {
@@ -706,6 +718,11 @@ namespace OpenLogReplicator {
                     if (bufferEnd < bufferScan)
                         if (!read2())
                             break;
+
+                    // The size taken at open time can be stale: refresh it before giving up on this position,
+                    // otherwise the reader polls here without notifying the parser (waiting in checkFinished)
+                    if (bufferScan >= fileSize)
+                        refreshFileSize();
 
                     // #1 read
                     if (bufferScan < fileSize && (bufferIsFree() || (bufferScan % Ctx::MEMORY_CHUNK_SIZE) > 0)

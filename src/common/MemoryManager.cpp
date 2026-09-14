@@ -64,6 +64,18 @@ namespace OpenLogReplicator {
                 int64_t swapIndex = -1;
                 Xid unswapXid;
                 int64_t unswapIndex = -1;
+                bool nothingToDo = false;
+                uint64_t openTransactions = 0;
+                uint64_t swappableTransactions = 0;
+
+                // Read outside swapMtx: the getters take memoryMtx, and memoryMtx must never be taken while
+                // holding swapMtx (the reverse order does not occur anywhere else)
+                const uint64_t freeMemoryMb = ctx->getFreeMemory(this);
+                const uint64_t allocatedMemoryMb = ctx->getAllocatedMemory();
+                const uint64_t maxMemoryMb = ctx->getMaxMemory();
+                const uint64_t blockedThreads = ctx->getBlockedThreads();
+                const uint64_t reservedMemoryMb = ctx->getReservedFreeChunks() * Ctx::MEMORY_CHUNK_SIZE_MB;
+                const std::string memoryModulesMb = ctx->getMemoryModulesText();
 
                 {
                     contextSet(CONTEXT::MUTEX, REASON::MEMORY_RUN1);
@@ -71,17 +83,51 @@ namespace OpenLogReplicator {
                     getChunkToUnswap(unswapXid, unswapIndex);
                     getChunkToSwap(swapXid, swapIndex);
 
-                    if (swapIndex == -1)
-                        ctx->wontSwap(this);
-
                     if (unswapIndex == -1 && swapIndex == -1) {
-                        contextSet(CONTEXT::WAIT, REASON::MEMORY_NO_WORK);
-                        ctx->chunksMemoryManager.wait_for(lck, std::chrono::milliseconds(10000));
-                        contextSet(CONTEXT::CPU);
-                        continue;
+                        nothingToDo = true;
+
+                        // Nothing to do while the pool is exhausted: if this persists, the parser and the
+                        // reader are deadlocked on memory (the commit sorter holds unflushed transactions
+                        // that only a further read could release). Warn instead of stalling silently - this
+                        // used to look exactly like a hung process with no error at all, and the warning was
+                        // additionally suppressed whenever a few reserved chunks happened to be left.
+                        openTransactions = ctx->swapChunks.size();
+                        for (const auto& entry: ctx->swapChunks) {
+                            const SwapChunk* sc = entry.second;
+                            if (!sc->release && ctx->swappedFlushXid != entry.first && sc->chunks.size() >= 2)
+                                ++swappableTransactions;
+                        }
+
+                        if (blockedThreads > 0 && (freeMemoryMb == 0 || freeMemoryMb <= reservedMemoryMb)) {
+                            ++exhaustedCycles;
+                            if (exhaustedCycles == 6 || (exhaustedCycles % 60) == 0)
+                                ctx->warning(60043, "memory pool exhausted with nothing left to swap for " +
+                                             std::to_string(exhaustedCycles * 10) + " s (allocated: " +
+                                             std::to_string(allocatedMemoryMb) + " MB of " + std::to_string(maxMemoryMb) +
+                                             " MB, free: " + std::to_string(freeMemoryMb) + " MB, blocked: " +
+                                             std::to_string(blockedThreads) + " thread(s), open transactions: " +
+                                             std::to_string(openTransactions) + ", swappable: " +
+                                             std::to_string(swappableTransactions) + ") - modules: " + memoryModulesMb +
+                                             " - replication is likely stalled; increase \"max-mb\", verify \"swap-path\" is "
+                                             "writable, or skip the big transaction via \"transaction-max-mb\"");
+                        } else
+                            exhaustedCycles = 0;
                     }
                 }
                 contextSet(CONTEXT::CPU);
+
+                if (nothingToDo) {
+                    // Escalation takes memoryMtx only (see wontSwap) and must not run while swapMtx is held
+                    if (blockedThreads > 0)
+                        ctx->wontSwap(this, openTransactions, swappableTransactions);
+
+                    contextSet(CONTEXT::MUTEX, REASON::MEMORY_RUN1);
+                    std::unique_lock lck(ctx->swapMtx);
+                    contextSet(CONTEXT::WAIT, REASON::MEMORY_NO_WORK);
+                    ctx->chunksMemoryManager.wait_for(lck, std::chrono::milliseconds(10000));
+                    contextSet(CONTEXT::CPU);
+                    continue;
+                }
 
                 if (unswapIndex != -1) {
                     if (unswap(unswapXid, unswapIndex) && ctx->metrics != nullptr)

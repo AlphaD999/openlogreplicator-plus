@@ -27,6 +27,10 @@ namespace OpenLogReplicator {
     class MemoryManager final : public Thread {
     protected:
         std::string swapPath;
+        // Consecutive "no work to do while the memory pool is exhausted" cycles (one cycle = one
+        // 10 s wait). Non-zero for more than a minute means the parser and the reader are deadlocked
+        // on memory and replication is stalled - see warning 60043.
+        uint64_t exhaustedCycles{0};
 
     public:
         MemoryManager(Ctx* newCtx, std::string newAlias, std::string newSwapPath);

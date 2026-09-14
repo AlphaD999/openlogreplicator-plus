@@ -77,7 +77,9 @@ namespace OpenLogReplicator {
         static XidMap makeXidMap(Xid xid, typeConId conId, uint16_t thread);
         void purge();
         [[nodiscard]] Transaction* findTransaction(XmlCtx* xmlCtx, Xid xid, typeConId conId, uint16_t thread, bool old, bool add, bool rollback);
-        void dropTransaction(Xid xid, typeConId conId, uint16_t thread);
+        // "expected" guards against erasing an entry that meanwhile belongs to a newer transaction: with a
+        // deferred commit (commit sorter) the same undo slot can be taken over before the flush happens.
+        void dropTransaction(Xid xid, typeConId conId, uint16_t thread, const Transaction* expected = nullptr);
         void addTransactionChunk(Transaction* transaction, RedoLogRecord* redoLogRecord);
         void addTransactionChunk(Transaction* transaction, RedoLogRecord* redoLogRecord1, const RedoLogRecord* redoLogRecord2);
         void rollbackTransactionChunk(Transaction* transaction);

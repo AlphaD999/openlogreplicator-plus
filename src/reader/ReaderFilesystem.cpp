@@ -51,6 +51,25 @@ namespace OpenLogReplicator {
         }
     }
 
+    void ReaderFilesystem::refreshFileSize() {
+        struct stat fileStat{};
+        const int statRet = fileDes != -1 ? fstat(fileDes, &fileStat) : stat(fileName.c_str(), &fileStat);
+        if (statRet != 0)
+            return;
+
+        uint64_t newFileSize = fileStat.st_size;
+        if ((newFileSize & (Ctx::MIN_BLOCK_SIZE - 1)) != 0)
+            newFileSize &= ~(Ctx::MIN_BLOCK_SIZE - 1);
+
+        if (newFileSize == fileSize)
+            return;
+
+        if (unlikely(ctx->isTraceSet(Ctx::TRACE::FILE)))
+            ctx->logTrace(Ctx::TRACE::FILE, "file: " + fileName + " - size refreshed from " + std::to_string(fileSize) + " to " +
+                          std::to_string(newFileSize));
+        fileSize = newFileSize;
+    }
+
     Reader::REDO_CODE ReaderFilesystem::redoOpen() {
         struct stat fileStat{};
 

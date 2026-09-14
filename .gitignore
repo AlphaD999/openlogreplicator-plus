@@ -3,3 +3,11 @@
 documentation/doc
 .codebuddy
 **/.DS_Store
+documentation/oracle-install
+
+# local build output (out-of-source CMake builds, generated IDE projects)
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json

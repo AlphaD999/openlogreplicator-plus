@@ -400,7 +400,7 @@ namespace OpenLogReplicator {
             }
         }
 
-        pack->addKeys(row);
+        pack->addKeys(ctx, row);
 
         if constexpr (TABLE::dependentTable())
             metadata->schema->touchTable(row->getDependentTable());

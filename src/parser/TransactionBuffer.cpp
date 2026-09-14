@@ -23,6 +23,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include "../common/RedoLogRecord.h"
 #include "../common/Thread.h"
 #include "../common/exception/RedoLogException.h"
+#include "../common/types/Scn.h"
 #include "../common/types/Seq.h"
 #include "OpCode0501.h"
 #include "OpCode050B.h"
@@ -66,8 +67,55 @@ namespace OpenLogReplicator {
         auto xidTransactionMapIt = xidTransactionMap.find(xidMap);
         if (xidTransactionMapIt != xidTransactionMap.end()) {
             transaction = xidTransactionMapIt->second;
-            if (unlikely(!rollback && (!old || transaction->xid != xid)))
-                throw RedoLogException(50039, "transaction " + xid.toString() + " conflicts with " + transaction->xid.toString());
+            if (unlikely(!rollback && (!old || transaction->xid != xid))) {
+                // The undo slot is now used by a transaction we do not have in our state yet. There are two
+                // very different reasons for that:
+                //   - the stored transaction never finished as far as we know: we started reading mid-stream
+                //     and never saw its commit/rollback. That is what 60041/50039 are about.
+                //   - the stored transaction has committed already and is merely waiting for the commit
+                //     sorter to flush it. A slot can be reused immediately after a commit, so this is not a
+                //     conflict at all - and the committed transaction must not be touched, because the commit
+                //     sorter still owns it and will purge it. Dropping it here loses its events and frees the
+                //     object twice (the sorter flushes it later).
+                const bool unfinished = (transaction->commitScn == Scn::none());
+
+                if (unfinished && likely(!ctx->isFlagSet(Ctx::REDO_FLAGS::RECOVER_BROKEN_TRANSACTION)))
+                    throw RedoLogException(50039, "transaction " + xid.toString() + " conflicts with " + transaction->xid.toString());
+
+                if (!add) {
+                    // The caller only wanted to look the transaction up: report it as unknown.
+                    return nullptr;
+                }
+
+                if (unfinished) {
+                    ctx->warning(60041, "transaction " + xid.toString() + " takes over the undo slot of unfinished " +
+                                 transaction->xid.toString() + " - the unfinished transaction is dropped");
+                    brokenXidMapList.insert(xidMap);
+                }
+
+                {
+                    ctx->parserThread->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::TRANSACTION_DROP);
+                    std::unique_lock const lck(mtx);
+                    xidTransactionMap.erase(xidMap);
+                }
+
+                if (unfinished) {
+                    transaction->purge(ctx);
+                    delete transaction;
+                }
+
+                transaction = new Transaction(xid, conId, &orphanedLobs, xmlCtx, thread);
+                {
+                    ctx->parserThread->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::TRANSACTION_FIND);
+                    std::unique_lock const lck(mtx);
+                    xidTransactionMap.insert_or_assign(xidMap, transaction);
+                }
+                ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
+                ctx->swappedMemoryInit(ctx->parserThread, xid);
+
+                if (dumpXidList.find(xid) != dumpXidList.end())
+                    transaction->dump = true;
+            }
         } else {
             if (!add)
                 return nullptr;
@@ -88,12 +136,16 @@ namespace OpenLogReplicator {
         return transaction;
     }
 
-    void TransactionBuffer::dropTransaction(Xid xid, typeConId conId, uint16_t thread) {
+    void TransactionBuffer::dropTransaction(Xid xid, typeConId conId, uint16_t thread, const Transaction* expected) {
         const XidMap xidMap = makeXidMap(xid, conId, thread);
         {
             ctx->parserThread->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::TRANSACTION_DROP);
             std::unique_lock const lck(mtx);
-            xidTransactionMap.erase(xidMap);
+            const auto& it = xidTransactionMap.find(xidMap);
+            // With a deferred commit the same undo slot can already be taken over by the next transaction,
+            // so only our own entry may be erased - never the one that replaced it.
+            if (it != xidTransactionMap.end() && (expected == nullptr || it->second == expected))
+                xidTransactionMap.erase(it);
         }
         ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
     }

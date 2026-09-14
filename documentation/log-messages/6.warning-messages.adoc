@@ -197,3 +197,47 @@ Remediation: Verify instance recovery/archival on the remaining nodes; if the ar
 A RAC source database always runs in archives-only mode, because online redo logs of a RAC database reside in ASM and are not readable from outside the cluster.
 An explicit `"archives-only": false` in the reader configuration therefore has no effect on a RAC database.
 Remediation: Remove the parameter to silence the warning; only a non-RAC database can use online mode.
+
+==== code 60041: "transaction <xid> takes over the undo slot of unfinished <xid> - the unfinished transaction is dropped"
+
+An undo slot holds one active transaction at a time. When OpenLogReplicator sees a different transaction
+take over a slot it had seen as still open, the previous transaction is assumed to have committed or
+rolled back unobserved (which is expected when reading starts in the middle of the redo stream).
+The unfinished transaction is discarded to let processing continue.
+Remediation: Only reported with the `RECOVER_BROKEN_TRANSACTION` flag (`1 << 19`). Usually harmless;
+if reported frequently, start reading from a position with no transactions in flight.
+
+==== code 60042: "duplicate <owner>.<table> value for unique (<columns>), dropped: <columns>"
+
+The unique key of a dictionary row is already indexed by a different row. This happens when the same
+object is present in more than one container of a CDB, or when the same redo stream is processed twice.
+Remediation: Only reported with the `ADAPTIVE_SCHEMA` flag (`1 << 2`), in which case the newly read row
+wins and the previous holder is discarded. Without the flag the same condition is an error (50024).
+
+==== code 60043: "memory pool exhausted with nothing left to swap for <seconds> s (allocated: <number> MB of <number> MB, free: <number> MB, blocked: <number> thread(s), open transactions: <number>, swappable: <number>) - modules: <modules> - replication is likely stalled; increase \"max-mb\", verify \"swap-path\" is writable, or skip the big transaction via \"transaction-max-mb\""
+
+The memory pool is completely allocated, at least one thread is waiting for a chunk and the memory manager
+has no transaction chunk left to swap out, so the parser (waiting for transaction memory) and the reader
+(waiting for a read buffer) can no longer make progress. The message reports the pool state, how many
+threads are blocked, how many transactions are open, how many of them are swappable and the per module
+memory usage. Replication is stalled until the condition resolves.
+
+Two independent limits can lead here:
+* a single transaction bigger than the configured `max-mb` (or `swap-path` does not exist or is not writable -
+  in that case transactions cannot be swapped out at all; `swap-path` is validated at startup since this
+  release);
+* the number of concurrently open transactions: every open transaction occupies at least
+  `MEMORY_CHUNK_SIZE_MB` and only transactions with more than one chunk are swappable, so a workload with
+  thousands of concurrent transactions can exhaust the pool even with small transactions. This case is
+  reported with `swappable: 0`. Note that a fresh start positioned in the middle of an archive re-reads the
+  whole archive from its beginning, so the peak number of open transactions can be the whole pre-start
+  part of an archive.
+
+Remediation: increase `memory.max-mb` (at least 110% of the biggest expected transaction and at least the
+peak number of concurrently open transactions in MB plus the read/write buffers), make sure
+`memory.swap-path` exists and is writable by the process user, or set `transaction-max-mb` to skip
+transactions bigger than the configured size (their data is not replicated).
+
+When the parser itself is blocked and nothing can be swapped out, the run is not recoverable (the commit
+sorter is flushed only by the parser) and OpenLogReplicator terminates with error 10017 instead of waiting
+forever.

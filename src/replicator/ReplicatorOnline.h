@@ -53,6 +53,30 @@ namespace OpenLogReplicator {
             ",  IS_RECOVERY_DEST_FILE DESC"
         };
 
+        // Used with reader parameter "arch-source": "asm". Archived redo logs stay in ASM - the path returned
+        // here is rewritten by "path-mapping" to a filesystem bridge (asmfs, NFS, ...).
+        static constexpr std::string_view SQL_GET_ARCHIVE_LOG_LIST_ASM
+        {
+            "SELECT"
+            "   NAME"
+            ",  SEQUENCE#"
+            ",  FIRST_CHANGE#"
+            ",  NEXT_CHANGE#"
+            ",  THREAD#"
+            " FROM"
+            "   SYS.V_$ARCHIVED_LOG"
+            " WHERE"
+            "   SEQUENCE# >= :i"
+            "   AND RESETLOGS_ID = :j"
+            "   AND NAME IS NOT NULL"
+            "   AND NAME LIKE '+%'"
+            " ORDER BY"
+            "   THREAD#"
+            ",  SEQUENCE#"
+            ",  DEST_ID"
+            ",  IS_RECOVERY_DEST_FILE DESC"
+        };
+
         static constexpr std::string_view SQL_GET_DATABASE_INFORMATION
         {
             "SELECT"
@@ -193,13 +217,29 @@ namespace OpenLogReplicator {
             "   SYS.V_$THREAD"
         };
 
+        // Only answers "is there at least one archived redo log reachable from a filesystem" - the count is
+        // capped at 1 with FETCH FIRST so that the check stays cheap on databases archiving hundreds of GB/h.
         static constexpr std::string_view SQL_CHECK_FS_ARCHIVED_LOG
         {
-            "SELECT COUNT(*) FROM"
-            "   SYS.V_$ARCHIVED_LOG"
-            " WHERE"
-            "   NAME IS NOT NULL"
-            "   AND NAME NOT LIKE '+%'"
+            "SELECT COUNT(*) FROM ("
+            "   SELECT 1 FROM"
+            "      SYS.V_$ARCHIVED_LOG"
+            "    WHERE"
+            "      NAME IS NOT NULL"
+            "      AND NAME NOT LIKE '+%'"
+            "    FETCH FIRST 1 ROWS ONLY)"
+        };
+
+        // Counterpart of SQL_CHECK_FS_ARCHIVED_LOG for reader parameter "arch-source": "asm".
+        static constexpr std::string_view SQL_CHECK_ASM_ARCHIVED_LOG
+        {
+            "SELECT COUNT(*) FROM ("
+            "   SELECT 1 FROM"
+            "      SYS.V_$ARCHIVED_LOG"
+            "    WHERE"
+            "      NAME IS NOT NULL"
+            "      AND NAME LIKE '+%'"
+            "    FETCH FIRST 1 ROWS ONLY)"
         };
 
         static constexpr std::string_view SQL_GET_PARAMETER
@@ -228,12 +268,9 @@ namespace OpenLogReplicator {
             "   L.ROWID, L.CON#, L.INTCOL#, L.OBJ#, MOD(L.SPARE1, 18446744073709551616) AS SPARE11,"
             "   MOD(TRUNC(L.SPARE1 / 18446744073709551616), 18446744073709551616) AS SPARE12"
             " FROM"
-            "   SYS.OBJ$ AS OF SCN :i O"
-            " JOIN"
-            "   SYS.CCOL$ AS OF SCN :j L ON"
-            "     O.OBJ# = L.OBJ#"
+            "   SYS.CCOL$ AS OF SCN :j L"
             " WHERE"
-            "   O.OWNER# = :k"
+            "   L.OBJ# IN (SELECT OBJ# FROM SYS.OBJ$ AS OF SCN :i O WHERE O.OWNER# = :k)"
         };
 
         static constexpr std::string_view SQL_GET_SYS_CCOL_OBJ
@@ -252,12 +289,9 @@ namespace OpenLogReplicator {
             "SELECT"
             "   D.ROWID, D.CON#, D.OBJ#, D.TYPE#"
             " FROM"
-            "   SYS.OBJ$ AS OF SCN :i O"
-            " JOIN"
-            "   SYS.CDEF$ AS OF SCN :j D ON"
-            "     O.OBJ# = D.OBJ#"
+            "   SYS.CDEF$ AS OF SCN :j D"
             " WHERE"
-            "   O.OWNER# = :k"
+            "   D.OBJ# IN (SELECT OBJ# FROM SYS.OBJ$ AS OF SCN :i O WHERE O.OWNER# = :k)"
         };
 
         static constexpr std::string_view SQL_GET_SYS_CDEF_OBJ
@@ -276,12 +310,9 @@ namespace OpenLogReplicator {
             "   C.ROWID, C.OBJ#, C.COL#, C.SEGCOL#, C.INTCOL#, C.NAME, C.TYPE#, C.LENGTH, C.PRECISION#, C.SCALE, C.CHARSETFORM, C.CHARSETID, C.NULL$,"
             "   MOD(C.PROPERTY, 18446744073709551616) AS PROPERTY1, MOD(TRUNC(C.PROPERTY / 18446744073709551616), 18446744073709551616) AS PROPERTY2"
             " FROM"
-            "   SYS.OBJ$ AS OF SCN :i O"
-            " JOIN"
-            "   SYS.COL$ AS OF SCN :j C ON"
-            "     O.OBJ# = C.OBJ#"
+            "   SYS.COL$ AS OF SCN :j C"
             " WHERE"
-            "   O.OWNER# = :k"
+            "   C.OBJ# IN (SELECT OBJ# FROM SYS.OBJ$ AS OF SCN :i O WHERE O.OWNER# = :k)"
         };
 
         static constexpr std::string_view SQL_GET_SYS_COL_OBJ
@@ -301,12 +332,9 @@ namespace OpenLogReplicator {
             "   DS.ROWID, DS.OBJ#, MOD(DS.FLAGS_STG, 18446744073709551616) AS FLAGS_STG1,"
             "   MOD(TRUNC(DS.FLAGS_STG / 18446744073709551616), 18446744073709551616) AS FLAGS_STG2"
             " FROM"
-            "   SYS.OBJ$ AS OF SCN :i O"
-            " JOIN"
-            "   SYS.DEFERRED_STG$ AS OF SCN :j DS ON"
-            "     O.OBJ# = DS.OBJ#"
+            "   SYS.DEFERRED_STG$ AS OF SCN :j DS"
             " WHERE"
-            "   O.OWNER# = :k"
+            "   DS.OBJ# IN (SELECT OBJ# FROM SYS.OBJ$ AS OF SCN :i O WHERE O.OWNER# = :k)"
         };
 
         static constexpr std::string_view SQL_GET_SYS_DEFERRED_STG_OBJ
@@ -325,12 +353,9 @@ namespace OpenLogReplicator {
             "SELECT"
             "   E.ROWID, E.TABOBJ#, E.COLNUM, E.GUARD_ID"
             " FROM"
-            "   SYS.OBJ$ AS OF SCN :i O"
-            " JOIN"
-            "   SYS.ECOL$ AS OF SCN :j E ON"
-            "     O.OBJ# = E.TABOBJ#"
+            "   SYS.ECOL$ AS OF SCN :j E"
             " WHERE"
-            "   O.OWNER# = :k"
+            "   E.TABOBJ# IN (SELECT OBJ# FROM SYS.OBJ$ AS OF SCN :i O WHERE O.OWNER# = :k)"
         };
 
         static constexpr std::string_view SQL_GET_SYS_ECOL_OBJ
@@ -348,12 +373,9 @@ namespace OpenLogReplicator {
             "SELECT"
             "   E.ROWID, E.TABOBJ#, E.COLNUM, -1 AS GUARD_ID"
             " FROM"
-            "   SYS.OBJ$ AS OF SCN :i O"
-            " JOIN"
-            "   SYS.ECOL$ AS OF SCN :j E ON"
-            "     O.OBJ# = E.TABOBJ#"
+            "   SYS.ECOL$ AS OF SCN :j E"
             " WHERE"
-            "   O.OWNER# = :k"
+            "   E.TABOBJ# IN (SELECT OBJ# FROM SYS.OBJ$ AS OF SCN :i O WHERE O.OWNER# = :k)"
         };
 
         static constexpr std::string_view SQL_GET_SYS_ECOL11_OBJ
@@ -371,12 +393,9 @@ namespace OpenLogReplicator {
             "SELECT"
             "   L.ROWID, L.OBJ#, L.COL#, L.INTCOL#, L.LOBJ#, L.TS#"
             " FROM"
-            "   SYS.OBJ$ AS OF SCN :i O"
-            " JOIN"
-            "   SYS.LOB$ AS OF SCN :j L ON"
-            "     O.OBJ# = L.OBJ#"
+            "   SYS.LOB$ AS OF SCN :j L"
             " WHERE"
-            "   O.OWNER# = :k"
+            "   L.OBJ# IN (SELECT OBJ# FROM SYS.OBJ$ AS OF SCN :i O WHERE O.OWNER# = :k)"
         };
 
         static constexpr std::string_view SQL_GET_SYS_LOB_OBJ
@@ -394,15 +413,12 @@ namespace OpenLogReplicator {
             "SELECT"
             "   LCP.ROWID, LCP.PARTOBJ#, LCP.LOBJ#"
             " FROM"
-            "   SYS.OBJ$ AS OF SCN :i O"
-            " JOIN"
-            "   SYS.LOB$ AS OF SCN :j L ON"
-            "     O.OBJ# = L.OBJ#"
+            "   SYS.LOB$ AS OF SCN :j L"
             " JOIN"
             "   SYS.LOBCOMPPART$ AS OF SCN :k LCP ON"
             "     LCP.LOBJ# = L.LOBJ#"
             " WHERE"
-            "   O.OWNER# = :l"
+            "   L.OBJ# IN (SELECT OBJ# FROM SYS.OBJ$ AS OF SCN :i O WHERE O.OWNER# = :l)"
         };
 
         static constexpr std::string_view SQL_GET_SYS_LOB_COMP_PART_OBJ
@@ -505,12 +521,9 @@ namespace OpenLogReplicator {
             "   MOD(T.FLAGS, 18446744073709551616) AS FLAGS1, MOD(TRUNC(T.FLAGS / 18446744073709551616), 18446744073709551616) AS FLAGS2,"
             "   MOD(T.PROPERTY, 18446744073709551616) AS PROPERTY1, MOD(TRUNC(T.PROPERTY / 18446744073709551616), 18446744073709551616) AS PROPERTY2"
             " FROM"
-            "   SYS.OBJ$ AS OF SCN :i O"
-            " JOIN"
-            "   SYS.TAB$ AS OF SCN :j T ON"
-            "     O.OBJ# = T.OBJ#"
+            "   SYS.TAB$ AS OF SCN :j T"
             " WHERE"
-            "   O.OWNER# = :k"
+            "   T.OBJ# IN (SELECT OBJ# FROM SYS.OBJ$ AS OF SCN :i O WHERE O.OWNER# = :k)"
         };
 
         static constexpr std::string_view SQL_GET_SYS_TAB_OBJ
@@ -530,12 +543,9 @@ namespace OpenLogReplicator {
             "SELECT"
             "   TCP.ROWID, TCP.OBJ#, TCP.DATAOBJ#, TCP.BO#"
             " FROM"
-            "   SYS.OBJ$ AS OF SCN :i O"
-            " JOIN"
-            "   SYS.TABCOMPART$ AS OF SCN :j TCP ON"
-            "     O.OBJ# = TCP.OBJ#"
+            "   SYS.TABCOMPART$ AS OF SCN :j TCP"
             " WHERE"
-            "   O.OWNER# = :k"
+            "   TCP.OBJ# IN (SELECT OBJ# FROM SYS.OBJ$ AS OF SCN :i O WHERE O.OWNER# = :k)"
         };
 
         static constexpr std::string_view SQL_GET_SYS_TABCOMPART_OBJ
@@ -553,12 +563,9 @@ namespace OpenLogReplicator {
             "SELECT"
             "   TP.ROWID, TP.OBJ#, TP.DATAOBJ#, TP.BO#"
             " FROM"
-            "   SYS.OBJ$ AS OF SCN :i O"
-            " JOIN"
-            "   SYS.TABPART$ AS OF SCN :j TP ON"
-            "     O.OBJ# = TP.OBJ#"
+            "   SYS.TABPART$ AS OF SCN :j TP"
             " WHERE"
-            "   O.OWNER# = :k"
+            "   TP.OBJ# IN (SELECT OBJ# FROM SYS.OBJ$ AS OF SCN :i O WHERE O.OWNER# = :k)"
         };
 
         static constexpr std::string_view SQL_GET_SYS_TABPART_OBJ
@@ -576,12 +583,9 @@ namespace OpenLogReplicator {
             "SELECT"
             "   TSP.ROWID, TSP.OBJ#, TSP.DATAOBJ#, TSP.POBJ#"
             " FROM"
-            "   SYS.OBJ$ AS OF SCN :i O"
-            " JOIN"
-            "   SYS.TABSUBPART$ AS OF SCN :j TSP ON"
-            "     O.OBJ# = TSP.OBJ#"
+            "   SYS.TABSUBPART$ AS OF SCN :j TSP"
             " WHERE"
-            "   O.OWNER# = :k"
+            "   TSP.OBJ# IN (SELECT OBJ# FROM SYS.OBJ$ AS OF SCN :i O WHERE O.OWNER# = :k)"
         };
 
         static constexpr std::string_view SQL_GET_SYS_TABSUBPART_OBJ
@@ -662,9 +666,11 @@ namespace OpenLogReplicator {
         void positionReader() override;
         void loadDatabaseMetadata() override;
         bool checkConnection() override;
+        bool checkConnectionFor(DatabaseConnection* databaseConnection);
         std::string getParameterValue(std::string parameter) const;
         std::string getPropertyValue(std::string property) const;
-        void checkTableForGrants(const std::string& tableName);
+        // databaseConnection defaults to the main connection (dictionary side)
+        void checkTableForGrants(const std::string& tableName, DatabaseConnection* databaseConnection = nullptr);
         void checkTableForGrantsFlashback(const std::string& tableName, Scn scn);
         std::string getModeName() const override;
         void verifySchema(Scn currentScn) override;
@@ -684,12 +690,24 @@ namespace OpenLogReplicator {
     public:
         DatabaseEnvironment* env;
         DatabaseConnection* conn;
+        // Optional second connection: the database that keeps the archived redo log list (typically a standby
+        // that received the archived redo logs of the primary in "conn"). Only the archive log list and the
+        // checks/reports that validate it are routed here - the dictionary, the database metadata and the
+        // positioning stay on "conn". When "archives-server" is not configured this stays null and every
+        // query keeps going through "conn", so the behavior is unchanged.
+        DatabaseConnection* connArchives;
         bool keepConnection;
 
         ReplicatorOnline(Ctx* newCtx, void (*newArchGetLog)(Replicator* replicator), Builder* newBuilder, Metadata* newMetadata,
                          TransactionBuffer* newTransactionBuffer, std::string newAlias, std::string newDatabase, std::string newUser,
-                         std::string newPassword, std::string newConnectString, bool newKeepConnection);
+                         std::string newPassword, std::string newConnectString, std::string newArchivesUser,
+                         std::string newArchivesPassword, std::string newArchivesConnectString, bool newKeepConnection);
         ~ReplicatorOnline() override;
+
+        // Connection that holds the archived redo log list
+        [[nodiscard]] DatabaseConnection* getArchivesConnection() const {
+            return connArchives != nullptr ? connArchives : conn;
+        }
 
         void goStandby() override;
 

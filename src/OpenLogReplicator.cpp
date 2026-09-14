@@ -355,6 +355,17 @@ namespace OpenLogReplicator {
                                              std::to_string(memoryUnswapBufferMinMb) + " + " + std::to_string(memoryReadBufferMinMb) +
                                              " + " + std::to_string(memoryWriteBufferMinMb) + " + 4) is greater than \"max-mb\" value (" +
                                              std::to_string(memoryMaxMb) + ")");
+
+            // A missing or unwritable swap directory cannot be reported once replication runs: the memory manager
+            // would silently fail to swap transaction chunks out and the parser/reader would deadlock on an exhausted
+            // pool. Report it at startup instead.
+            if (memorySwapMb > 0) {
+                struct stat swapDirStat{};
+                if (stat(memorySwapPath.c_str(), &swapDirStat) != 0 || !S_ISDIR(swapDirStat.st_mode))
+                    throw ConfigurationException(30001, R"(bad JSON, invalid "swap-path" value: )" + memorySwapPath +
+                                                 " - not a readable directory: " + strerror(errno) +
+                                                 "; create it and make it writable for the process user, or set \"swap-mb\": 0 to disable swapping");
+            }
         }
 
         // MEMORY MANAGER
@@ -482,6 +493,7 @@ namespace OpenLogReplicator {
                     "redo-verify-delay-us",
                     "refresh-interval-us",
                     "schema-change-topic",
+                    "slice-pending-commits",
                     "state",
                     "topic-prefix",
                     "transaction-max-mb"
@@ -497,7 +509,11 @@ namespace OpenLogReplicator {
 
             if (!ctx->isDisableChecksSet(Ctx::DISABLE_CHECKS::JSON_TAGS)) {
                 static const std::vector<std::string> readerNames {
+                    "arch-source",
                     "archives-only",
+                    "archives-password",
+                    "archives-server",
+                    "archives-user",
                     "db-timezone",
                     "disable-checks",
                     "host-timezone",
@@ -520,9 +536,11 @@ namespace OpenLogReplicator {
 
             if (sourceJson.HasMember("flags")) {
                 ctx->flags = Ctx::getJsonFieldU64(configFileName, sourceJson, "flags");
-                if (ctx->flags > 524287)
+                // REDO_FLAGS currently uses bits 0..19 (see Ctx::REDO_FLAGS), so the accepted
+                // range is 0 .. (1 << 20) - 1.
+                if (ctx->flags > 1048575)
                     throw ConfigurationException(30001, "bad JSON, invalid \"flags\" value: " + std::to_string(ctx->flags) +
-                                                 ", expected: one of {0 .. 524287}");
+                                                 ", expected: one of {0 .. 1048575}");
                 if (ctx->isFlagSet(Ctx::REDO_FLAGS::DIRECT_DISABLE))
                     ctx->redoVerifyDelayUs = 500000;
             }
@@ -549,6 +567,19 @@ namespace OpenLogReplicator {
                 if (ctx->disableChecks > 15)
                     throw ConfigurationException(30001, "bad JSON, invalid \"disable-checks\" value: " +
                                                  std::to_string(ctx->disableChecks) + ", expected: one of {0 .. 15}");
+            }
+
+            // Where the archived redo logs are stored. "asm" keeps them in ASM and expects "path-mapping" to
+            // point at a filesystem bridge (asmfs, NFS, ...).
+            if (readerJson.HasMember("arch-source")) {
+                const std::string archSource = Ctx::getJsonFieldS(configFileName, Ctx::JSON_PARAMETER_LENGTH, readerJson, "arch-source");
+                if (archSource == "filesystem")
+                    ctx->asmArchives = false;
+                else if (archSource == "asm")
+                    ctx->asmArchives = true;
+                else
+                    throw ConfigurationException(30001, "bad JSON, invalid \"arch-source\" value: " + archSource +
+                                                 R"(, expected: one of {"filesystem", "asm"})");
             }
 
             Scn startScn = Scn::none();
@@ -947,6 +978,15 @@ namespace OpenLogReplicator {
                                                  std::to_string(ctx->archReadTries) + ", expected: one of: {1 .. 1000000000}");
             }
 
+            // Archive slicing for RAC sources: bounds the transaction memory kept by the commit sorter (one
+            // chunk per finished transaction that waits for the low-water-mark over the redo threads)
+            if (sourceJson.HasMember("slice-pending-commits")) {
+                ctx->slicePendingCommits = Ctx::getJsonFieldU64(configFileName, sourceJson, "slice-pending-commits");
+                if (ctx->slicePendingCommits > 10000000)
+                    throw ConfigurationException(30001, "bad JSON, invalid \"slice-pending-commits\" value: " +
+                                                 std::to_string(ctx->slicePendingCommits) + ", expected: one of: {0 .. 10000000}");
+            }
+
             if (sourceJson.HasMember("redo-verify-delay-us"))
                 ctx->redoVerifyDelayUs = Ctx::getJsonFieldU64(configFileName, sourceJson, "redo-verify-delay-us");
 
@@ -981,6 +1021,27 @@ namespace OpenLogReplicator {
                 const std::string server = Ctx::getJsonFieldS(configFileName, Ctx::JSON_SERVER_LENGTH, readerJson, "server");
                 bool keepConnection = false;
 
+                // Optional second connection: the database that keeps the archived redo log list - typically a
+                // standby that received the archived redo logs of the primary. The file names registered there
+                // differ from the primary (db_unique_name directory and ASM incarnation number), so they have to
+                // be read from the instance that owns the files. "user"/"password" are reused as defaults.
+                std::string archivesServer;
+                std::string archivesUser;
+                std::string archivesPassword;
+                if (readerJson.HasMember("archives-server")) {
+                    archivesServer = Ctx::getJsonFieldS(configFileName, Ctx::JSON_SERVER_LENGTH, readerJson, "archives-server");
+                    if (readerJson.HasMember("archives-user"))
+                        archivesUser = Ctx::getJsonFieldS(configFileName, Ctx::JSON_USERNAME_LENGTH, readerJson, "archives-user");
+                    else
+                        archivesUser = user;
+                    if (readerJson.HasMember("archives-password"))
+                        archivesPassword = Ctx::getJsonFieldS(configFileName, Ctx::JSON_PASSWORD_LENGTH, readerJson, "archives-password");
+                    else
+                        archivesPassword = password;
+                } else if (readerJson.HasMember("archives-user") || readerJson.HasMember("archives-password")) {
+                    throw ConfigurationException(30001, R"(bad JSON, "archives-user" and "archives-password" require "archives-server")");
+                }
+
                 if (sourceJson.HasMember("arch")) {
                     const std::string arch = Ctx::getJsonFieldS(configFileName, Ctx::JSON_PARAMETER_LENGTH, sourceJson, "arch");
 
@@ -997,7 +1058,8 @@ namespace OpenLogReplicator {
                 } else
                     archGetLog = ReplicatorOnline::archGetLogOnline;
 
-                replicator = new ReplicatorOnline(ctx, archGetLog, builder, metadata, transactionBuffer, alias, name, user, password, server, keepConnection);
+                replicator = new ReplicatorOnline(ctx, archGetLog, builder, metadata, transactionBuffer, alias, name, user, password, server,
+                                                 archivesUser, archivesPassword, archivesServer, keepConnection);
                 builder->initialize();
                 replicator->initialize();
                 mainProcessMapping(readerJson);

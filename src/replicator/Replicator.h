@@ -25,6 +25,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include <queue>
 #include <set>
 #include <unordered_map>
+#include <deque>
 #include <vector>
 
 #include "../common/Ctx.h"
@@ -42,10 +43,6 @@ namespace OpenLogReplicator {
     class Transaction;
     class TransactionBuffer;
 
-    struct parserCompare {
-        bool operator()(const Parser* p1, const Parser* p2) const;
-    };
-
     class Replicator : public Thread {
     protected:
         void (*archGetLog)(Replicator* replicator);
@@ -57,7 +54,15 @@ namespace OpenLogReplicator {
         // Redo log files
         Reader* archReader{nullptr};
         std::string lastCheckedDay;
-        std::priority_queue<Parser*, std::vector<Parser*>, parserCompare> archiveRedoQueue;
+        // Archived redo logs waiting to be parsed. The next one is selected on demand by the SCN still to be
+        // parsed (see bestArchiveIndex) instead of by (thread, sequence): with several redo threads the
+        // archives have to be interleaved, otherwise parsing one whole archive keeps every committed
+        // transaction of that archive in memory until the other threads catch up (the low-water-mark - the
+        // minimum parsed SCN over the threads - only moves then). One chunk (1 MB) is held per open
+        // transaction regardless of its size, so this is the difference between a few MB and tens of GB.
+        std::vector<Parser*> archiveRedoQueue;
+        // Archives parked because the predecessor is missing: the other redo threads may still be parseable
+        std::deque<Parser*> gapArchives;
         std::set<Parser*> onlineRedoSet;
         std::set<Reader*> readers;
         std::vector<std::string> pathMapping;
@@ -66,6 +71,8 @@ namespace OpenLogReplicator {
         std::map<uint16_t, bool> threadClosed;
 
         void cleanArchList();
+        // Index of the archive with the lowest SCN still to be parsed in archiveRedoQueue
+        [[nodiscard]] size_t bestArchiveIndex() const;
         void updateOnlineLogs() const;
         void readerDropAll();
         static Seq getSequenceFromFileName(const Replicator* replicator, const std::string& file, uint16_t& thread);

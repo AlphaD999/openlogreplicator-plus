@@ -398,5 +398,11 @@ Increase `write-buffer-max-mb` and possibly `max-mb`.
 
 ==== code 10073: "RAC database detected but no archived redo logs on filesystem found - configure log_archive_dest_2 to archive redo logs to a filesystem"
 
-The source database runs in RAC mode, but no archived redo log copy is available on a regular filesystem (all copies reside in ASM).
+The source database runs in RAC mode with the default reader parameter `arch-source` = `filesystem`, but no archived redo log copy is available on a regular filesystem (all copies reside in ASM).
 Remediation: Configure `log_archive_dest_2` with `LOCATION` pointing to a filesystem directory visible to OpenLogReplicator, then archive the current logs (`ALTER SYSTEM ARCHIVE LOG CURRENT` on each node).
+Alternatively, if the archived redo logs are meant to stay in ASM and are reached through a filesystem bridge, set `arch-source` to `asm` in the `reader` element.
+
+==== code 10073: "RAC database detected with \"arch-source\": \"asm\" but no archived redo logs in ASM found"
+
+The source database runs in RAC mode with `arch-source` = `asm`, but no archived redo log row with an ASM path (`+...`) was found in `SYS.V_$ARCHIVED_LOG`.
+Remediation: Check that the archiver is running and that at least one archived redo log exists, then archive the current logs (`ALTER SYSTEM ARCHIVE LOG CURRENT` on each node). If archived redo logs do exist, the reader is connected to the wrong database.

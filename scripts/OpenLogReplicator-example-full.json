@@ -35,6 +35,7 @@
       "name": "DBNAME",
       "reader": {
         "type": "online",
+        "arch-source": "filesystem",
         "path-mapping": ["/db/fra", "/opt/fast-recovery-area"],
         "redo-copy-path": "copy",
         "user": "user1",
