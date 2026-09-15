@@ -69,6 +69,10 @@ namespace OpenLogReplicator {
         std::vector<std::string> redoLogsBatch;
         // RAC thread state: true = thread closed (instance down), refreshed from V$THREAD
         std::map<uint16_t, bool> threadClosed;
+        // Start of the current "nothing was read in this pass" period and the timestamp of the last report of
+        // it (warning 60047, at most one message per 30 s). Both are reset as soon as a pass does real work.
+        uint64_t idleSince{0};
+        uint64_t lastIdleReport{0};
 
         void cleanArchList();
         // Index of the archive with the lowest SCN still to be parsed in archiveRedoQueue

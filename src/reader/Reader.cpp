@@ -717,6 +717,29 @@ namespace OpenLogReplicator {
                     // would then neither read nor notify the parser and the whole run would stall without
                     // a single message.
                     if (bufferEnd >= fileSize) {
+                        // The end of the redo log reached - but the size known here can still be too small: the
+                        // redo header block count is written while the archiver copies the log, and a
+                        // filesystem bridge can bound the reads by the size the file had when the handle was
+                        // opened (asmfs answers stat with the current size but clamps reads to the size
+                        // snapshotted at open). Accepting such a size as the end of the archive skips its tail
+                        // silently: the parser finishes the archive, the checkpoint moves past redo that was
+                        // never read and the low-water-mark stops advancing (the transactions held in the
+                        // commit sorter are never released again). Re-read the size before finishing: if the
+                        // file turns out to be bigger, keep reading - and if the tail is still not readable,
+                        // the read below stops the archive (60044) and it is picked up again with a fresh
+                        // handle on the next pass.
+                        const uint64_t fileSizeBefore = fileSize;
+                        refreshFileSize();
+                        if (group == 0 && numBlocksHeader != Ctx::ZERO_BLK) {
+                            const uint64_t fileSizeHeader = static_cast<uint64_t>(numBlocksHeader) * blockSize;
+                            if (fileSizeHeader > fileSize)
+                                fileSize = fileSizeHeader;
+                        }
+                        if (fileSize > fileSizeBefore) {
+                            ctx->info(0, "updating redo log size to: " + std::to_string(fileSize) + " for: " + fileName);
+                            continue;
+                        }
+
                         if (nextScnHeader != Scn::none()) {
                             ret = REDO_CODE::FINISHED;
                             nextScn = nextScnHeader;

@@ -282,3 +282,20 @@ The warning is repeated while the condition persists (first after about 200 * `r
 1200 iterations). A single occurrence can be caused by a slow filesystem bridge, a repeating one means that
 replication is stalled - the redo log mentioned in the message is the place to look at. Before this warning
 existed such a stall produced no log message at all.
+
+==== code 60047: "no archived redo log was read for: <number> s, but <number> committed transaction(s) still wait for the low-water-mark (scn: <number>, thread watermarks: <text>, archives in the list: <number>, skipped: <number>, parked: <number>)"
+
+Reported in archives-only mode when a pass over the archive list did not read anything while committed
+transactions are still buffered in the commit sorter **and the first of them is already at or below the
+low-water-mark**. The sorter is flushed only by the parser (the low-water-mark is the minimum parsed SCN over
+the redo threads), so once the parser stops reading nothing can release those transactions any more: replication
+stops delivering while the process looks exactly like an idle one. Transactions that wait *above* the
+low-water-mark are the normal case (the other redo thread has not been parsed that far yet) and are not
+reported. The message reports how long this has been going on, the SCN of the first buffered event and the
+current low-water-mark, the per thread watermarks (a thread released by `idle-thread-release-us` or closed by
+instance recovery is marked as such), how many archives are still in the list, how many were dropped as already
+parsed and how many are parked waiting for a missing predecessor.
+
+At most one message per 30 seconds. A run that reports this has to be restarted (`pkill` +
+restart): the scheduler resumes from the checkpoint and the saved file offsets, so the data is not lost, it is
+only delayed.

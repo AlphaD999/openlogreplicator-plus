@@ -131,4 +131,20 @@ namespace OpenLogReplicator {
             events.erase(it);
         }
     }
+
+    std::string CommitSorter::getThreadWatermarksText() const {
+        std::string ret;
+        for (const auto& [thread, parsedScn]: threadWatermark) {
+            if (!ret.empty())
+                ret += ", ";
+            ret += std::to_string(thread) + ": " + parsedScn.toString();
+            if (closedThreads.find(thread) != closedThreads.end())
+                ret += " (closed)";
+            else if (idleThreads.find(thread) != idleThreads.end())
+                ret += " (released)";
+        }
+        if (ret.empty())
+            ret = "none";
+        return ret;
+    }
 }

@@ -752,6 +752,7 @@ namespace OpenLogReplicator {
             // dropped without reading a byte (already parsed archives, archives parked because a predecessor
             // is missing), and the pass has to be told apart from one that did real work.
             bool processedThisPass = false;
+            uint64_t skippedThisPass = 0;
 
             if (unlikely(ctx->isTraceSet(Ctx::TRACE::REDO)))
                 ctx->logTrace(Ctx::TRACE::REDO, "checking archived redo logs, seq: " + metadata->sequence.toString());
@@ -799,6 +800,7 @@ namespace OpenLogReplicator {
                         ctx->logTrace(Ctx::TRACE::ARCHIVE_LIST, "skipping already parsed archive: thread: " +
                                       std::to_string(parser->thread) + ", seq: " + parser->sequence.toString() +
                                       ", expected: " + expectedSequence.toString());
+                    ++skippedThisPass;
                     delete parser;
                     continue;
                 }
@@ -872,6 +874,15 @@ namespace OpenLogReplicator {
                 ret = parser->parse();
                 metadata->setFirstNextScn(parser->firstScn, parser->nextScn, parser->thread);
 
+                // Report the outcome of every archive. The parser logs when it starts reading an archive,
+                // nothing was logged when it ended - a finished / stopped / dropped archive left no trace at
+                // all, which made a run that stopped delivering indistinguishable from an idle one.
+                ctx->info(0, "archived redo log " + parser->path + " - thread: " + std::to_string(parser->thread) +
+                          ", seq: " + parser->sequence.toString() + " - result: " +
+                          std::string(Reader::REDO_MSG[static_cast<uint>(ret)]) + (parser->slicePending ? " (sliced)" : "") +
+                          ", position: " + archReader->getBufferStart().toString() + " / " + archReader->getBufferEnd().toString() +
+                          ", expected sequence: " + metadata->threadSequence(parser->thread).toString());
+
                 if (ctx->softShutdown) {
                     delete parser;
                     break;
@@ -912,8 +923,11 @@ namespace OpenLogReplicator {
                 }
             }
 
-            if (processedThisPass)
+            if (processedThisPass) {
+                idleSince = 0;
+                lastIdleReport = 0;
                 continue;
+            }
 
             // Nothing was read in this pass: everything the archive list returned was dropped again (already
             // parsed archives, or archives parked because a predecessor is missing while nothing else is
@@ -922,6 +936,31 @@ namespace OpenLogReplicator {
             // archive shows up (measured: several full logons per second, forever).
             if (!ctx->isFlagSet(Ctx::REDO_FLAGS::ARCH_ONLY))
                 break;
+
+            // Committed transactions that still wait for the low-water-mark can only be flushed by the parser
+            // (CommitSorter::flushReady is called from there), so once the parser stops reading they can not
+            // move at all: the run then looks exactly like an idle one and stays that way. Reported only when a
+            // buffered event is at or below the low-water-mark - that is an event the sorter would release
+            // right away, so it is the signature of a stall and not the normal wait for the next archive of
+            // the other redo thread. At most once per 30 s.
+            const uint64_t idleNow = ctx->clock->getTimeUt();
+            if (idleSince == 0)
+                idleSince = idleNow;
+            if (metadata->commitSorter != nullptr && metadata->commitSorter->getPendingEvents() > 0 &&
+                metadata->commitSorter->getWatermark() != Scn::none() &&
+                metadata->commitSorter->getLowestPendingScn() != Scn::none() &&
+                metadata->commitSorter->getLowestPendingScn() <= metadata->commitSorter->getWatermark() &&
+                (lastIdleReport == 0 || idleNow > lastIdleReport + 30000000)) {
+                ctx->warning(60047, "no archived redo log was read for: " + std::to_string((idleNow - idleSince) / 1000000) +
+                             " s, but " + std::to_string(metadata->commitSorter->getPendingEvents()) +
+                             " committed transaction(s) still wait for the low-water-mark while the first of them (scn: " +
+                             metadata->commitSorter->getLowestPendingScn().toString() + ") is already below it (scn: " +
+                             metadata->commitSorter->getWatermark().toString() + ", thread watermarks: " +
+                             metadata->commitSorter->getThreadWatermarksText() + ", archives in the list: " +
+                             std::to_string(archiveRedoQueue.size()) + ", skipped: " + std::to_string(skippedThisPass) +
+                             ", parked: " + std::to_string(gapArchives.size()) + ")");
+                lastIdleReport = idleNow;
+            }
 
             contextSet(CONTEXT::SLEEP);
             ctx->usleepInt(ctx->archReadSleepUs);

@@ -96,6 +96,17 @@ namespace OpenLogReplicator {
             return pendingEvents;
         }
 
+        // Diagnostics only (warning 60047): the per thread watermarks, with the threads that do not hold back
+        // the low-water-mark any more marked accordingly
+        [[nodiscard]] std::string getThreadWatermarksText() const;
+
+        // SCN of the buffered event that would be flushed first (none when nothing is buffered): an event at or
+        // below the low-water-mark could be flushed by flushReady, so one that is still buffered while the
+        // watermark is above it means that nothing called the sorter at all
+        [[nodiscard]] Scn getLowestPendingScn() const {
+            return events.empty() ? Scn::none() : events.begin()->first;
+        }
+
     protected:
         struct Event {
             Scn scn;
