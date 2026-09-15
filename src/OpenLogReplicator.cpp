@@ -486,6 +486,7 @@ namespace OpenLogReplicator {
                     "filter",
                     "flags",
                     "format",
+                    "idle-thread-release-us",
                     "memory",
                     "name",
                     "reader",
@@ -661,6 +662,7 @@ namespace OpenLogReplicator {
             auto* metadata = new Metadata(ctx, locales, name, startScn, startSequence, startTime, startTimeRel);
             metadatas.push_back(metadata);
             metadata->commitSorter = new CommitSorter();
+            metadata->commitSorter->setContext(ctx);
             metadata->resetElements();
             if (!debugOwner.empty())
                 metadata->users.insert(debugOwner);
@@ -986,6 +988,13 @@ namespace OpenLogReplicator {
                     throw ConfigurationException(30001, "bad JSON, invalid \"slice-pending-commits\" value: " +
                                                  std::to_string(ctx->slicePendingCommits) + ", expected: one of: {0 .. 10000000}");
             }
+
+            // An idle redo thread (its instance is not archiving anything) would hold back the low-water-mark
+            // of the commit sorter forever, so every transaction the other threads commit stays in memory.
+            // After this timeout such a thread is left out of the low-water-mark - it bounds the memory, but
+            // the global SCN order is no longer guaranteed for the transactions of that thread (0 = off).
+            if (sourceJson.HasMember("idle-thread-release-us"))
+                ctx->idleThreadReleaseUs = Ctx::getJsonFieldU64(configFileName, sourceJson, "idle-thread-release-us");
 
             if (sourceJson.HasMember("redo-verify-delay-us"))
                 ctx->redoVerifyDelayUs = Ctx::getJsonFieldU64(configFileName, sourceJson, "redo-verify-delay-us");

@@ -17,6 +17,7 @@ You should have received a copy of the GNU Affero General Public License
 along with this program; see the file LICENSE;
 If not, see <http://www.gnu.org/licenses/>. */
 
+#include "../common/Ctx.h"
 #include "CommitSorter.h"
 #include "Transaction.h"
 
@@ -47,12 +48,39 @@ namespace OpenLogReplicator {
         ++pendingEvents;
     }
 
-    void CommitSorter::setThreadWatermark(uint16_t thread, Scn parsedScn) {
+    void CommitSorter::setThreadWatermark(uint16_t thread, Scn parsedScn, uint64_t currentTime, uint64_t idleReleaseUs) {
         auto it = threadWatermark.find(thread);
-        if (it == threadWatermark.end())
+        if (it == threadWatermark.end()) {
             threadWatermark.try_emplace(thread, parsedScn);
-        else if (parsedScn > it->second)
+            threadWatermarkTime.try_emplace(thread, currentTime);
+        } else if (parsedScn > it->second) {
             it->second = parsedScn;
+            // Only progress restarts the idle timer: being called again with an unchanged SCN is not
+            // "the thread is alive", it is exactly the state a release has to recognize.
+            threadWatermarkTime[thread] = currentTime;
+            idleThreads.erase(thread);
+        }
+
+        if (idleReleaseUs == 0)
+            return;
+
+        // An idle redo thread (its instance has not archived anything for a long time) would otherwise
+        // hold back the low-water-mark forever: every transaction the other threads commit stays in
+        // memory (at least one chunk each) until the instance produces redo again. After the timeout such
+        // a thread is left out of the low-water-mark, which bounds the memory at the price of the global
+        // SCN order: transactions of the idle thread can be delivered after transactions with a higher SCN.
+        for (const auto& [idleThread, lastAdvance]: threadWatermarkTime) {
+            if (idleThreads.find(idleThread) != idleThreads.end())
+                continue;
+            if (currentTime > lastAdvance && currentTime - lastAdvance > idleReleaseUs) {
+                idleThreads.insert(idleThread);
+                if (ctx != nullptr)
+                    ctx->warning(60045, "redo thread: " + std::to_string(idleThread) + " did not advance for: " +
+                                 std::to_string((currentTime - lastAdvance) / 1000000) + " s - it stops holding back the "
+                                 "low-water-mark (\"idle-thread-release-us\"); its transactions can now be delivered "
+                                 "after transactions with a higher SCN");
+            }
+        }
     }
 
     void CommitSorter::threadClosed(uint16_t thread) {
@@ -68,6 +96,9 @@ namespace OpenLogReplicator {
         Scn lowWatermark = Scn::none();
         for (const auto& [thread, parsedScn]: threadWatermark) {
             if (closedThreads.find(thread) != closedThreads.end())
+                continue;
+            // Idle thread released by the timeout: it does not hold back the low-water-mark any more
+            if (idleThreads.find(thread) != idleThreads.end())
                 continue;
             if (lowWatermark == Scn::none() || parsedScn < lowWatermark)
                 lowWatermark = parsedScn;

@@ -31,6 +31,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include "../common/types/Types.h"
 
 namespace OpenLogReplicator {
+    class Ctx;
     class Transaction;
 
     struct CheckpointEvent {
@@ -65,12 +66,20 @@ namespace OpenLogReplicator {
         CommitSorter() = default;
         ~CommitSorter();
 
+        // Only used to report the idle thread release (warning 60045).
+        void setContext(Ctx* newCtx) {
+            ctx = newCtx;
+        }
+
         // Takes ownership of the flush decision; the transaction itself stays in the
         // transaction buffer until the executor drops it
         void enqueueCommit(Transaction* transaction, Scn commitScn);
         void enqueueCheckpoint(const CheckpointEvent& event);
-        // All records with scn <= parsedScn have been analyzed for the thread
-        void setThreadWatermark(uint16_t thread, Scn parsedScn);
+        // All records with scn <= parsedScn have been analyzed for the thread. "currentTime" is the
+        // microsecond clock of the parser and is only used to measure how long a thread has been idle:
+        // "idleReleaseUs" (0 = disabled) is the timeout after which a thread that did not advance stops
+        // holding back the global low-water-mark.
+        void setThreadWatermark(uint16_t thread, Scn parsedScn, uint64_t currentTime, uint64_t idleReleaseUs);
         // Closed thread (instance down): its final watermark stops holding back the global low-water-mark
         void threadClosed(uint16_t thread);
         void threadReopened(uint16_t thread);
@@ -100,6 +109,11 @@ namespace OpenLogReplicator {
         std::map<Scn, std::vector<Event*>> events; // insertion order preserved within the same SCN
         std::map<uint16_t, Scn> threadWatermark;
         std::set<uint16_t> closedThreads;
+        Ctx* ctx{nullptr};
+        // Time of the last advance of the parsed SCN per thread, and the threads that stopped holding
+        // back the low-water-mark because of it.
+        std::map<uint16_t, uint64_t> threadWatermarkTime;
+        std::set<uint16_t> idleThreads;
 
         void flushUpTo(Executor* executor, Scn limit);
     };

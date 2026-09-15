@@ -298,9 +298,15 @@ namespace OpenLogReplicator {
             // or above the file size - without notifying the parser, which waits for the end of the archive in
             // checkFinished, and without ever reading the rest of the archive.
             const uint64_t fileSizeHeader = static_cast<uint64_t>(numBlocksHeader) * blockSize;
-            if (fileSize != fileSizeHeader) {
+            // The header may also claim a smaller size than the one from stat (padding). That correction is
+            // only allowed while nothing beyond it has been read: a size below the position already read
+            // would leave the read loop without a termination condition.
+            if (fileSize != fileSizeHeader && (fileSizeHeader > fileSize || fileSizeHeader >= bufferEnd)) {
                 fileSize = fileSizeHeader;
                 ctx->info(0, "updating redo log size to: " + std::to_string(fileSize) + " for: " + fileName);
+            } else if (fileSize != fileSizeHeader) {
+                ctx->info(0, "keeping redo log size: " + std::to_string(fileSize) + " (header block count suggests: " +
+                          std::to_string(fileSizeHeader) + ") for: " + fileName);
             }
         }
 
@@ -441,6 +447,19 @@ namespace OpenLogReplicator {
 
         // Partial online redo log file
         if (goodBlocks == 0 && group == 0) {
+            // Not a single byte was read although the archive should still hold data at this position: a
+            // filesystem bridge (asmfs) can report a size the file does not have yet and answer the read
+            // with zero bytes. Reporting the archive as finished here would silently skip the rest of it
+            // and move the checkpoint past redo that was never read, so stop instead - the position is
+            // saved and the archive is read again on the next scheduler pass.
+            if (actualRead == 0 && bufferScan < fileSize) {
+                ctx->warning(60044, "file: " + fileName + " - position: " + std::to_string(bufferScan) +
+                             " - short read before the end of file (size: " + std::to_string(fileSize) +
+                             "), the file is not fully readable yet");
+                ret = REDO_CODE::STOPPED;
+                return false;
+            }
+
             if (nextScnHeader != Scn::none()) {
                 ret = REDO_CODE::FINISHED;
                 nextScn = nextScnHeader;
@@ -683,13 +702,21 @@ namespace OpenLogReplicator {
                 readTime = 0;
                 bufferScan = bufferEnd;
                 reachedZero = false;
+                // Progress watchdog: consecutive loop iterations that did not read anything and did not
+                // move the end of the buffer.
+                uint64_t stallIterations = 0;
+                uint64_t lastStallBufferEnd = 0;
 
                 while (!ctx->softShutdown && status == STATUS::READ) {
                     loopTime = ctx->clock->getTimeUt();
                     readBlocks = false;
                     readTime = 0;
 
-                    if (bufferEnd == fileSize) {
+                    // ">=" and not "==": the size can be revised (reloadHeader, refreshFileSize) and the
+                    // read loop must never be able to sit behind a position it has already passed - it
+                    // would then neither read nor notify the parser and the whole run would stall without
+                    // a single message.
+                    if (bufferEnd >= fileSize) {
                         if (nextScnHeader != Scn::none()) {
                             ret = REDO_CODE::FINISHED;
                             nextScn = nextScnHeader;
@@ -705,14 +732,29 @@ namespace OpenLogReplicator {
                     if (bufferStart + ctx->bufferSizeMax == bufferEnd) {
                         contextSet(CONTEXT::MUTEX, REASON::READER_FULL);
                         std::unique_lock lck(mtx);
-                        if (!ctx->softShutdown && bufferStart + ctx->bufferSizeMax == bufferEnd) {
+                        uint64_t fullIterations = 0;
+                        while (!ctx->softShutdown && bufferStart + ctx->bufferSizeMax == bufferEnd) {
                             if (unlikely(ctx->isTraceSet(Ctx::TRACE::SLEEP)))
                                 ctx->logTrace(Ctx::TRACE::SLEEP, "Reader:mainLoop:bufferFull");
                             contextSet(CONTEXT::WAIT, REASON::READER_BUFFER_FULL);
-                            condBufferFull.wait(lck);
-                            contextSet(CONTEXT::CPU);
-                            continue;
+                            condBufferFull.wait_for(lck, std::chrono::microseconds(ctx->redoReadSleepUs));
+                            contextSet(CONTEXT::MUTEX, REASON::READER_FULL);
+                            ++fullIterations;
+                            // Never wait here in silence: if the parser does not release the read buffer
+                            // (for example when it waits in Reader::checkFinished for this very reader),
+                            // the whole replication stops without a single message in the log.
+                            if (fullIterations == 200 || (fullIterations % 1200) == 0)
+                                ctx->warning(60046, "file: " + fileName + " - the reader is waiting for free read buffer space for: " +
+                                             std::to_string(fullIterations * ctx->redoReadSleepUs / 1000000) + " s (buffer: " +
+                                             std::to_string(bufferStart) + "-" + std::to_string(bufferEnd) + ", limit: " +
+                                             std::to_string(ctx->bufferSizeMax) + ", size: " + std::to_string(fileSize) +
+                                             ", status: " + std::to_string(static_cast<int>(status.load())) + ", ret: " +
+                                             REDO_MSG[static_cast<uint>(ret.load())] + ")");
                         }
+                        contextSet(CONTEXT::CPU);
+                        if (ctx->softShutdown)
+                            break;
+                        continue;
                     }
 
                     if (bufferEnd < bufferScan)
@@ -730,7 +772,7 @@ namespace OpenLogReplicator {
                         if (!read1())
                             break;
 
-                    if (numBlocksHeader != Ctx::ZERO_BLK && bufferEnd == static_cast<uint64_t>(numBlocksHeader) * blockSize) {
+                    if (numBlocksHeader != Ctx::ZERO_BLK && bufferEnd >= static_cast<uint64_t>(numBlocksHeader) * blockSize) {
                         if (nextScnHeader != Scn::none()) {
                             ret = REDO_CODE::FINISHED;
                             nextScn = nextScnHeader;
@@ -740,6 +782,21 @@ namespace OpenLogReplicator {
                             ret = REDO_CODE::STOPPED;
                         }
                         break;
+                    }
+
+                    // The reader can not make progress here: nothing was read and the position did not
+                    // move (the file is smaller than the size the reader knows about, or no read buffer
+                    // is free). Report it periodically instead of spinning in silence - this used to look
+                    // like a hung process without a single message.
+                    if (!readBlocks && bufferEnd == lastStallBufferEnd) {
+                        ++stallIterations;
+                        if (stallIterations == 200 || (stallIterations % 1200) == 0)
+                            ctx->warning(60044, "file: " + fileName + " - no progress at position: " + std::to_string(bufferScan) +
+                                         ", size: " + std::to_string(fileSize) + " for: " +
+                                         std::to_string(stallIterations * ctx->redoReadSleepUs / 1000000) + " s");
+                    } else {
+                        stallIterations = 0;
+                        lastStallBufferEnd = bufferEnd;
                     }
 
                     // Sleep some time
@@ -1187,8 +1244,15 @@ namespace OpenLogReplicator {
         t->contextSet(CONTEXT::MUTEX, REASON::READER_CHECK_FINISHED);
         {
             std::unique_lock lck(mtx);
-            if (bufferStart < confirmedBufferStart.getData())
+            if (bufferStart < confirmedBufferStart.getData()) {
                 bufferStart = confirmedBufferStart.getData();
+                // The parser has just confirmed the last chunk of the read buffer. The reader can be
+                // waiting for free space in the read buffer right now ("buffer full") - without this
+                // notification it would keep sleeping while the parser waits below for a reader that
+                // can not make progress any more: a deadlock without a single message in the log.
+                if (status == STATUS::READ)
+                    condBufferFull.notify_all();
+            }
 
             // All work done
             if (confirmedBufferStart.getData() == bufferEnd) {
@@ -1198,8 +1262,35 @@ namespace OpenLogReplicator {
                 }
                 if (unlikely(ctx->isTraceSet(Ctx::TRACE::SLEEP)))
                     ctx->logTrace(Ctx::TRACE::SLEEP, "Reader:checkFinished");
-                t->contextSet(CONTEXT::WAIT, REASON::READER_FINISHED);
-                condParserSleeping.wait(lck);
+                // Wait for the reader to finish this redo log or to append more data. The wait is repeated
+                // instead of waiting once unconditionally: the timeout changes nothing in the data flow
+                // (every pass through the loop is a no-op while nothing new is available), it only makes
+                // the handshake observable - the reader can also be blocked on the read buffer (see
+                // Reader::mainLoop) and then nothing at all would be written to the log.
+                uint64_t stallIterations = 0;
+                while (!ctx->softShutdown && confirmedBufferStart.getData() == bufferEnd &&
+                       ret != REDO_CODE::STOPPED && ret != REDO_CODE::OVERWRITTEN && ret != REDO_CODE::FINISHED &&
+                       status != STATUS::SLEEPING) {
+                    t->contextSet(CONTEXT::WAIT, REASON::READER_FINISHED);
+                    condParserSleeping.wait_for(lck, std::chrono::microseconds(ctx->redoReadSleepUs));
+                    t->contextSet(CONTEXT::MUTEX, REASON::READER_CHECK_FINISHED);
+                    ++stallIterations;
+                    if (stallIterations == 200 || (stallIterations % 1200) == 0)
+                        ctx->warning(60046, "file: " + fileName + " - the parser is waiting for the reader for: " +
+                                     std::to_string(stallIterations * ctx->redoReadSleepUs / 1000000) + " s (position: " +
+                                     std::to_string(bufferScan) + ", buffer: " + std::to_string(bufferStart) + "-" +
+                                     std::to_string(bufferEnd) + ", size: " + std::to_string(fileSize) + ", status: " +
+                                     std::to_string(static_cast<int>(status.load())) + ", ret: " +
+                                     REDO_MSG[static_cast<uint>(ret.load())] + ")");
+                }
+                if (ctx->softShutdown) {
+                    t->contextSet(CONTEXT::CPU);
+                    return false;
+                }
+                if (ret == REDO_CODE::STOPPED || ret == REDO_CODE::OVERWRITTEN || ret == REDO_CODE::FINISHED || status == STATUS::SLEEPING) {
+                    t->contextSet(CONTEXT::CPU);
+                    return true;
+                }
             }
         }
         t->contextSet(CONTEXT::CPU);

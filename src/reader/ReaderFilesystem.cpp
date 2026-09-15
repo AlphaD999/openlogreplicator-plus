@@ -61,7 +61,10 @@ namespace OpenLogReplicator {
         if ((newFileSize & (Ctx::MIN_BLOCK_SIZE - 1)) != 0)
             newFileSize &= ~(Ctx::MIN_BLOCK_SIZE - 1);
 
-        if (newFileSize == fileSize)
+        // Only growth is accepted. A smaller value is a stale answer of the filesystem bridge (asmfs answers
+        // 0 for a file that is not fully visible yet) and lowering the size below the position already read
+        // would leave the read loop of Reader::mainLoop without a termination condition.
+        if (newFileSize <= fileSize)
             return;
 
         if (unlikely(ctx->isTraceSet(Ctx::TRACE::FILE)))

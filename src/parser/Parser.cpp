@@ -1355,6 +1355,9 @@ namespace OpenLogReplicator {
         }
         reader->setBufferStartEnd(FileOffset(lwnConfirmedBlock, reader->getBlockSize()),
                                   FileOffset(lwnConfirmedBlock, reader->getBlockSize()));
+        // Start of this parsing pass: the slice boundary below must not cut a shorter piece than
+        // Ctx::SLICE_MIN_BYTES, otherwise a busy archive gets shredded into tiny slices.
+        const typeBlk sliceStartBlock = lwnConfirmedBlock;
 
         ctx->info(0, "processing redo log: " + toString() + " offset: " + reader->getBufferStart().toString());
         if (ctx->isFlagSet(Ctx::REDO_FLAGS::ADAPTIVE_SCHEMA) && !metadata->schema->loaded && !ctx->versionStr.empty()) {
@@ -1567,7 +1570,7 @@ namespace OpenLogReplicator {
 
                     if (metadata->commitSorter != nullptr)
                         // All records of this LWN have been analyzed for the thread
-                        metadata->commitSorter->setThreadWatermark(thread, lwnScn);
+                        metadata->commitSorter->setThreadWatermark(thread, lwnScn, ctx->clock->getTimeUt(), ctx->idleThreadReleaseUs);
 
                     if (lwnScn > metadata->firstDataScn) {
                         if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
@@ -1641,7 +1644,8 @@ namespace OpenLogReplicator {
                     // position and let the scheduler continue with the redo thread that is behind.
                     if (!switchRedo && ctx->slicePendingCommits > 0 && metadata->commitSorter != nullptr &&
                         metadata->commitSorter->getPendingEvents() >= ctx->slicePendingCommits &&
-                        lwnScn > metadata->commitSorter->getWatermark()) {
+                        lwnScn > metadata->commitSorter->getWatermark() &&
+                        static_cast<uint64_t>(currentBlock - sliceStartBlock) * reader->getBlockSize() >= Ctx::SLICE_MIN_BYTES) {
                         slicePending = true;
                         sliceScn = lwnScn;
                         metadata->saveFileOffset(thread, FileOffset(currentBlock, reader->getBlockSize()));

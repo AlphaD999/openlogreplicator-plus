@@ -241,3 +241,44 @@ transactions bigger than the configured size (their data is not replicated).
 When the parser itself is blocked and nothing can be swapped out, the run is not recoverable (the commit
 sorter is flushed only by the parser) and OpenLogReplicator terminates with error 10017 instead of waiting
 forever.
+
+==== code 60044: "file: <file name> - position: <number> - short read before the end of file (size: <number>), the file is not fully readable yet"
+
+An archived redo log could not be read up to the position the reader expects to have:
+either the read returned zero bytes although the file is larger than the current position, or the position
+did not move at all for a longer time ("no progress at position: ..., size: ... for: ... s").
+
+A filesystem bridge can report a size the file does not have yet - asmfs, for example, snapshots the size of
+an ASM file when it is opened and answers later reads with zero bytes when the file was not fully visible at
+that moment. The reader does not treat this as the end of the archive (that would silently skip the rest of
+it and move the checkpoint past redo that was never read): it stops and the archive is read again on the next
+pass, which is why the same warning can repeat.
+
+Remediation: check the filesystem bridge (mount options, `arch-read-tries`/`arch-read-sleep-us` retry window),
+or use a destination where the archive is written before it is read.
+Repeated short reads are usually harmless for the data - they only delay replication.
+
+==== code 60045: "redo thread: <number> did not advance for: <number> s - it stops holding back the low-water-mark (\"idle-thread-release-us\"); its transactions can now be delivered after transactions with a higher SCN"
+
+Only reported with `idle-thread-release-us` set (`source` element, 0 = disabled). The redo thread did not
+report a new parsed SCN within the configured timeout, so it was left out of the low-water-mark of the commit
+sorter. This bounds the memory that transactions of the other threads keep while an instance is idle.
+
+_IMPORTANT:_ the global SCN order is not guaranteed for the transactions of the released thread any more - if
+it later delivers redo with an SCN below what has already been written, those transactions are written after
+transactions with a higher SCN. Remove the parameter (or set it to a higher value) if strict ordering by SCN
+is required.
+
+==== code 60046: "file: <file name> - the parser is waiting for the reader for: <number> s (position: <number>, buffer: <number>-<number>, size: <number>, status: <number>, ret: <status>)" / "file: <file name> - the reader is waiting for free read buffer space for: <number> s (buffer: <number>-<number>, limit: <number>, size: <number>, status: <number>, ret: <status>)"
+
+The reader and the parser of one redo log exchange data through the read buffer: the reader fills it, the
+parser parses it and confirms (releases) the part it has consumed. One of the two waits here for the other one
+for a longer time - either the parser waits for the reader to finish the archive (or to append more data), or
+the reader waits for free space in the read buffer while the parser still holds it. The message reports the
+read position, the current read buffer window (and its limit), the size of the redo log, the reader status and
+its result code.
+
+The warning is repeated while the condition persists (first after about 200 * `redo-read-sleep-us`, then every
+1200 iterations). A single occurrence can be caused by a slow filesystem bridge, a repeating one means that
+replication is stalled - the redo log mentioned in the message is the place to look at. Before this warning
+existed such a stall produced no log message at all.

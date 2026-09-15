@@ -748,6 +748,11 @@ namespace OpenLogReplicator {
         bool logsProcessed = false;
 
         while (!ctx->softShutdown) {
+            // Whether this pass of the loop managed to read anything. Everything left in the queue can be
+            // dropped without reading a byte (already parsed archives, archives parked because a predecessor
+            // is missing), and the pass has to be told apart from one that did real work.
+            bool processedThisPass = false;
+
             if (unlikely(ctx->isTraceSet(Ctx::TRACE::REDO)))
                 ctx->logTrace(Ctx::TRACE::REDO, "checking archived redo logs, seq: " + metadata->sequence.toString());
             updateResetlogs();
@@ -790,6 +795,10 @@ namespace OpenLogReplicator {
 
                 // Skip older archived redo logs
                 if (parser->sequence < expectedSequence) {
+                    if (unlikely(ctx->isTraceSet(Ctx::TRACE::ARCHIVE_LIST)))
+                        ctx->logTrace(Ctx::TRACE::ARCHIVE_LIST, "skipping already parsed archive: thread: " +
+                                      std::to_string(parser->thread) + ", seq: " + parser->sequence.toString() +
+                                      ", expected: " + expectedSequence.toString());
                     delete parser;
                     continue;
                 }
@@ -829,6 +838,7 @@ namespace OpenLogReplicator {
                 }
 
                 logsProcessed = true;
+                processedThisPass = true;
                 if (metadata->commitSorter != nullptr)
                     metadata->commitSorter->threadReopened(parser->thread);
                 parser->reader = archReader;
@@ -902,8 +912,20 @@ namespace OpenLogReplicator {
                 }
             }
 
-            if (!logsProcessed)
+            if (processedThisPass)
+                continue;
+
+            // Nothing was read in this pass: everything the archive list returned was dropped again (already
+            // parsed archives, or archives parked because a predecessor is missing while nothing else is
+            // left). Wait before polling the list once more - without this the loop would query the database,
+            // and log on again whenever the connection is not kept, as fast as it can for as long as no new
+            // archive shows up (measured: several full logons per second, forever).
+            if (!ctx->isFlagSet(Ctx::REDO_FLAGS::ARCH_ONLY))
                 break;
+
+            contextSet(CONTEXT::SLEEP);
+            ctx->usleepInt(ctx->archReadSleepUs);
+            contextSet(CONTEXT::CPU);
         }
 
         return logsProcessed;

@@ -137,6 +137,10 @@ namespace OpenLogReplicator {
         static constexpr uint64_t MEMORY_CHUNK_SIZE_MB{1};
         static constexpr uint64_t MEMORY_CHUNK_SIZE{MEMORY_CHUNK_SIZE_MB * 1024 * 1024};
         static constexpr uint64_t MEMORY_CHUNK_MIN_MB{32};
+        // Minimum length of an archive slice (see Parser::parse): a shorter piece does not release any
+        // transaction memory, it only turns into scheduling overhead - slicing at every low-water-mark
+        // boundary of a busy archive was measured to shred it into 512 byte pieces.
+        static constexpr uint64_t SLICE_MIN_BYTES{1024 * 1024};
 
         static constexpr typeBlk ZERO_BLK{0xFFFFFFFF};
 
@@ -233,6 +237,11 @@ namespace OpenLogReplicator {
         // is held per waiting transaction, so this bounds the memory used by the transactions of one archive.
         // 0 disables slicing (every archive is parsed in one go).
         uint64_t slicePendingCommits{1024};
+        // A redo thread that does not advance its parsed SCN for this many microseconds stops holding back
+        // the low-water-mark, so the transaction memory kept by the other threads stays bounded while one
+        // instance is idle (no log switches for hours). 0 = disabled (default): the strict global SCN order
+        // is kept, at the price of an idle instance being able to exhaust "max-mb". See warning 60045.
+        uint64_t idleThreadReleaseUs{0};
         // Writer
         uint64_t pollIntervalUs{100000};
         uint64_t queueSize{65536};

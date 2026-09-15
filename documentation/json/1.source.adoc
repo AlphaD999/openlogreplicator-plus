@@ -126,6 +126,23 @@ Prefer direct IO instead of relying on double reads.
 |_integer_, min: 0, default: 10000000
 |Microseconds between attempts to refresh the list of redo log groups while reading online redo logs.
 
+|`idle-thread-release-us`
+|_integer_, min: 0, default: 0 (disabled)
+|With more than one redo thread (RAC): a thread that does not advance its parsed SCN for this many microseconds stops holding back the low-water-mark of the commit sorter.
+
+An instance that archives nothing for a long time (no log switches) would otherwise hold back the low-water-mark forever - every transaction the other threads commit stays in memory (at least `MEMORY_CHUNK_SIZE_MB` per transaction) until that instance archives again, which can exhaust `max-mb`.
+
+_WARNING:_ with this parameter set the global SCN order is no longer guaranteed for the transactions of the released thread: if it delivers redo with an SCN below what has already been written, its transactions are written after transactions with a higher SCN.
+A release is reported with warning 60045.
+
+|`slice-pending-commits`
+|_integer_, min: 0, max: 10000000, default: 1024
+|With more than one redo thread (RAC): number of finished transactions waiting in the commit sorter for the low-water-mark at which the archive being parsed is sliced.
+
+One memory chunk (`MEMORY_CHUNK_SIZE_MB`) is held per transaction that waits for the low-water-mark, so parsing one whole archive in one go keeps every committed transaction of that archive in memory. A slice stops at a low-water-mark boundary, saves the position and lets the redo thread that is behind run first; the length of a slice is never below `SLICE_MIN_BYTES` (1 MB) - shorter slices do not release memory, they only add scheduling overhead.
+
+`0` disables slicing: every archive is parsed in one go.
+
 |===
 
 [NOTE]
