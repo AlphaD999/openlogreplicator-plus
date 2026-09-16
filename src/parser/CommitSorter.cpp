@@ -61,6 +61,10 @@ namespace OpenLogReplicator {
             idleThreads.erase(thread);
         }
 
+        refreshIdle(currentTime, idleReleaseUs);
+    }
+
+    void CommitSorter::refreshIdle(uint64_t currentTime, uint64_t idleReleaseUs) {
         if (idleReleaseUs == 0)
             return;
 

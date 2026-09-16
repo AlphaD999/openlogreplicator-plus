@@ -85,6 +85,9 @@ namespace OpenLogReplicator {
         void threadReopened(uint16_t thread);
         // Flush all events with scn <= low-water-mark
         void flushReady(Executor* executor);
+        // Release the redo threads whose parsed SCN did not advance for "idleReleaseUs" (0 = disabled). Split
+        // out of setThreadWatermark so that it can also run while nothing is being parsed.
+        void refreshIdle(uint64_t currentTime, uint64_t idleReleaseUs);
         // Flush everything ignoring the watermark (soft shutdown)
         void flushAll(Executor* executor);
 

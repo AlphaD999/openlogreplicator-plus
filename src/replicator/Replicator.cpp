@@ -67,6 +67,9 @@ namespace OpenLogReplicator {
             delete parser;
         onlineRedoSet.clear();
 
+        delete flushParser;
+        flushParser = nullptr;
+
         pathMapping.clear();
         redoLogsBatch.clear();
     }
@@ -960,6 +963,22 @@ namespace OpenLogReplicator {
                              std::to_string(archiveRedoQueue.size()) + ", skipped: " + std::to_string(skippedThisPass) +
                              ", parked: " + std::to_string(gapArchives.size()) + ")");
                 lastIdleReport = idleNow;
+            }
+
+            // Nothing was parsed in this pass, so nothing drove the commit sorter: both the release of an
+            // idle redo thread (CommitSorter::refreshIdle, called from setThreadWatermark) and the flush
+            // (CommitSorter::flushReady) only run from the parser. Without this tick a redo thread that
+            // produces no archive keeps holding back the low-water-mark and every committed transaction
+            // above it stays in memory - the run then looks exactly like an idle one (warning 60047 above
+            // only covers the case where the sorter would release something, not this one).
+            // Same thread as the parser, so no locking is needed.
+            if (metadata->commitSorter != nullptr && metadata->commitSorter->getPendingEvents() > 0) {
+                metadata->commitSorter->refreshIdle(idleNow, ctx->idleThreadReleaseUs);
+                // The parser of the archive that was read last is gone by now (one is created and deleted
+                // per archive), so a dedicated one executes the released events here.
+                if (flushParser == nullptr)
+                    flushParser = new Parser(ctx, builder, metadata, transactionBuffer, 0, "");
+                metadata->commitSorter->flushReady(flushParser);
             }
 
             contextSet(CONTEXT::SLEEP);

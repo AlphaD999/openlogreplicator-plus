@@ -65,6 +65,10 @@ namespace OpenLogReplicator {
         std::deque<Parser*> gapArchives;
         std::set<Parser*> onlineRedoSet;
         std::set<Reader*> readers;
+        // Parser used to execute the events that the commit sorter releases outside of parsing (see the idle
+        // tick in Replicator.cpp). It never parses anything: the transaction buffer and the builder are
+        // shared by all parsers, so it produces the same output as the parser that parsed the archive.
+        Parser* flushParser{nullptr};
         std::vector<std::string> pathMapping;
         std::vector<std::string> redoLogsBatch;
         // RAC thread state: true = thread closed (instance down), refreshed from V$THREAD
