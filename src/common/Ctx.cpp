@@ -28,6 +28,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include <string>
 #include <unistd.h>
 
+#include "AlignedAllocCompat.h"
 #include "ClockHW.h"
 #include "Ctx.h"
 #include "Thread.h"

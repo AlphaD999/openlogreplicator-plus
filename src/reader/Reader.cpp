@@ -29,6 +29,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 
 #include "../common/Clock.h"
 #include "../common/Ctx.h"
+#include "../common/AlignedAllocCompat.h"
 #include "../common/RedoLogRecord.h"
 #include "../common/exception/RuntimeException.h"
 #include "../common/metrics/Metrics.h"
@@ -641,7 +642,13 @@ namespace OpenLogReplicator {
                     if (unlikely(ctx->isTraceSet(Ctx::TRACE::SLEEP)))
                         ctx->logTrace(Ctx::TRACE::SLEEP, "Reader:mainLoop:sleep");
                     contextSet(CONTEXT::WAIT, REASON::READER_NO_WORK);
-                    condReaderSleeping.wait(lck);
+                    // An unbounded wait here can deadlock with the scheduler: when the parser ends up in
+                    // Reader::updateRedoLog (which waits for this reader to re-check the archive) while this
+                    // reader waits for the parser to wake it up, both wait forever and the replication stops
+                    // in silence - no warning, no watchdog. Waking up on a timer changes nothing in the data
+                    // flow (a sleeping reader with no status change just goes back to sleep) and keeps the
+                    // handshake observable.
+                    condReaderSleeping.wait_for(lck, std::chrono::microseconds(ctx->redoReadSleepUs));
                     contextSet(CONTEXT::MUTEX, REASON::READER_MAIN2);
                 } else if (status == STATUS::READ && !ctx->softShutdown && (bufferEnd % Ctx::MEMORY_CHUNK_SIZE) == 0) {
                     ctx->warning(0, "buffer full?");
@@ -1204,7 +1211,8 @@ namespace OpenLogReplicator {
             if (unlikely(ctx->isTraceSet(Ctx::TRACE::SLEEP)))
                 ctx->logTrace(Ctx::TRACE::SLEEP, "Reader:checkRedoLog");
             contextSet(CONTEXT::WAIT, REASON::READER_CHECK);
-            condParserSleeping.wait(lck);
+            // Bounded: see the mainLoop sleep - this wait and the reader's sleep must never deadlock.
+            condParserSleeping.wait_for(lck, std::chrono::microseconds(ctx->redoReadSleepUs));
         }
         contextSet(CONTEXT::CPU);
         return (ret == REDO_CODE::OK);
@@ -1224,7 +1232,10 @@ namespace OpenLogReplicator {
                 if (unlikely(ctx->isTraceSet(Ctx::TRACE::SLEEP)))
                     ctx->logTrace(Ctx::TRACE::SLEEP, "Reader:updateRedoLog");
                 contextSet(CONTEXT::WAIT);
-                condParserSleeping.wait(lck);
+                // Bounded for the same reason as the mainLoop sleep below: this wait and the reader's sleep
+                // must never deadlock each other. The timeout only matters when the reader thread went to
+                // sleep without a notification - a regular update still wakes it up immediately.
+                condParserSleeping.wait_for(lck, std::chrono::microseconds(ctx->redoReadSleepUs));
                 contextSet(CONTEXT::MUTEX, REASON::READER_UPDATE_REDO2);
             }
 
