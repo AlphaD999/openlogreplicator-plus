@@ -128,6 +128,10 @@ namespace OpenLogReplicator {
         // back the low-water-mark because of it.
         std::map<uint16_t, uint64_t> threadWatermarkTime;
         std::set<uint16_t> idleThreads;
+        // Threads that came back from a release (or from a closed instance) while their parsed SCN is still
+        // behind the water-mark: they take part in the minimum again only once they have caught up with redo
+        // that was already delivered.
+        std::set<uint16_t> unalignedThreads;
 
         void flushUpTo(Executor* executor, Scn limit);
     };

@@ -58,7 +58,18 @@ namespace OpenLogReplicator {
             // Only progress restarts the idle timer: being called again with an unchanged SCN is not
             // "the thread is alive", it is exactly the state a release has to recognize.
             threadWatermarkTime[thread] = currentTime;
-            idleThreads.erase(thread);
+            if (idleThreads.erase(thread) > 0 && watermark != Scn::none() && parsedScn < watermark) {
+                // Back from a release while still behind the water-mark: it does not take part in the minimum
+                // until it has caught up. Its events up to the water-mark are still delivered right away - the
+                // order of that window was given up when the thread was released.
+                unalignedThreads.insert(thread);
+                if (ctx != nullptr)
+                    ctx->info(0, "redo thread: " + std::to_string(thread) + " is behind the low-water-mark (scn: " +
+                              parsedScn.toString() + " < " + watermark.toString() + ") - it does not hold it back until "
+                              "it has caught up");
+            }
+            if (watermark != Scn::none() && parsedScn >= watermark)
+                unalignedThreads.erase(thread);
         }
 
         refreshIdle(currentTime, idleReleaseUs);
@@ -93,6 +104,16 @@ namespace OpenLogReplicator {
 
     void CommitSorter::threadReopened(uint16_t thread) {
         closedThreads.erase(thread);
+        // Same rule as coming back from a release: a thread that is behind the water-mark takes part in the
+        // minimum again only once it has caught up (after instance recovery its tail is still to be parsed).
+        const auto it = threadWatermark.find(thread);
+        if (it != threadWatermark.end() && watermark != Scn::none() && it->second < watermark) {
+            unalignedThreads.insert(thread);
+            if (ctx != nullptr)
+                ctx->info(0, "redo thread: " + std::to_string(thread) + " reopened behind the low-water-mark (scn: " +
+                          it->second.toString() + " < " + watermark.toString() + ") - it does not hold it back until it "
+                          "has caught up");
+        }
     }
 
     void CommitSorter::flushReady(Executor* executor) {
@@ -104,14 +125,22 @@ namespace OpenLogReplicator {
             // Idle thread released by the timeout: it does not hold back the low-water-mark any more
             if (idleThreads.find(thread) != idleThreads.end())
                 continue;
+            // Thread that came back from a release while still behind the water-mark: it must not hold back the
+            // other threads until it has caught up (see setThreadWatermark)
+            if (unalignedThreads.find(thread) != unalignedThreads.end())
+                continue;
             if (lowWatermark == Scn::none() || parsedScn < lowWatermark)
                 lowWatermark = parsedScn;
         }
         if (lowWatermark == Scn::none())
             return;
 
-        watermark = lowWatermark;
-        flushUpTo(executor, lowWatermark);
+        // The water-mark is a lower bound that was already acknowledged as safe, so it never moves back: a
+        // thread that comes back below it (see unalignedThreads) must not stall every other thread until it has
+        // caught up.
+        if (watermark == Scn::none() || lowWatermark > watermark)
+            watermark = lowWatermark;
+        flushUpTo(executor, watermark);
     }
 
     void CommitSorter::flushAll(Executor* executor) {
@@ -146,6 +175,8 @@ namespace OpenLogReplicator {
                 ret += " (closed)";
             else if (idleThreads.find(thread) != idleThreads.end())
                 ret += " (released)";
+            else if (unalignedThreads.find(thread) != unalignedThreads.end())
+                ret += " (unaligned)";
         }
         if (ret.empty())
             ret = "none";
