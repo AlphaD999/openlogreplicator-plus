@@ -622,15 +622,18 @@ namespace OpenLogReplicator {
         }
     }
 
-    void Ctx::swappedMemoryInit(Thread* t, Xid xid) {
+    void Ctx::swappedMemoryInit(Thread* t, const SwapKey& swapKey) {
         bool slept = false;
         auto* sc = new SwapChunk();
         {
             t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_MEMORY_INIT);
             std::unique_lock lck(swapMtx);
 
+            // Only the same transaction (same thread, container and Xid) can hold this key: with the redo
+            // threads in the key this is a transaction that is parsed twice, not a transaction of another
+            // instance that happens to use the same undo slot.
             while (!hardShutdown) {
-                if (swapChunks.find(xid) == swapChunks.end())
+                if (swapChunks.find(swapKey) == swapChunks.end())
                     break;
 
                 slept = true;
@@ -639,21 +642,21 @@ namespace OpenLogReplicator {
                 t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_MEMORY_INIT);
             }
 
-            swapChunks.insert_or_assign(xid, sc);
+            swapChunks.insert_or_assign(swapKey, sc);
         }
         t->contextSet(Thread::CONTEXT::CPU);
         if (slept && unlikely(isTraceSet(TRACE::TRANSACTION)))
-            logTrace(TRACE::TRANSACTION, "swap memory stalled transaction xid: " + xid.toString());
+            logTrace(TRACE::TRANSACTION, "swap memory stalled transaction: " + swapKey.toString());
     }
 
-    uint64_t Ctx::swappedMemorySize(Thread* t, Xid xid) const {
+    uint64_t Ctx::swappedMemorySize(Thread* t, const SwapKey& swapKey) const {
         uint64_t ret;
         {
             t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_SWAPPED_SIZE);
             std::unique_lock const lck(swapMtx);
-            const auto& it = swapChunks.find(xid);
+            const auto& it = swapChunks.find(swapKey);
             if (unlikely(it == swapChunks.end()))
-                throw RuntimeException(50070, "swap chunk not found for xid: " + xid.toString() + " during memory size");
+                throw RuntimeException(50070, "swap chunk not found for transaction: " + swapKey.toString() + " during memory size");
             const SwapChunk* sc = it->second;
             ret = sc->chunks.size();
         }
@@ -661,13 +664,13 @@ namespace OpenLogReplicator {
         return ret;
     }
 
-    uint8_t* Ctx::swappedMemoryGet(Thread* t, Xid xid, int64_t index) {
+    uint8_t* Ctx::swappedMemoryGet(Thread* t, const SwapKey& swapKey, int64_t index) {
         {
             t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_SWAPPED_GET);
             std::unique_lock lck(swapMtx);
-            const auto& it = swapChunks.find(xid);
+            const auto& it = swapChunks.find(swapKey);
             if (unlikely(it == swapChunks.end()))
-                throw RuntimeException(50070, "swap chunk not found for xid: " + xid.toString() + " during memory get");
+                throw RuntimeException(50070, "swap chunk not found for transaction: " + swapKey.toString() + " during memory get");
             const SwapChunk* sc = it->second;
 
             while (!hardShutdown) {
@@ -685,14 +688,14 @@ namespace OpenLogReplicator {
         return nullptr;
     }
 
-    void Ctx::swappedMemoryRelease(Thread* t, Xid xid, int64_t index) {
+    void Ctx::swappedMemoryRelease(Thread* t, const SwapKey& swapKey, int64_t index) {
         uint8_t* tc;
         {
             t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_SWAPPED_RELEASE);
             std::unique_lock const lck(swapMtx);
-            const auto& it = swapChunks.find(xid);
+            const auto& it = swapChunks.find(swapKey);
             if (unlikely(it == swapChunks.end()))
-                throw RuntimeException(50070, "swap chunk not found for xid: " + xid.toString() + " during memory release");
+                throw RuntimeException(50070, "swap chunk not found for transaction: " + swapKey.toString() + " during memory release");
             SwapChunk* sc = it->second;
             tc = sc->chunks.at(index);
             sc->chunks[index] = nullptr;
@@ -702,14 +705,14 @@ namespace OpenLogReplicator {
         freeMemoryChunk(t, MEMORY::TRANSACTIONS, tc);
     }
 
-    [[nodiscard]] uint8_t* Ctx::swappedMemoryGrow(Thread* t, Xid xid) {
+    [[nodiscard]] uint8_t* Ctx::swappedMemoryGrow(Thread* t, const SwapKey& swapKey) {
         SwapChunk* sc;
         {
             t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_SWAPPED_GROW1);
             std::unique_lock const lck(swapMtx);
-            const auto& it = swapChunks.find(xid);
+            const auto& it = swapChunks.find(swapKey);
             if (unlikely(it == swapChunks.end()))
-                throw RuntimeException(50070, "swap chunk not found for xid: " + xid.toString() + " during memory grow");
+                throw RuntimeException(50070, "swap chunk not found for transaction: " + swapKey.toString() + " during memory grow");
             sc = it->second;
         }
         t->contextSet(Thread::CONTEXT::CPU);
@@ -726,15 +729,15 @@ namespace OpenLogReplicator {
         return tc;
     }
 
-    uint8_t* Ctx::swappedMemoryShrink(Thread* t, Xid xid) {
+    uint8_t* Ctx::swappedMemoryShrink(Thread* t, const SwapKey& swapKey) {
         SwapChunk* sc;
         uint8_t* tc;
         {
             t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_SWAPPED_SHRINK1);
             std::unique_lock const lck(swapMtx);
-            const auto& it = swapChunks.find(xid);
+            const auto& it = swapChunks.find(swapKey);
             if (unlikely(it == swapChunks.end()))
-                throw RuntimeException(50070, "swap chunk not found for xid: " + xid.toString() + " during memory shrink");
+                throw RuntimeException(50070, "swap chunk not found for transaction: " + swapKey.toString() + " during memory shrink");
             sc = it->second;
             tc = sc->chunks.back();
             sc->chunks.pop_back();
@@ -751,7 +754,7 @@ namespace OpenLogReplicator {
             }
             const int64_t index = sc->chunks.size() - 1;
 
-            swappedShrinkXid = xid;
+            swappedShrinkXid = swapKey;
             while (!hardShutdown) {
                 if (index < sc->swappedMin || index > sc->swappedMax)
                     break;
@@ -759,50 +762,50 @@ namespace OpenLogReplicator {
                 chunksMemoryManager.notify_all();
                 chunksTransaction.wait(lck);
             }
-            swappedShrinkXid = 0;
+            swappedShrinkXid = SwapKey{};
             tc = sc->chunks.back();
         }
         t->contextSet(Thread::CONTEXT::CPU);
         return tc;
     }
 
-    void Ctx::swappedMemoryFlush(Thread* t, Xid xid) {
+    void Ctx::swappedMemoryFlush(Thread* t, const SwapKey& swapKey) {
         {
             t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_SWAPPED_FLUSH1);
             std::unique_lock const lck(swapMtx);
-            swappedFlushXid = xid;
+            swappedFlushXid = swapKey;
         }
         t->contextSet(Thread::CONTEXT::CPU);
     }
 
-    void Ctx::swappedMemoryRemove(Thread* t, Xid xid) {
+    void Ctx::swappedMemoryRemove(Thread* t, const SwapKey& swapKey) {
         SwapChunk* sc = nullptr;
         bool alreadyRemoved = false;
         {
             t->contextSet(Thread::CONTEXT::CPU);
             std::unique_lock const lck(swapMtx);
-            const auto& it = swapChunks.find(xid);
+            const auto& it = swapChunks.find(swapKey);
             if (unlikely(it == swapChunks.end())) {
                 // The chunk can be legitimately gone already: MemoryManager::cleanOldTransactions() erases an
-                // entry as soon as the transaction has been released, so releasing the same xid twice is a race
-                // and not an error. Throwing 50070 here used to abort OpenLogReplicator while it was recovering
-                // from a burst of undo slot take-overs (see warning 60041): the recovery path releases the
-                // unfinished transaction, the memory manager may clean it up, and a later release of the same
-                // xid then failed the whole run.
-                if (swappedFlushXid == xid)
-                    swappedFlushXid = 0;
+                // entry as soon as the transaction has been released, so releasing the same transaction twice is a
+                // race and not an error. Throwing 50070 here used to abort OpenLogReplicator while it was
+                // recovering from a burst of undo slot take-overs (see warning 60041): the recovery path releases
+                // the unfinished transaction, the memory manager may clean it up, and a later release of the same
+                // transaction then failed the whole run.
+                if (swappedFlushXid == swapKey)
+                    swappedFlushXid = SwapKey{};
                 alreadyRemoved = true;
             } else {
                 sc = it->second;
                 sc->release = true;
-                swappedFlushXid = 0;
+                swappedFlushXid = SwapKey{};
             }
         }
         t->contextSet(Thread::CONTEXT::CPU);
 
         if (unlikely(alreadyRemoved)) {
             if (unlikely(isTraceSet(TRACE::TRANSACTION)))
-                logTrace(TRACE::TRANSACTION, "swap memory already released for xid: " + xid.toString());
+                logTrace(TRACE::TRANSACTION, "swap memory already released for transaction: " + swapKey.toString());
             return;
         }
 
@@ -814,7 +817,7 @@ namespace OpenLogReplicator {
             t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_SWAPPED_FLUSH2);
             std::unique_lock const lck(swapMtx);
             sc->chunks.clear();
-            commitedXids.push_back(xid);
+            commitedXids.push_back(swapKey);
             chunksMemoryManager.notify_all();
         }
         t->contextSet(Thread::CONTEXT::CPU);

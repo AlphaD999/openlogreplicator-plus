@@ -111,7 +111,7 @@ namespace OpenLogReplicator {
                     xidTransactionMap.insert_or_assign(xidMap, transaction);
                 }
                 ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
-                ctx->swappedMemoryInit(ctx->parserThread, xid);
+                ctx->swappedMemoryInit(ctx->parserThread, SwapKey{thread, conId, xid});
 
                 if (dumpXidList.find(xid) != dumpXidList.end())
                     transaction->dump = true;
@@ -127,7 +127,7 @@ namespace OpenLogReplicator {
                 xidTransactionMap.insert_or_assign(xidMap, transaction);
             }
             ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
-            ctx->swappedMemoryInit(ctx->parserThread, xid);
+            ctx->swappedMemoryInit(ctx->parserThread, SwapKey{thread, conId, xid});
 
             if (dumpXidList.find(xid) != dumpXidList.end())
                 transaction->dump = true;
@@ -174,7 +174,7 @@ namespace OpenLogReplicator {
 
         // New block
         if (transaction->lastTc == nullptr || transaction->lastTc->size + chunkSize > TransactionChunk::DATA_BUFFER_SIZE)
-            transaction->lastTc = reinterpret_cast<TransactionChunk*>(ctx->swappedMemoryGrow(ctx->parserThread, transaction->xid));
+            transaction->lastTc = reinterpret_cast<TransactionChunk*>(ctx->swappedMemoryGrow(ctx->parserThread, transaction->swapKey()));
 
         // Append to the chunk at the end
         auto* lastTc = transaction->lastTc;
@@ -235,7 +235,7 @@ namespace OpenLogReplicator {
 
         // New block
         if (transaction->lastTc == nullptr || transaction->lastTc->size + chunkSize > TransactionChunk::DATA_BUFFER_SIZE)
-            transaction->lastTc = reinterpret_cast<TransactionChunk*>(ctx->swappedMemoryGrow(ctx->parserThread, transaction->xid));
+            transaction->lastTc = reinterpret_cast<TransactionChunk*>(ctx->swappedMemoryGrow(ctx->parserThread, transaction->swapKey()));
 
         // Append to the chunk at the end
         auto* lastTc = transaction->lastTc;
@@ -278,7 +278,7 @@ namespace OpenLogReplicator {
         if (likely(lastTc->elements > 0))
             return;
 
-        transaction->lastTc = reinterpret_cast<TransactionChunk*>(ctx->swappedMemoryShrink(ctx->parserThread, transaction->xid));
+        transaction->lastTc = reinterpret_cast<TransactionChunk*>(ctx->swappedMemoryShrink(ctx->parserThread, transaction->swapKey()));
     }
 
     void TransactionBuffer::mergeBlocks(uint8_t* mergeBuffer, RedoLogRecord* redoLogRecord1, const RedoLogRecord* redoLogRecord2) {

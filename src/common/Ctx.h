@@ -50,6 +50,45 @@ namespace OpenLogReplicator {
         bool release{false};
     };
 
+    // Key of the per transaction swap storage (Ctx::swapChunks). A bare Xid is not unique enough: in a RAC
+    // cluster every instance has its own undo space (and in a CDB every container its own undo tablespace),
+    // so the same usn/slt/sqn can belong to two transactions that are alive at the same time. With the Xid
+    // alone as key the second transaction waited in swappedMemoryInit() for the first one to be delivered -
+    // and that can never happen while the parser, the only thread that can deliver, is the one waiting.
+    class SwapKey final {
+    public:
+        uint16_t thread{0};
+        typeConId conId{0};
+        Xid xid;
+
+        bool operator==(const SwapKey& other) const {
+            return thread == other.thread && conId == other.conId && xid == other.xid;
+        }
+
+        bool operator!=(const SwapKey& other) const {
+            return !(*this == other);
+        }
+
+        // Suffix of the swap file of this transaction: it has to be unique per key, two live transactions
+        // with the same Xid would otherwise share one file.
+        [[nodiscard]] std::string fileNameSuffix() const {
+            return xid.toString() + "-t" + std::to_string(thread) + "-c" + std::to_string(conId);
+        }
+
+        [[nodiscard]] std::string toString() const {
+            return xid.toString() + " (thread: " + std::to_string(thread) + ", conId: " + std::to_string(conId) + ")";
+        }
+    };
+
+    class SwapKeyHash final {
+    public:
+        size_t operator()(const SwapKey& key) const noexcept {
+            return std::hash<uint64_t>()(key.xid.getData()) ^
+                    (static_cast<size_t>(static_cast<uint16_t>(key.thread)) << 1) ^
+                    (static_cast<size_t>(static_cast<uint16_t>(key.conId)) << 17);
+        }
+    };
+
     class Ctx final {
     public:
         enum class LOCALES : unsigned char {
@@ -264,13 +303,14 @@ namespace OpenLogReplicator {
         Thread* parserThread{nullptr};
         Thread* writerThread{nullptr};
 
-        std::unordered_map<Xid, SwapChunk*> swapChunks;
-        std::vector<Xid> commitedXids;
+        // Per transaction swap storage, keyed by (thread, conId, xid) - see SwapKey
+        std::unordered_map<SwapKey, SwapChunk*, SwapKeyHash> swapChunks;
+        std::vector<SwapKey> commitedXids;
         std::condition_variable chunksMemoryManager;
         std::condition_variable chunksTransaction;
         uint64_t swappedMB{0};
-        Xid swappedFlushXid{0, 0, 0};
-        Xid swappedShrinkXid{0, 0, 0};
+        SwapKey swappedFlushXid;
+        SwapKey swappedShrinkXid;
         mutable std::mutex swapMtx;
         std::condition_variable reusedTransactions;
         bool version12{false};
@@ -641,14 +681,14 @@ namespace OpenLogReplicator {
         [[nodiscard]] std::string getMemoryModulesText() const;
         [[nodiscard]] uint8_t* getMemoryChunk(Thread* t, MEMORY module, bool swap = false);
         void freeMemoryChunk(Thread* t, MEMORY module, uint8_t* chunk);
-        void swappedMemoryInit(Thread* t, Xid xid);
-        [[nodiscard]] uint64_t swappedMemorySize(Thread* t, Xid xid) const;
-        [[nodiscard]] uint8_t* swappedMemoryGet(Thread* t, Xid xid, int64_t index);
-        void swappedMemoryRelease(Thread* t, Xid xid, int64_t index);
-        [[nodiscard]] uint8_t* swappedMemoryGrow(Thread* t, Xid xid);
-        [[nodiscard]] uint8_t* swappedMemoryShrink(Thread* t, Xid xid);
-        void swappedMemoryFlush(Thread* t, Xid xid);
-        void swappedMemoryRemove(Thread* t, Xid xid);
+        void swappedMemoryInit(Thread* t, const SwapKey& swapKey);
+        [[nodiscard]] uint64_t swappedMemorySize(Thread* t, const SwapKey& swapKey) const;
+        [[nodiscard]] uint8_t* swappedMemoryGet(Thread* t, const SwapKey& swapKey, int64_t index);
+        void swappedMemoryRelease(Thread* t, const SwapKey& swapKey, int64_t index);
+        [[nodiscard]] uint8_t* swappedMemoryGrow(Thread* t, const SwapKey& swapKey);
+        [[nodiscard]] uint8_t* swappedMemoryShrink(Thread* t, const SwapKey& swapKey);
+        void swappedMemoryFlush(Thread* t, const SwapKey& swapKey);
+        void swappedMemoryRemove(Thread* t, const SwapKey& swapKey);
         void wontSwap(Thread* t, uint64_t openTransactions, uint64_t swappableTransactions) const;
 
         void stopHard();

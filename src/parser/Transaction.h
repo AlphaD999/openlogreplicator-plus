@@ -38,6 +38,7 @@ namespace OpenLogReplicator {
     class Builder;
     class Metadata;
     class TransactionBuffer;
+    class SwapKey;
     struct TransactionChunk;
     class XmlCtx;
 
@@ -69,6 +70,11 @@ namespace OpenLogReplicator {
         bool dump{false};
         typeTransactionSize size{0};
         uint16_t thread;
+
+        // Key of the memory chunks of this transaction (see Ctx::swapChunks): not the bare Xid, because two
+        // redo threads (and two containers) can produce the same Xid for two transactions that are alive at the
+        // same time. Defined in Transaction.cpp, which has the complete type.
+        [[nodiscard]] SwapKey swapKey() const;
 
         AttributeMap attributes;
 

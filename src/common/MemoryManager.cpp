@@ -60,9 +60,9 @@ namespace OpenLogReplicator {
                     break;
                 }
 
-                Xid swapXid;
+                SwapKey swapKey;
                 int64_t swapIndex = -1;
-                Xid unswapXid;
+                SwapKey unswapKey;
                 int64_t unswapIndex = -1;
                 bool nothingToDo = false;
                 uint64_t openTransactions = 0;
@@ -80,8 +80,8 @@ namespace OpenLogReplicator {
                 {
                     contextSet(CONTEXT::MUTEX, REASON::MEMORY_RUN1);
                     std::unique_lock lck(ctx->swapMtx);
-                    getChunkToUnswap(unswapXid, unswapIndex);
-                    getChunkToSwap(swapXid, swapIndex);
+                    getChunkToUnswap(unswapKey, unswapIndex);
+                    getChunkToSwap(swapKey, swapIndex);
 
                     if (unswapIndex == -1 && swapIndex == -1) {
                         nothingToDo = true;
@@ -130,7 +130,7 @@ namespace OpenLogReplicator {
                 }
 
                 if (unswapIndex != -1) {
-                    if (unswap(unswapXid, unswapIndex) && ctx->metrics != nullptr)
+                    if (unswap(unswapKey, unswapIndex) && ctx->metrics != nullptr)
                         ctx->metrics->emitSwapOperationsMbRead(1);
                     {
                         contextSet(CONTEXT::MUTEX, REASON::MEMORY_RUN2);
@@ -139,7 +139,7 @@ namespace OpenLogReplicator {
                     }
                     contextSet(CONTEXT::CPU);
                 }
-                if (swapIndex != -1 && swap(swapXid, swapIndex) && ctx->metrics != nullptr)
+                if (swapIndex != -1 && swap(swapKey, swapIndex) && ctx->metrics != nullptr)
                     ctx->metrics->emitSwapOperationsMbWrite(1);
             }
         } catch (RuntimeException& ex) {
@@ -161,7 +161,7 @@ namespace OpenLogReplicator {
     uint64_t MemoryManager::cleanOldTransactions() {
         uint64_t discard = 0;
         while (true) {
-            Xid xid;
+            SwapKey swapKey;
             SwapChunk* sc;
             {
                 contextSet(CONTEXT::MUTEX, REASON::MEMORY_CLEAN);
@@ -171,9 +171,9 @@ namespace OpenLogReplicator {
                     return discard;
                 }
 
-                xid = ctx->commitedXids.back();
+                swapKey = ctx->commitedXids.back();
                 ctx->commitedXids.pop_back();
-                const auto& it = ctx->swapChunks.find(xid);
+                const auto& it = ctx->swapChunks.find(swapKey);
                 if (it == ctx->swapChunks.end())
                     continue;
                 sc = it->second;
@@ -186,7 +186,7 @@ namespace OpenLogReplicator {
             delete sc;
 
             struct stat fileStat{};
-            const std::string fileName(swapPath + "/" + xid.toString() + ".swap");
+            const std::string fileName(swapPath + "/" + swapKey.fileNameSuffix() + ".swap");
             if (stat(fileName.c_str(), &fileStat) == 0) {
                 if (unlink(fileName.c_str()) != 0)
                     ctx->error(10010, "file: " + fileName + " - delete returned: " + strerror(errno));
@@ -240,55 +240,55 @@ namespace OpenLogReplicator {
         closedir(dir);
     }
 
-    void MemoryManager::getChunkToUnswap(Xid& xid, int64_t& index) const {
-        if (ctx->swappedFlushXid.toUint() != 0) {
+    void MemoryManager::getChunkToUnswap(SwapKey& swapKey, int64_t& index) const {
+        if (ctx->swappedFlushXid.xid.toUint() != 0) {
             const auto& it = ctx->swapChunks.find(ctx->swappedFlushXid);
             if (unlikely(it == ctx->swapChunks.end()))
-                throw RuntimeException(50070, "swap chunk not found for xid: " + ctx->swappedFlushXid.toString() + " during unswap");
+                throw RuntimeException(50070, "swap chunk not found for transaction: " + ctx->swappedFlushXid.toString() + " during unswap");
             const SwapChunk* sc = it->second;
             if (sc->swappedMin > -1) {
                 index = sc->swappedMin;
-                xid = ctx->swappedFlushXid;
+                swapKey = ctx->swappedFlushXid;
                 return;
             }
         }
 
-        if (ctx->swappedShrinkXid.toUint() == 0)
+        if (ctx->swappedShrinkXid.xid.toUint() == 0)
             return;
 
         const auto& it = ctx->swapChunks.find(ctx->swappedShrinkXid);
         if (unlikely(it == ctx->swapChunks.end()))
-            throw RuntimeException(50070, "swap chunk not found for xid: " + ctx->swappedShrinkXid.toString() + " during unswap");
+            throw RuntimeException(50070, "swap chunk not found for transaction: " + ctx->swappedShrinkXid.toString() + " during unswap");
         const SwapChunk* sc = it->second;
         if (sc->swappedMax == -1)
             return;
 
         index = sc->swappedMax;
-        xid = ctx->swappedShrinkXid;
+        swapKey = ctx->swappedShrinkXid;
     }
 
-    void MemoryManager::getChunkToSwap(Xid& xid, int64_t& index) {
+    void MemoryManager::getChunkToSwap(SwapKey& swapKey, int64_t& index) {
         if (ctx->nothingToSwap(this))
             return;
 
-        for (const auto& [swapXid, sc]: ctx->swapChunks) {
-            if (ctx->swappedFlushXid == swapXid || sc->release || sc->chunks.size() <= 1)
+        for (const auto& [candidateKey, sc]: ctx->swapChunks) {
+            if (ctx->swappedFlushXid == candidateKey || sc->release || sc->chunks.size() <= 1)
                 continue;
 
             if (sc->swappedMax < static_cast<int64_t>(sc->chunks.size() - 2)) {
                 index = sc->swappedMax + 1;
-                xid = swapXid;
+                swapKey = candidateKey;
                 return;
             }
         }
     }
 
-    bool MemoryManager::unswap(Xid xid, int64_t index) {
+    bool MemoryManager::unswap(const SwapKey& swapKey, int64_t index) {
         uint8_t* tc = ctx->getMemoryChunk(this, Ctx::MEMORY::TRANSACTIONS, true);
         if (tc == nullptr)
             return false;
 
-        const std::string fileName = swapPath + "/" + xid.toString() + ".swap";
+        const std::string fileName = swapPath + "/" + swapKey.fileNameSuffix() + ".swap";
         struct stat fileStat{};
 
         if (stat(fileName.c_str(), &fileStat) != 0)
@@ -328,9 +328,9 @@ namespace OpenLogReplicator {
         {
             contextSet(CONTEXT::MUTEX, REASON::MEMORY_UNSWAP);
             std::unique_lock const lck(ctx->swapMtx);
-            const auto& it = ctx->swapChunks.find(xid);
+            const auto& it = ctx->swapChunks.find(swapKey);
             if (unlikely(it == ctx->swapChunks.end()))
-                throw RuntimeException(50070, "swap chunk not found for xid: " + xid.toString() + " during unswap read");
+                throw RuntimeException(50070, "swap chunk not found for transaction: " + swapKey.toString() + " during unswap read");
             SwapChunk* sc = it->second;
             if (sc->swappedMin == index) {
                 sc->chunks[sc->swappedMin] = tc;
@@ -363,15 +363,15 @@ namespace OpenLogReplicator {
         }
     }
 
-    bool MemoryManager::swap(Xid xid, int64_t index) {
+    bool MemoryManager::swap(const SwapKey& swapKey, int64_t index) {
         uint8_t* tc;
         SwapChunk* sc;
         {
             contextSet(CONTEXT::MUTEX, REASON::MEMORY_SWAP1);
             std::unique_lock const lck(ctx->swapMtx);
-            const auto& it = ctx->swapChunks.find(xid);
+            const auto& it = ctx->swapChunks.find(swapKey);
             if (unlikely(it == ctx->swapChunks.end()))
-                throw RuntimeException(50070, "swap chunk not found for xid: " + xid.toString() + " during swap write");
+                throw RuntimeException(50070, "swap chunk not found for transaction: " + swapKey.toString() + " during swap write");
             sc = it->second;
 
             if (sc->chunks.size() <= 1 || index >= static_cast<int64_t>(sc->chunks.size() - 1) || sc->swappedMax != index - 1) {
@@ -389,7 +389,7 @@ namespace OpenLogReplicator {
         }
         contextSet(CONTEXT::CPU);
 
-        const std::string fileName = swapPath + "/" + xid.toString() + ".swap";
+        const std::string fileName = swapPath + "/" + swapKey.fileNameSuffix() + ".swap";
 
         int flags = O_WRONLY | O_CREAT;
 #if __linux__
@@ -423,7 +423,7 @@ namespace OpenLogReplicator {
             contextSet(CONTEXT::MUTEX, REASON::MEMORY_SWAP2);
             std::unique_lock const lck(ctx->swapMtx);
 
-            if (ctx->swappedShrinkXid == xid) {
+            if (ctx->swappedShrinkXid == swapKey) {
                 sc->chunks[index] = tc;
 
                 if (sc->swappedMax == 0) {
