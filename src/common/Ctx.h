@@ -303,6 +303,11 @@ namespace OpenLogReplicator {
         Thread* parserThread{nullptr};
         Thread* writerThread{nullptr};
 
+        // swappedMemoryInit() waits for the same transaction to be delivered. The wait stays unbounded (see the
+        // comment there), but it reports itself with this interval: an unbounded silent wait is
+        // indistinguishable from an idle run (warning 60050).
+        static constexpr uint64_t SWAP_WAIT_REPORT_US{30000000};
+
         // Per transaction swap storage, keyed by (thread, conId, xid) - see SwapKey
         std::unordered_map<SwapKey, SwapChunk*, SwapKeyHash> swapChunks;
         std::vector<SwapKey> commitedXids;

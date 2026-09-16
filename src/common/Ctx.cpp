@@ -20,6 +20,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #define GLOBALS 1
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <csignal>
 #include <execinfo.h>
@@ -632,13 +633,32 @@ namespace OpenLogReplicator {
             // Only the same transaction (same thread, container and Xid) can hold this key: with the redo
             // threads in the key this is a transaction that is parsed twice, not a transaction of another
             // instance that happens to use the same undo slot.
+            // The wait stays unbounded: the holder is the same transaction and the only thing that can release
+            // the key is its delivery, which this very thread has to do - releasing it early or giving up would
+            // corrupt the transaction. It only reports itself, because an unbounded silent wait looks exactly
+            // like an idle run: that is how the RAC Xid collision (61cd93c) presented itself - the run simply
+            // stopped, with no message at all.
+            uint64_t waitSince = 0;
+            uint64_t lastReport = 0;
             while (!hardShutdown) {
                 if (swapChunks.find(swapKey) == swapChunks.end())
                     break;
 
                 slept = true;
+                const uint64_t now = clock->getTimeUt();
+                if (waitSince == 0)
+                    waitSince = now;
+                if (now >= waitSince + SWAP_WAIT_REPORT_US && (lastReport == 0 || now >= lastReport + SWAP_WAIT_REPORT_US)) {
+                    warning(60050, "swap memory of transaction: " + swapKey.toString() + " is still held after " +
+                            std::to_string((now - waitSince) / 1000000) + " s of waiting for its delivery (swapped "
+                            "transactions: " + std::to_string(swapChunks.size()) + ", committed and waiting for "
+                            "delivery: " + std::to_string(commitedXids.size()) + ") - the same transaction is parsed "
+                            "twice (slice boundary / instance recovery), or its delivery is stalled (see 60045/60047)");
+                    lastReport = now;
+                }
+
                 t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::MEMORY_BLOCKED);
-                reusedTransactions.wait(lck);
+                reusedTransactions.wait_for(lck, std::chrono::microseconds(SWAP_WAIT_REPORT_US));
                 t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_MEMORY_INIT);
             }
 
