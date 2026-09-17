@@ -139,8 +139,11 @@ namespace OpenLogReplicator {
             "   DUAL"
         };
 
+        // ":i" carries the timestamp string (Metadata::startTime, e.g. "2026-09-17 17:00:00"), the format is
+        // the literal. The previous form had the two TO_DATE arguments swapped and a missing closing bracket,
+        // which made every "start-time" positioning fail: ORA-00907 as-is, ORA-01821 with the bracket fixed.
         static constexpr std::string_view SQL_GET_SCN_FROM_TIME
-                {"SELECT TIMESTAMP_TO_SCN(TO_DATE('YYYY-MM-DD HH24:MI:SS', :i) FROM DUAL"};
+                {"SELECT TIMESTAMP_TO_SCN(TO_DATE(:i, 'YYYY-MM-DD HH24:MI:SS')) FROM DUAL"};
 
         static constexpr std::string_view SQL_GET_SCN_FROM_TIME_RELATIVE
                 {"SELECT TIMESTAMP_TO_SCN(SYSDATE - (:i/24/3600)) FROM DUAL"};
@@ -155,6 +158,7 @@ namespace OpenLogReplicator {
             "     SYS.V_$LOG"
             "   WHERE"
             "     FIRST_CHANGE# - 1 <= :i"
+            "     AND SEQUENCE# > 0"
             " UNION"
             "  SELECT"
             "     THREAD#"
@@ -163,6 +167,7 @@ namespace OpenLogReplicator {
             "     SYS.V_$ARCHIVED_LOG"
             "   WHERE"
             "     FIRST_CHANGE# - 1 <= :i"
+            "     AND SEQUENCE# > 0"
             "     AND RESETLOGS_ID = :j)"
             " GROUP BY THREAD#"
         };
@@ -177,6 +182,7 @@ namespace OpenLogReplicator {
             "     SYS.V_$STANDBY_LOG"
             "   WHERE"
             "     FIRST_CHANGE# - 1 <= :i"
+            "     AND SEQUENCE# > 0"
             " UNION"
             "  SELECT"
             "     THREAD#"
@@ -185,6 +191,7 @@ namespace OpenLogReplicator {
             "     SYS.V_$ARCHIVED_LOG"
             "   WHERE"
             "     FIRST_CHANGE# - 1 <= :i"
+            "     AND SEQUENCE# > 0"
             "     AND RESETLOGS_ID = :j)"
             " GROUP BY THREAD#"
         };
@@ -218,7 +225,9 @@ namespace OpenLogReplicator {
         };
 
         // Only answers "is there at least one archived redo log reachable from a filesystem" - the count is
-        // capped at 1 with FETCH FIRST so that the check stays cheap on databases archiving hundreds of GB/h.
+        // capped at 1 so that the check stays cheap on databases archiving hundreds of GB/h. ROWNUM is used
+        // instead of the 12c+ "FETCH FIRST" clause: this check runs at startup and the target platforms
+        // include 11g, where "FETCH FIRST" raises ORA-00933.
         static constexpr std::string_view SQL_CHECK_FS_ARCHIVED_LOG
         {
             "SELECT COUNT(*) FROM ("
@@ -227,10 +236,11 @@ namespace OpenLogReplicator {
             "    WHERE"
             "      NAME IS NOT NULL"
             "      AND NAME NOT LIKE '+%'"
-            "    FETCH FIRST 1 ROWS ONLY)"
+            "      AND ROWNUM <= 1)"
         };
 
         // Counterpart of SQL_CHECK_FS_ARCHIVED_LOG for reader parameter "arch-source": "asm".
+        // ROWNUM instead of "FETCH FIRST" - see SQL_CHECK_FS_ARCHIVED_LOG (11g compatibility).
         static constexpr std::string_view SQL_CHECK_ASM_ARCHIVED_LOG
         {
             "SELECT COUNT(*) FROM ("
@@ -239,7 +249,7 @@ namespace OpenLogReplicator {
             "    WHERE"
             "      NAME IS NOT NULL"
             "      AND NAME LIKE '+%'"
-            "    FETCH FIRST 1 ROWS ONLY)"
+            "      AND ROWNUM <= 1)"
         };
 
         static constexpr std::string_view SQL_GET_PARAMETER
