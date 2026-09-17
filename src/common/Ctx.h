@@ -213,6 +213,10 @@ namespace OpenLogReplicator {
         // through a filesystem bridge (asmfs, NFS, ...) declared in "path-mapping". Archived redo log paths then
         // start with '+' and must not be filtered out by the SQL layer.
         bool asmArchives{false};
+        // Set when the reader parameter "position-source" is "archives": the starting SCN and the starting redo
+        // sequence are read through the "archives-server" connection (the instance that owns the archived redo
+        // logs) instead of the main connection. Time based positioning always stays on the main connection.
+        bool positionSourceArchives{false};
         uint disableChecks{0};
         LOG logLevel{LOG::INFO};
 

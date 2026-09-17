@@ -70,6 +70,14 @@ namespace OpenLogReplicator {
         env->initialize();
         conn = new DatabaseConnection(env, std::move(newUser), std::move(newPassword), std::move(newConnectString), false);
 
+        // Announced before the connect strings are moved into the connections
+        if (ctx->positionSourceArchives) {
+            if (!newArchivesConnectString.empty())
+                ctx->info(0, "starting scn and sequence will be read from: " + newArchivesConnectString);
+            else
+                ctx->info(0, "\"position-source\": \"archives\" without \"archives-server\" - the starting scn and sequence stay on the main connection");
+        }
+
         // The archive log list is read from another database when "archives-server" is configured: the names
         // registered there (a standby that received the archived redo logs of the primary) carry a different
         // db_unique_name directory and ASM incarnation number, so they can not be translated from the primary
@@ -116,11 +124,19 @@ namespace OpenLogReplicator {
                 "SYS.V_$TRANSPORTABLE_PLATFORM"
             };
             for (const auto& tableName: tables) {
-                // The archive log list is read through the second connection when it is configured
-                if (tableName == "SYS.V_$ARCHIVED_LOG")
+                // Grant checks follow the connection that will run the query: the archive log list is read
+                // through the second connection when it is configured and with "position-source": "archives"
+                // the positioning queries (V$DATABASE.CURRENT_SCN, V$LOG / V$STANDBY_LOG) run there too.
+                if (tableName == "SYS.V_$ARCHIVED_LOG") {
                     checkTableForGrants(tableName, getArchivesConnection());
-                else
+                } else if (ctx->positionSourceArchives && connArchives != nullptr &&
+                           (tableName == "SYS.V_$LOG" || tableName == "SYS.V_$STANDBY_LOG")) {
+                    checkTableForGrants(tableName, getArchivesConnection());
+                } else {
                     checkTableForGrants(tableName);
+                }
+                if (ctx->positionSourceArchives && connArchives != nullptr && tableName == "SYS.V_$DATABASE")
+                    checkTableForGrants(tableName, getArchivesConnection());
             }
         }
 
@@ -307,10 +323,41 @@ namespace OpenLogReplicator {
     }
 
     void ReplicatorOnline::positionReader() {
+        // Positioning source ("position-source": "archives"): with a second connection configured, the starting
+        // SCN and the starting redo sequence are read from the instance that owns the archived redo logs. The
+        // SCN and sequence spaces are shared between primary and standby, so the dictionaries - which stay on
+        // "conn" - remain consistent, while the starting sequence is guaranteed to be one that is already on
+        // disk: nothing waits for the primary's current redo log to be archived and no redo between the standby
+        // position and the primary "now" is skipped by firstDataScn.
+        // Time based positioning always stays on "conn": on a standby TIMESTAMP_TO_SCN is only mapped up to the
+        // applied SCN (ORA-08186 for recent timestamps) and the starting sequence has to come from the same side
+        // as the starting SCN.
+        const bool timePositioning = !metadata->startTime.empty() || metadata->startTimeRel > 0;
+        DatabaseConnection* const positionConn = (ctx->positionSourceArchives && !timePositioning) ? getArchivesConnection() : conn;
+        bool positionStandby = standby;
+        if (positionConn != conn) {
+            // The sequence query variant depends on the role of the connection that runs it, not on the role of "conn"
+            std::array < char, 130 > positionRole{};
+            DatabaseStatement roleStmt(positionConn);
+            if (unlikely(ctx->isTraceSet(Ctx::TRACE::SQL)))
+                ctx->logTrace(Ctx::TRACE::SQL, std::string(SQL_GET_DATABASE_ROLE));
+            roleStmt.createStatement(SQL_GET_DATABASE_ROLE);
+            roleStmt.defineString(1, positionRole.data(), positionRole.size());
+            if (roleStmt.executeQuery() == 0)
+                throw RuntimeException(10038, "can't get the database role of the positioning connection");
+            const std::string role(positionRole.data());
+            if (role == "PRIMARY")
+                positionStandby = false;
+            else if (role == "PHYSICAL STANDBY")
+                positionStandby = true;
+            else
+                throw RuntimeException(10038, "unknown database role: " + role);
+        }
+
         // Position by time
         if (!metadata->startTime.empty()) {
-            DatabaseStatement stmt(conn);
-            if (standby)
+            DatabaseStatement stmt(positionConn);
+            if (positionStandby)
                 throw BootException(10024, "can't position by time for standby database");
 
             if (unlikely(ctx->isTraceSet(Ctx::TRACE::SQL))) {
@@ -327,8 +374,8 @@ namespace OpenLogReplicator {
                 throw BootException(10025, "can't find scn for: " + metadata->startTime);
             metadata->firstDataScn = firstDataScn;
         } else if (metadata->startTimeRel > 0) {
-            DatabaseStatement stmt(conn);
-            if (standby)
+            DatabaseStatement stmt(positionConn);
+            if (positionStandby)
                 throw BootException(10026, "can't position by relative time for standby database");
 
             if (unlikely(ctx->isTraceSet(Ctx::TRACE::SQL))) {
@@ -345,7 +392,7 @@ namespace OpenLogReplicator {
             metadata->firstDataScn = firstDataScn;
         } else if (metadata->firstDataScn == Scn::none() || metadata->firstDataScn == Scn::zero()) {
             // NOW
-            DatabaseStatement stmt(conn);
+            DatabaseStatement stmt(positionConn);
             if (unlikely(ctx->isTraceSet(Ctx::TRACE::SQL)))
                 ctx->logTrace(Ctx::TRACE::SQL, std::string(SQL_GET_DATABASE_SCN));
             stmt.createStatement(SQL_GET_DATABASE_SCN);
@@ -363,8 +410,8 @@ namespace OpenLogReplicator {
             if (metadata->firstDataScn == Scn::none())
                 metadata->firstDataScn = Scn::zero();
         } else {
-            DatabaseStatement stmt(conn);
-            if (standby) {
+            DatabaseStatement stmt(positionConn);
+            if (positionStandby) {
                 if (unlikely(ctx->isTraceSet(Ctx::TRACE::SQL))) {
                     ctx->logTrace(Ctx::TRACE::SQL, std::string(SQL_GET_SEQUENCE_FROM_SCN_STANDBY));
                     ctx->logTrace(Ctx::TRACE::SQL, "PARAM1: " + metadata->firstDataScn.toString());

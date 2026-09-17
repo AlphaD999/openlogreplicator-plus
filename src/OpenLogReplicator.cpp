@@ -522,6 +522,7 @@ namespace OpenLogReplicator {
                     "log-timezone",
                     "password",
                     "path-mapping",
+                    "position-source",
                     "redo-copy-path",
                     "redo-log",
                     "server",
@@ -561,6 +562,19 @@ namespace OpenLogReplicator {
                     ctx->flags |= static_cast<uint>(Ctx::REDO_FLAGS::ARCH_ONLY);
                 else
                     ctx->flags &= ~static_cast<uint>(Ctx::REDO_FLAGS::ARCH_ONLY);
+            }
+
+            // Positioning source: "server" (default) reads the starting SCN and the starting sequence through
+            // the main connection, "archives" reads them through the "archives-server" connection.
+            if (readerJson.HasMember("position-source")) {
+                const std::string positionSource = Ctx::getJsonFieldS(configFileName, Ctx::JSON_PARAMETER_LENGTH, readerJson, "position-source");
+                if (positionSource == "archives")
+                    ctx->positionSourceArchives = true;
+                else if (positionSource == "server")
+                    ctx->positionSourceArchives = false;
+                else
+                    throw ConfigurationException(30001, "bad JSON, invalid \"position-source\" value: " + positionSource +
+                                                 ", expected: one of {\"server\", \"archives\"}");
             }
 
             if (readerJson.HasMember("disable-checks")) {
