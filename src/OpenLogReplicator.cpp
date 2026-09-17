@@ -496,6 +496,7 @@ namespace OpenLogReplicator {
                     "schema-change-topic",
                     "slice-pending-commits",
                     "state",
+                    "thread-inactive-us",
                     "topic-prefix",
                     "transaction-max-mb"
                 };
@@ -564,9 +565,12 @@ namespace OpenLogReplicator {
                     ctx->flags &= ~static_cast<uint>(Ctx::REDO_FLAGS::ARCH_ONLY);
             }
 
-            // Positioning source: "server" (default) reads the starting SCN and the starting sequence through
-            // the main connection, "archives" reads them through the "archives-server" connection.
+            // Positioning source: "server" reads the starting SCN and the starting sequence through the main
+            // connection, "archives" reads them through the "archives-server" connection. Not given: decided
+            // automatically in the reader block below (a configured "archives-server" without a time based
+            // position means that the archives - and therefore the position - live on the other instance).
             if (readerJson.HasMember("position-source")) {
+                ctx->positionSourceSet = true;
                 const std::string positionSource = Ctx::getJsonFieldS(configFileName, Ctx::JSON_PARAMETER_LENGTH, readerJson, "position-source");
                 if (positionSource == "archives")
                     ctx->positionSourceArchives = true;
@@ -1010,6 +1014,12 @@ namespace OpenLogReplicator {
             if (sourceJson.HasMember("idle-thread-release-us"))
                 ctx->idleThreadReleaseUs = Ctx::getJsonFieldU64(configFileName, sourceJson, "idle-thread-release-us");
 
+            // A redo thread that stopped archiving (its instance is gone) must not hold back the low-water-mark
+            // forever when one of its archives is missing. The state is taken from the archived redo log list
+            // itself - the highest sequence of the thread that did not move for this long (0 = disabled).
+            if (sourceJson.HasMember("thread-inactive-us"))
+                ctx->threadInactiveUs = Ctx::getJsonFieldU64(configFileName, sourceJson, "thread-inactive-us");
+
             if (sourceJson.HasMember("redo-verify-delay-us"))
                 ctx->redoVerifyDelayUs = Ctx::getJsonFieldU64(configFileName, sourceJson, "redo-verify-delay-us");
 
@@ -1064,6 +1074,16 @@ namespace OpenLogReplicator {
                 } else if (readerJson.HasMember("archives-user") || readerJson.HasMember("archives-password")) {
                     throw ConfigurationException(30001, R"(bad JSON, "archives-user" and "archives-password" require "archives-server")");
                 }
+
+                // Position source, unless it was given explicitly ("position-source"): the starting SCN and the
+                // starting redo sequence are read from the instance that owns the archived redo logs. Only that
+                // instance can name a sequence that is already on disk, so the first run neither waits for the
+                // current redo log of the main connection to be archived nor skips the redo between the position
+                // of the archive owner and the "now" of the main connection (the delivery gate drops everything
+                // below firstDataScn). Time based positioning ("start-time"/"start-time-rel") always stays on the
+                // main connection: on a standby TIMESTAMP_TO_SCN is only mapped up to the applied SCN.
+                if (!ctx->positionSourceSet)
+                    ctx->positionSourceArchives = !archivesServer.empty() && startTime.empty() && startTimeRel == 0;
 
                 if (sourceJson.HasMember("arch")) {
                     const std::string arch = Ctx::getJsonFieldS(configFileName, Ctx::JSON_PARAMETER_LENGTH, sourceJson, "arch");

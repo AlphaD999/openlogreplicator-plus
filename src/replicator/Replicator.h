@@ -71,8 +71,14 @@ namespace OpenLogReplicator {
         Parser* flushParser{nullptr};
         std::vector<std::string> pathMapping;
         std::vector<std::string> redoLogsBatch;
-        // RAC thread state: true = thread closed (instance down), refreshed from V$THREAD
-        std::map<uint16_t, bool> threadClosed;
+        // RAC thread activity, taken from the archived redo log list itself: the highest sequence seen for the
+        // thread and the moment it moved last. A thread whose highest sequence does not move for
+        // "thread-inactive-us" counts as an instance that stopped producing redo, so a missing archive of it no
+        // longer holds back the low-water-mark (see processArchivedRedoLogs). SYS.V_$THREAD is deliberately not
+        // consulted: on a physical standby it reports whether the standby instance itself has the thread
+        // attached, which makes the threads of all other instances look CLOSED while they keep archiving.
+        std::map<uint16_t, Seq> threadMaxSequence;
+        std::map<uint16_t, uint64_t> threadMaxSequenceTime;
         // Start of the current "nothing was read in this pass" period and the timestamp of the last report of
         // it (warning 60047, at most one message per 30 s). Both are reset as soon as a pass does real work.
         uint64_t idleSince{0};
@@ -99,6 +105,15 @@ namespace OpenLogReplicator {
         Replicator(Ctx* newCtx, void (*newArchGetLog)(Replicator* replicator), Builder* newBuilder, Metadata* newMetadata,
                    TransactionBuffer* newTransactionBuffer, std::string newAlias, std::string newDatabase);
         ~Replicator() override;
+
+        // Every archived redo log returned by the archive list of the source connection is reported here: keeps
+        // the highest sequence per thread and the moment it moved last (the input of the activity check below)
+        void observeArchiveSequence(uint16_t thread, Seq sequence, uint64_t currentTime);
+        // Seconds since the highest archived sequence of the thread moved last, 0 when the thread is unknown or
+        // did not move since the last observation
+        [[nodiscard]] uint64_t threadInactiveSec(uint16_t thread, uint64_t currentTime) const;
+        // Highest archived sequence seen for the thread, Seq::none() while the thread is unknown
+        [[nodiscard]] Seq getThreadMaxSequence(uint16_t thread) const;
 
         virtual void initialize();
         virtual void positionReader();

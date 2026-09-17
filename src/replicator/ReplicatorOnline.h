@@ -215,15 +215,6 @@ namespace OpenLogReplicator {
             ",  LF.MEMBER ASC"
         };
 
-        static constexpr std::string_view SQL_GET_THREAD_INFO
-        {
-            "SELECT"
-            "   THREAD#"
-            ",  STATUS"
-            " FROM"
-            "   SYS.V_$THREAD"
-        };
-
         // Only answers "is there at least one archived redo log reachable from a filesystem" - the count is
         // capped at 1 so that the check stays cheap on databases archiving hundreds of GB/h. ROWNUM is used
         // instead of the 12c+ "FETCH FIRST" clause: this check runs at startup and the target platforms

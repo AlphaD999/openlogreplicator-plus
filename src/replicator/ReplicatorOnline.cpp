@@ -73,7 +73,8 @@ namespace OpenLogReplicator {
         // Announced before the connect strings are moved into the connections
         if (ctx->positionSourceArchives) {
             if (!newArchivesConnectString.empty())
-                ctx->info(0, "starting scn and sequence will be read from: " + newArchivesConnectString);
+                ctx->info(0, "starting scn and sequence will be read from: " + newArchivesConnectString +
+                          (ctx->positionSourceSet ? "" : " (default: \"archives-server\" is configured, no time based position)"));
             else
                 ctx->info(0, "\"position-source\": \"archives\" without \"archives-server\" - the starting scn and sequence stay on the main connection");
         }
@@ -1807,25 +1808,6 @@ namespace OpenLogReplicator {
         if (sequenceStart == Seq::zero())
             sequenceStart = replicator->metadata->sequence;
 
-        // Refresh RAC thread state (open/closed) for the scheduling layer
-        if (replicator->metadata->rac) {
-            DatabaseStatement stmtThread(replicatorOnline->conn);
-            if (unlikely(replicator->ctx->isTraceSet(Ctx::TRACE::SQL)))
-                replicator->ctx->logTrace(Ctx::TRACE::SQL, std::string(SQL_GET_THREAD_INFO));
-            stmtThread.createStatement(SQL_GET_THREAD_INFO);
-            uint32_t threadNumber;
-            stmtThread.defineUInt(1, threadNumber);
-            std::array < char, 33 > statusStr{};
-            stmtThread.defineString(2, statusStr.data(), statusStr.size());
-
-            int retThread = stmtThread.executeQuery();
-            while (retThread != 0) {
-                replicator->threadClosed.insert_or_assign(static_cast<uint16_t>(threadNumber),
-                                                          std::string(statusStr.data()) != "OPEN");
-                retThread = stmtThread.next();
-            }
-        }
-
         {
             const std::string_view listStatement = replicator->ctx->asmArchives
                     ? SQL_GET_ARCHIVE_LOG_LIST_ASM : SQL_GET_ARCHIVE_LOG_LIST;
@@ -1873,6 +1855,12 @@ namespace OpenLogReplicator {
                 firstRow = false;
                 lastThread = thread;
                 lastSequence = sequence;
+
+                // Thread activity is derived from the archive list itself: the highest sequence per thread and
+                // the moment it moved last. SYS.V_$THREAD is not usable for this - on a physical standby it
+                // reports whether the standby instance has the thread attached, so the threads of the other
+                // instances always look CLOSED while they are in fact archiving.
+                replicator->observeArchiveSequence(static_cast<uint16_t>(thread), sequence, replicator->ctx->clock->getTimeUt());
 
                 std::string mappedPath(path.data());
                 replicator->applyMapping(mappedPath);

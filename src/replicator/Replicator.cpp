@@ -745,6 +745,37 @@ namespace OpenLogReplicator {
                   startingSeq);
     }
 
+    void Replicator::observeArchiveSequence(uint16_t thread, Seq sequence, uint64_t currentTime) {
+        const auto it = threadMaxSequence.find(thread);
+        if (it == threadMaxSequence.end()) {
+            threadMaxSequence.try_emplace(thread, sequence);
+            threadMaxSequenceTime.try_emplace(thread, currentTime);
+            return;
+        }
+
+        // Only a higher sequence counts as an advance: the same archive is returned by every pass of the list,
+        // so a repeated row must not keep the thread looking alive.
+        if (sequence > it->second) {
+            it->second = sequence;
+            threadMaxSequenceTime[thread] = currentTime;
+        }
+    }
+
+    uint64_t Replicator::threadInactiveSec(uint16_t thread, uint64_t currentTime) const {
+        const auto itTime = threadMaxSequenceTime.find(thread);
+        if (itTime == threadMaxSequenceTime.end() || threadMaxSequence.find(thread) == threadMaxSequence.end() ||
+            currentTime <= itTime->second)
+            return 0;
+        return (currentTime - itTime->second) / 1000000;
+    }
+
+    Seq Replicator::getThreadMaxSequence(uint16_t thread) const {
+        const auto it = threadMaxSequence.find(thread);
+        if (it == threadMaxSequence.end())
+            return Seq::none();
+        return it->second;
+    }
+
     bool Replicator::processArchivedRedoLogs() {
         Reader::REDO_CODE ret;
         Parser* parser;
@@ -810,15 +841,27 @@ namespace OpenLogReplicator {
 
                 if (parser->sequence > expectedSequence) {
                     if (metadata->rac) {
-                        auto threadClosedIt = threadClosed.find(parser->thread);
-                        if (threadClosedIt != threadClosed.end() && threadClosedIt->second) {
-                            // Closed thread stops holding back the global low-water-mark
+                        const uint64_t now = ctx->clock->getTimeUt();
+                        const uint64_t inactiveSec = threadInactiveSec(parser->thread, now);
+                        const Seq threadMaxSeq = getThreadMaxSequence(parser->thread);
+                        const std::string threadMaxSeqStr = threadMaxSeq == Seq::none() ? std::string("none") : threadMaxSeq.toString();
+                        // The thread is released only when its own archive stream stopped growing: a thread that
+                        // keeps producing archives moves its highest sequence on every arrival, so this is the
+                        // "the instance behind this thread is gone" signal - taken from the archived redo log
+                        // list itself. SYS.V_$THREAD can not be used for it: on a physical standby it reports
+                        // whether the standby instance itself has the thread attached, so the threads of the
+                        // other instances look CLOSED while they keep archiving (see Replicator.h).
+                        if (ctx->threadInactiveUs > 0 && inactiveSec > 0 && inactiveSec * 1000000 >= ctx->threadInactiveUs) {
+                            // Inactive thread stops holding back the global low-water-mark
                             if (metadata->commitSorter != nullptr)
                                 metadata->commitSorter->threadClosed(parser->thread);
                             ctx->warning(60038, "couldn't find archive log for thread: " + std::to_string(parser->thread) +
                                          " seq: " + expectedSequence.toString() + ", found: " + parser->sequence.toString() +
-                                         ", thread is closed - waiting for delayed archival (instance recovery), sleeping " +
-                                         std::to_string(ctx->archReadSleepUs) + " us");
+                                         ", highest known sequence of the thread: " + threadMaxSeqStr +
+                                         ", no new archived redo log for this thread for: " + std::to_string(inactiveSec) +
+                                         " s (\"thread-inactive-us\") - thread treated as inactive, it stops holding back the "
+                                         "low-water-mark, its transactions can be delivered after transactions with a higher SCN, "
+                                         "sleeping " + std::to_string(ctx->archReadSleepUs) + " us");
                         } else
                             ctx->warning(60027, "couldn't find archive log for thread: " + std::to_string(parser->thread) +
                                          " seq: " + expectedSequence.toString() + ", found: " + parser->sequence.toString() +

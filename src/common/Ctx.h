@@ -217,6 +217,10 @@ namespace OpenLogReplicator {
         // sequence are read through the "archives-server" connection (the instance that owns the archived redo
         // logs) instead of the main connection. Time based positioning always stays on the main connection.
         bool positionSourceArchives{false};
+        // True when "position-source" was given explicitly. When it is not, the value above is decided
+        // automatically: with "archives-server" configured and no time based position requested, the position is
+        // taken from there as well (see the reader block of the configuration parser).
+        bool positionSourceSet{false};
         uint disableChecks{0};
         LOG logLevel{LOG::INFO};
 
@@ -285,6 +289,14 @@ namespace OpenLogReplicator {
         // instance is idle (no log switches for hours). 0 = disabled (default): the strict global SCN order
         // is kept, at the price of an idle instance being able to exhaust "max-mb". See warning 60045.
         uint64_t idleThreadReleaseUs{0};
+        // A redo thread whose highest archived redo log sequence does not move for this many microseconds is
+        // treated as an instance that stopped producing redo: when one of its archives is missing it no longer
+        // holds back the global low-water-mark (warning 60038). The value is derived from the archived redo log
+        // list itself, never from SYS.V_$THREAD: on a physical standby V$THREAD.STATUS tells whether the standby
+        // instance itself has the thread attached, so the threads of the other instances always look CLOSED
+        // while they are in fact archiving. Must stay well above "archive_lag_target" plus the arrival and
+        // visibility delay of the archives (900 s default). 0 = disabled: a thread is never released, only waited for.
+        uint64_t threadInactiveUs{900000000};
         // Writer
         uint64_t pollIntervalUs{100000};
         uint64_t queueSize{65536};
