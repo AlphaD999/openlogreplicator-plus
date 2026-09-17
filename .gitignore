@@ -2,6 +2,7 @@
 .qoder
 documentation/doc
 .codebuddy
+.workbuddy
 **/.DS_Store
 documentation/oracle-install
 
