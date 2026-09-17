@@ -402,6 +402,25 @@ namespace OpenLogReplicator {
             if (stmt.executeQuery() == 0)
                 throw BootException(10029, "can't find database current scn");
             metadata->firstDataScn = firstDataScn;
+
+            // The dictionaries are still read through "conn": an SCN taken from another connection can be ahead
+            // of what "conn" can flashback (ORA-08181, reported as 10035) - for example when both connections
+            // point to instances of the same database. Clamp the start SCN to the current SCN of the dictionary
+            // connection; with a standby (which lags behind the primary) this never triggers.
+            if (positionConn != conn) {
+                DatabaseStatement connStmt(conn);
+                if (unlikely(ctx->isTraceSet(Ctx::TRACE::SQL)))
+                    ctx->logTrace(Ctx::TRACE::SQL, std::string(SQL_GET_DATABASE_SCN));
+                connStmt.createStatement(SQL_GET_DATABASE_SCN);
+                Scn connScn;
+                connStmt.defineUInt(1, connScn);
+
+                if (connStmt.executeQuery() != 0 && connScn < metadata->firstDataScn) {
+                    ctx->info(0, "starting scn: " + metadata->firstDataScn.toString() + " is ahead of the dictionary connection (scn: " +
+                              connScn.toString() + ") - using the lower value");
+                    metadata->firstDataScn = connScn;
+                }
+            }
         }
 
         // First sequence
