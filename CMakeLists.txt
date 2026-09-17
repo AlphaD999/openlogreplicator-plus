@@ -101,7 +101,14 @@ if (WITH_RDKAFKA)
         set_target_properties(static_rdkafka1 PROPERTIES IMPORTED_LOCATION ${WITH_RDKAFKA}/lib/librdkafka.a)
         set_target_properties(static_rdkafka2 PROPERTIES IMPORTED_LOCATION ${WITH_RDKAFKA}/lib/librdkafka++.a)
         add_library(static_rdkafka INTERFACE IMPORTED)
-        set_property(TARGET static_rdkafka PROPERTY INTERFACE_LINK_LIBRARIES static_rdkafka1 static_rdkafka2 OpenSSL::Crypto OpenSSL::SSL sasl2)
+        # librdkafka built with zstd support references libzstd: link the static library. Only the .a is
+        # installed (no libzstd.so), so the target machine does not need libzstd.so.1 - the symbol version
+        # check (GLIBC_2.12) stays valid. Empty when the library is not present.
+        set(ZSTD_STATIC_LIB "")
+        if (EXISTS "/usr/lib/libzstd.a")
+            set(ZSTD_STATIC_LIB "/usr/lib/libzstd.a")
+        endif()
+        set_property(TARGET static_rdkafka PROPERTY INTERFACE_LINK_LIBRARIES static_rdkafka1 static_rdkafka2 OpenSSL::Crypto OpenSSL::SSL sasl2 ${ZSTD_STATIC_LIB})
     else ()
         link_directories(${WITH_RDKAFKA}/lib)
     endif ()
