@@ -16,18 +16,12 @@
 # License along with this program; see the file LICENSE;
 # If not, see <http://www.gnu.org/licenses/>.
 
-cmake_minimum_required(VERSION 3.16)
-project(OpenLogReplicator
-        VERSION 2.0.0
-        DESCRIPTION "OpenLogReplicator, Open Source Oracle database CDC"
-        HOMEPAGE_URL "https://github.com/bersler/OpenLogReplicator"
-)
+cmake_minimum_required(VERSION 3.6)
+project(OpenLogReplicator VERSION 2.0.0 LANGUAGES CXX)
 
 set(SCHEMA_VERSION "2.0.0")
 string(TIMESTAMP CMAKE_BUILD_TIMESTAMP "%Y-%m-%d %H:%M" UTC)
-set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_EXTENSIONS FALSE)
+add_compile_options(-std=c++17)
 if (OSX_ARCH)
     set(CMAKE_OSX_ARCHITECTURES ${OSX_ARCH})
 endif ()
@@ -36,8 +30,8 @@ if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
     set(MACOSX TRUE)
 endif()
 
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -g -O3 -Wall -Wextra -Wshadow -Wnon-virtual-dtor -pedantic -Wold-style-cast -Wcast-align -Wunused -Woverloaded-virtual -Wpedantic -Wmisleading-indentation  -Wnull-dereference -Wdouble-promotion -Wimplicit-fallthrough -DCTXASSERT=0")
-set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -Wall -Wextra -Wshadow -Wnon-virtual-dtor -pedantic -Wold-style-cast -Wcast-align -Wunused -Woverloaded-virtual -Wpedantic -Wmisleading-indentation -Wnull-dereference -Wdouble-promotion -Wimplicit-fallthrough -pedantic  -fno-omit-frame-pointer -fsanitize=address -fsanitize=shift -fsanitize=shift-exponent -fsanitize=shift-base -fsanitize=integer-divide-by-zero -fsanitize=unreachable -fsanitize=vla-bound -fsanitize=null -fsanitize=return -fsanitize=signed-integer-overflow -fsanitize=bounds -fsanitize=float-divide-by-zero -fsanitize=float-cast-overflow -fsanitize=nonnull-attribute -fsanitize=bool -fsanitize=enum -fsanitize=vptr -fsanitize=pointer-overflow -fsanitize=builtin -DCTXASSERT=1")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -g -O3 -Wall -Wextra -Wshadow -Wnon-virtual-dtor -pedantic -Wold-style-cast -Wcast-align -Wunused -Woverloaded-virtual  -DCTXASSERT=0")
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -Wall -Wextra -Wshadow -Wnon-virtual-dtor -pedantic -Wold-style-cast -Wcast-align -Wunused -Woverloaded-virtual -pedantic  -fno-omit-frame-pointer -fsanitize=address -fsanitize=shift -fsanitize=shift-exponent -fsanitize=shift-base -fsanitize=integer-divide-by-zero -fsanitize=unreachable -fsanitize=vla-bound -fsanitize=null -fsanitize=return -fsanitize=signed-integer-overflow -fsanitize=bounds -fsanitize=float-divide-by-zero -fsanitize=float-cast-overflow -fsanitize=nonnull-attribute -fsanitize=bool -fsanitize=enum -fsanitize=vptr -fsanitize=pointer-overflow -fsanitize=builtin -DCTXASSERT=1")
 set(CMAKE_LINKER_FLAGS_DEBUG "${CMAKE_LINKER_FLAGS_DEBUG} -fno-omit-frame-pointer -fsanitize=address")
 configure_file(config.h.in ../config.h)
 
@@ -48,7 +42,7 @@ if (CPU_ARCH)
 endif()
 
 if (THREAD_INFO)
-    add_compile_definitions(THREAD_INFO)
+    add_definitions(-DTHREAD_INFO)
 endif()
 
 find_package(Threads REQUIRED)
@@ -64,17 +58,17 @@ endif ()
 if (WITH_OCI)
     include_directories(SYSTEM ${WITH_OCI}/sdk/include)
     link_directories(${WITH_OCI})
-    add_compile_definitions(LINK_LIBRARY_OCI)
+    add_definitions(-DLINK_LIBRARY_OCI)
 endif ()
 
 if (WITH_STATIC)
-    add_compile_definitions(LINK_STATIC)
+    add_definitions(-DLINK_STATIC)
 endif ()
 
 # Protobuf, dynamic or static
 if (WITH_PROTOBUF)
     include_directories(SYSTEM ${WITH_PROTOBUF}/include)
-    add_compile_definitions(LINK_LIBRARY_PROTOBUF)
+    add_definitions(-DLINK_LIBRARY_PROTOBUF)
 
     if (WITH_STATIC)
         add_library(static_protobuf STATIC IMPORTED)
@@ -86,7 +80,7 @@ if (WITH_PROTOBUF)
     # ZeroMQ, just dynamic
     if (WITH_ZEROMQ)
         include_directories(SYSTEM ${WITH_ZEROMQ}/include)
-        add_compile_definitions(LINK_LIBRARY_ZEROMQ)
+        add_definitions(-DLINK_LIBRARY_ZEROMQ)
         if (MACOSX)
             link_directories(${WITH_ZEROMQ}/lib)
         else ()
@@ -98,7 +92,7 @@ endif ()
 # Kafka, dynamic or static
 if (WITH_RDKAFKA)
     include_directories(SYSTEM ${WITH_RDKAFKA}/include)
-    add_compile_definitions(LINK_LIBRARY_RDKAFKA)
+    add_definitions(-DLINK_LIBRARY_RDKAFKA)
 
     if (WITH_STATIC)
         find_package(OpenSSL REQUIRED)
@@ -107,7 +101,7 @@ if (WITH_RDKAFKA)
         set_target_properties(static_rdkafka1 PROPERTIES IMPORTED_LOCATION ${WITH_RDKAFKA}/lib/librdkafka.a)
         set_target_properties(static_rdkafka2 PROPERTIES IMPORTED_LOCATION ${WITH_RDKAFKA}/lib/librdkafka++.a)
         add_library(static_rdkafka INTERFACE IMPORTED)
-        set_property(TARGET static_rdkafka PROPERTY INTERFACE_LINK_LIBRARIES static_rdkafka1 static_rdkafka2 OpenSSL::Crypto OpenSSL::SSL)
+        set_property(TARGET static_rdkafka PROPERTY INTERFACE_LINK_LIBRARIES static_rdkafka1 static_rdkafka2 OpenSSL::Crypto OpenSSL::SSL sasl2)
     else ()
         link_directories(${WITH_RDKAFKA}/lib)
     endif ()
@@ -117,21 +111,22 @@ endif ()
 if (WITH_PROMETHEUS)
     include_directories(SYSTEM ${WITH_PROMETHEUS}/include)
     link_directories(${WITH_PROMETHEUS}/lib)
-    add_compile_definitions(LINK_LIBRARY_PROMETHEUS)
+    add_definitions(-DLINK_LIBRARY_PROMETHEUS)
 endif ()
 
-add_executable(OpenLogReplicator ${SOURCE_FILES})
+add_executable(OpenLogReplicator src/OpenLogReplicator.cpp src/main.cpp)
 
 if (WITH_PROTOBUF)
     add_executable(StreamClient ${SOURCE_FILES})
 endif ()
 
 add_subdirectory(src)
+target_link_libraries(OpenLogReplicator -Wl,--start-group ${OLR_LIBS} -Wl,--end-group)
 
 target_link_libraries(OpenLogReplicator Threads::Threads)
 
 if (WITH_OCI)
-    target_link_libraries(OpenLogReplicator clntshcore nnz clntsh)
+    target_link_libraries(OpenLogReplicator nnz11 clntsh)
 endif ()
 
 if (WITH_RDKAFKA)
