@@ -3,6 +3,7 @@
 documentation/doc
 .codebuddy
 .workbuddy
+tmp
 **/.DS_Store
 documentation/oracle-install
 
