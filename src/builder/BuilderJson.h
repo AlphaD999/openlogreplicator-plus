@@ -42,6 +42,11 @@ namespace OpenLogReplicator {
         // are dropped in envelope mode (they must never mix into data topics). Configured = DDL envelope
         // messages {"source":{...},"ddl":"..."} are emitted and routed to this topic.
         std::string schemaChangeTopic;
+        // Debezium standard envelope: when enabled, every data message (and the Kafka key) is wrapped as
+        // {"schema":{...},"payload":{...}} so that Kafka Connect JsonConverter with schemas.enable=true can
+        // build a Struct. That is required by Sink Connectors which only parse Debezium envelopes
+        // (e.g. Doris Kafka Connector: converter.mode=debezium_ingestion only accepts Struct records).
+        // NOTE: debeziumSchemaBlock lives in the Builder base class (see Builder.h)
 
         bool hasPreviousValue{false};
         bool hasPreviousRedo{false};
@@ -955,9 +960,41 @@ namespace OpenLogReplicator {
         void processBeginMessage(Seq sequence, Time timestamp) override;
         void addTagData(LobCtx* lobCtx, const XmlCtx* xmlCtx, const DbTable* table, Format::VALUE_TYPE valueType, FileOffset fileOffset);
 
+        // --- Debezium standard envelope (schema block) support: see "schema-block" format option ---
+        // Name prefix used in schema names: "topic.prefix" when configured, otherwise the database name
+        [[nodiscard]] std::string schemaNamespace() const;
+        // True for columns that processValue() never emits (guard/nested/hidden/unused without flags)
+        [[nodiscard]] bool isColumnSkipped(const DbColumn* column);
+        // Emits one column descriptor of the row ("before"/"after") schema
+        void appendColumnSchema(const DbColumn* column);
+        // Column descriptor following the Debezium Oracle connector defaults
+        // (decimal.handling.mode=precise, time.precision.mode=adaptive, binary.handling.mode=bytes,
+        // interval.handling.mode=numeric) - used when the schema block is enabled
+        void appendColumnSchemaDebezium(const DbColumn* column);
+        // Emits the field descriptors of the row object (before/after), no enclosing braces:
+        // JsonConverter requires nested structs to be flattened into the parent field descriptor
+        void appendValueFields(const DbTable* table);
+        // Emits the field descriptors of the "source" object (mirrors the emitted source object)
+        void appendSourceFields();
+        // Emits the whole envelope schema and opens the outer JSON object: {"schema":{...},"payload":
+        void appendEnvelopeSchemaOpen(const DbTable* table);
+
+        // --- Debezium compatible value encodings (see "schema-block" format option) ---
+        // Kafka Connect JsonConverter encodes BYTES (incl. Decimal) as base64
+        void appendBase64(const uint8_t* data, uint64_t size);
+        // Converts the decimal text held in valueBuffer (as produced by parseNumber(), e.g. "-123.45")
+        // into the unscaled value and emits its base64 encoded two's complement big endian byte array,
+        // exactly like java.math.BigInteger.toByteArray() (what Connect's Decimal/Bytes hold).
+        void appendDecimalBase64(int64_t scale);
+        // Emits the decimal as a VariableScaleDecimal object: {"scale":<n>,"value":"<base64 unscaled>"}
+        void appendVariableScaleDecimal();
+        // Emits the key envelope schema and opens the key JSON object: {"schema":{...},"payload":
+        void appendKeySchemaOpen(const DbTable* table);
+
     public:
         BuilderJson(Ctx* newCtx, Locales* newLocales, Metadata* newMetadata, Format& newFormat, uint64_t newFlushBuffer,
-                    bool newEnvelopeOutput = false, std::string newTopicPrefix = "", std::string newSchemaChangeTopic = "");
+                    bool newEnvelopeOutput = false, std::string newTopicPrefix = "", std::string newSchemaChangeTopic = "",
+                    bool newDebeziumSchemaBlock = false);
 
         [[nodiscard]] bool isEnvelopeOutput() const {
             return envelopeOutput;

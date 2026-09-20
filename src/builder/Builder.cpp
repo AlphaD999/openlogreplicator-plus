@@ -125,6 +125,9 @@ namespace OpenLogReplicator {
             }
         }
 
+        // Expose the column being emitted to the writer (see Builder::currentColumn)
+        currentColumn = column;
+
         switch (column->type) {
             case SysCol::COLTYPE::VARCHAR:
             case SysCol::COLTYPE::CHAR:
@@ -153,8 +156,15 @@ namespace OpenLogReplicator {
 
             case SysCol::COLTYPE::JSON:
                 if (ctx->isFlagSet(Ctx::REDO_FLAGS::EXPERIMENTAL_JSON))
-                    if (parseLob(lobCtx, data, size, 0, table->obj, fileOffset, false, table->sys))
-                        columnRaw(column->name, reinterpret_cast<const uint8_t*>(valueBuffer), valueSize);
+                    if (parseLob(lobCtx, data, size, 0, table->obj, fileOffset, false, table->sys)) {
+                        if (debeziumSchemaBlock) {
+                            // Debezium maps JSON columns to io.debezium.data.Json, a STRING carrying the
+                            // JSON text itself (not a base64 encoded byte array)
+                            columnString(column->name);
+                        } else {
+                            columnRaw(column->name, reinterpret_cast<const uint8_t*>(valueBuffer), valueSize);
+                        }
+                    }
                 break;
 
             case SysCol::COLTYPE::CLOB:
@@ -375,6 +385,18 @@ namespace OpenLogReplicator {
                             minus = true;
                         }
 
+                        if (debeziumSchemaBlock) {
+                            // Debezium interval.handling.mode=numeric (default) => io.debezium.time.MicroDuration
+                            // DAYS_PER_MONTH_AVG = 365.25 / 12 = 30.4375 days => 2629800000000 microseconds
+                            int64_t micros = static_cast<int64_t>((year * 12) + month) * 2629800000000LL;
+                            if (minus)
+                                micros = -micros;
+                            valueSize = 0;
+                            valueBufferAppendInt(micros);
+                            columnNumber(column->name, 17, 0);
+                            break;
+                        }
+
                         char buffer[12];
                         uint64_t len = 0;
                         valueSize = 0;
@@ -384,7 +406,11 @@ namespace OpenLogReplicator {
 
                         if (format.intervalYtmFormat == Format::INTERVAL_YTM_FORMAT::MONTHS ||
                                 format.intervalYtmFormat == Format::INTERVAL_YTM_FORMAT::MONTHS_STRING) {
+                            // Debezium interval.handling.mode=numeric (default) => MicroDuration uses
+                            // DAYS_PER_MONTH_AVG = 365.25 / 12 = 30.4375 days => 2629800000000 microseconds
                             uint64_t val = (year * 12) + month;
+                            if (debeziumSchemaBlock)
+                                val *= 2629800000000ULL;
                             if (val == 0) {
                                 valueBuffer[valueSize++] = '0';
                             } else {
@@ -480,6 +506,18 @@ namespace OpenLogReplicator {
                             minus = true;
                         }
 
+                        if (debeziumSchemaBlock) {
+                            // Debezium interval.handling.mode=numeric (default) => io.debezium.time.MicroDuration
+                            int64_t micros = (((static_cast<int64_t>(day) * 24 + hour) * 60 + minute) * 60 + second) * 1000000
+                                    + (static_cast<int64_t>(us) + 500) / 1000;
+                            if (minus)
+                                micros = -micros;
+                            valueSize = 0;
+                            valueBufferAppendInt(micros);
+                            columnNumber(column->name, 17, 0);
+                            break;
+                        }
+
                         char buffer[30];
                         valueSize = 0;
                         uint64_t val = 0;
@@ -529,7 +567,8 @@ namespace OpenLogReplicator {
 
                             columnString(column->name);
                         } else {
-                            switch (format.intervalDtsFormat) {
+                            // Debezium interval.handling.mode=numeric (default) => io.debezium.time.MicroDuration
+                            switch (debeziumSchemaBlock ? Format::INTERVAL_DTS_FORMAT::UNIX_MICRO : format.intervalDtsFormat) {
                                 case Format::INTERVAL_DTS_FORMAT::UNIX_NANO:
                                 case Format::INTERVAL_DTS_FORMAT::UNIX_NANO_STRING:
                                     val = (((day * 24 + hour) * 60 + minute) * 60 + second) * 1000000000 + us;

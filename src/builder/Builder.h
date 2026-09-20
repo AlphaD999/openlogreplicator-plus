@@ -105,11 +105,22 @@ namespace OpenLogReplicator {
         }
     };
 
+    class DbColumn;
+
     class Builder {
     public:
         static constexpr uint64_t OUTPUT_BUFFER_DATA_SIZE = Ctx::MEMORY_CHUNK_SIZE - sizeof(BuilderQueue);
 
     protected:
+        // Column currently being emitted by processValue(). Writers use it to know the column type and
+        // precision/scale without changing the columnXxx() signatures (needed for Debezium-compatible
+        // schema types: Decimal, VariableScaleDecimal, adaptive timestamps, boolean, ...).
+        const DbColumn* currentColumn{nullptr};
+
+        // Emit the Debezium standard envelope (see the "schema-block" format option). Kept in the base
+        // class so that processValue() can adapt value encodings (e.g. INTERVAL micros) as well.
+        bool debeziumSchemaBlock{false};
+
         static constexpr uint64_t BUFFER_START_UNDEFINED{0xFFFFFFFFFFFFFFFF};
 
         static constexpr uint64_t VALUE_BUFFER_MIN{1048576};
@@ -413,6 +424,26 @@ namespace OpenLogReplicator {
 
         void valueBufferAppend(uint8_t value) {
             valueBuffer[valueSize++] = static_cast<char>(value);
+        }
+
+        void valueBufferAppendInt(int64_t value) {
+            if (value == 0) {
+                valueBuffer[valueSize++] = '0';
+                return;
+            }
+
+            const bool negative = value < 0;
+            uint64_t magnitude = negative ? static_cast<uint64_t>(-(value + 1)) + 1 : static_cast<uint64_t>(value);
+            char tmp[24];
+            uint len = 0;
+            while (magnitude != 0 && len < 24) {
+                tmp[len++] = Data::map10(magnitude % 10);
+                magnitude /= 10;
+            }
+            if (negative)
+                valueBuffer[valueSize++] = '-';
+            while (len > 0)
+                valueBuffer[valueSize++] = tmp[--len];
         }
 
         void valueBufferAppendHex(uint8_t value, FileOffset fileOffset) {

@@ -727,6 +727,7 @@ namespace OpenLogReplicator {
                     "rid",
                     "redo-thread",
                     "schema",
+                    "schema-block",
                     "scn",
                     "scn-type",
                     "timestamp",
@@ -765,6 +766,8 @@ namespace OpenLogReplicator {
 
             const std::string formatType = Ctx::getJsonFieldS(configFileName, Ctx::JSON_PARAMETER_LENGTH, formatJson, "type");
             bool envelopeOutput = false;
+            // Debezium standard envelope: wrap every message as {"schema":{...},"payload":{...}}
+            bool debeziumSchemaBlock = false;
             std::string topicPrefix;
             std::string schemaChangeTopic;
             if (formatType == "debezium-json") {
@@ -790,6 +793,12 @@ namespace OpenLogReplicator {
                 // When not set, DDL events are dropped and never mixed into data topics.
                 if (sourceJson.HasMember("schema-change-topic"))
                     schemaChangeTopic = Ctx::getJsonFieldS(configFileName, Ctx::JSON_PARAMETER_LENGTH, sourceJson, "schema-change-topic");
+                // Optional: standard Debezium envelope with the "schema" block. Needed when the Sink
+                // connector only accepts Debezium records carrying a Connect schema (Kafka Connect
+                // JsonConverter with schemas.enable=true builds a Struct), for example the Doris Kafka
+                // Connector in converter.mode=debezium_ingestion. Default: false (plain payload only).
+                if (formatJson.HasMember("schema-block"))
+                    debeziumSchemaBlock = (Ctx::getJsonFieldU(configFileName, formatJson, "schema-block") != 0);
             } else if (formatType == "debezium") {
                 columnFormat = Format::COLUMN_FORMAT::FULL_UPD;
                 dbFormat = Format::DB_FORMAT::ALL;
@@ -969,7 +978,7 @@ namespace OpenLogReplicator {
                 timestampFormat, timestampMetadataFormat, timestampTzFormat, timestampType, charFormat, scnFormat, scnType, unknownFormat,
                 schemaFormat, columnFormat, unknownType, userType);
             if (formatType == "json" || formatType == "debezium" || formatType == "debezium-json") {
-                builder = new BuilderJson(ctx, locales, metadata, format, flushBuffer, envelopeOutput, topicPrefix, schemaChangeTopic);
+                builder = new BuilderJson(ctx, locales, metadata, format, flushBuffer, envelopeOutput, topicPrefix, schemaChangeTopic, debeziumSchemaBlock);
             } else if (formatType == "protobuf") {
 #ifdef LINK_LIBRARY_PROTOBUF
                 builder = new BuilderProtobuf(ctx, locales, metadata, format, flushBuffer);
