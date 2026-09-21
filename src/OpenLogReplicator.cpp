@@ -717,11 +717,14 @@ namespace OpenLogReplicator {
             if (!ctx->isDisableChecksSet(Ctx::DISABLE_CHECKS::JSON_TAGS)) {
                 static const std::vector<std::string> formatNames{
                     "attributes",
+                    "binary-handling-mode",
                     "char",
                     "column",
                     "db",
+                    "decimal-handling-mode",
                     "flush-buffer",
                     "interval-dts",
+                    "interval-handling-mode",
                     "interval-ytm",
                     "message",
                     "rid",
@@ -730,6 +733,7 @@ namespace OpenLogReplicator {
                     "schema-block",
                     "scn",
                     "scn-type",
+                    "time-precision-mode",
                     "timestamp",
                     "timestamp-metadata",
                     "timestamp-type",
@@ -759,6 +763,11 @@ namespace OpenLogReplicator {
             Format::TIMESTAMP_FORMAT timestampMetadataFormat = Format::TIMESTAMP_FORMAT::UNIX_NANO;
             Format::TIMESTAMP_TYPE timestampType = Format::TIMESTAMP_TYPE::DEFAULT;
             Format::TIMESTAMP_TZ_FORMAT timestampTzFormat = Format::TIMESTAMP_TZ_FORMAT::UNIX_NANO_STRING;
+            // Debezium connector compatible behaviour switches (used with the "schema-block" option)
+            Format::DECIMAL_HANDLING_MODE decimalHandlingMode = Format::DECIMAL_HANDLING_MODE::PRECISE;
+            Format::TIME_PRECISION_MODE timePrecisionMode = Format::TIME_PRECISION_MODE::ADAPTIVE;
+            Format::BINARY_HANDLING_MODE binaryHandlingMode = Format::BINARY_HANDLING_MODE::BYTES;
+            Format::INTERVAL_HANDLING_MODE intervalHandlingMode = Format::INTERVAL_HANDLING_MODE::NUMERIC;
             Format::UNKNOWN_FORMAT unknownFormat = Format::UNKNOWN_FORMAT::QUESTION_MARK;
             Format::UNKNOWN_TYPE unknownType = Format::UNKNOWN_TYPE::HIDE;
             Format::USER_TYPE userType = Format::USER_TYPE::DEFAULT;
@@ -841,6 +850,60 @@ namespace OpenLogReplicator {
                 if (val > 4)
                     throw ConfigurationException(30001, "bad JSON, invalid \"interval-ytm\" value: " + std::to_string(val) + ", expected: one of {0 .. 4}");
                 intervalYtmFormat = static_cast<Format::INTERVAL_YTM_FORMAT>(val);
+            }
+
+            // Behaviour switches mirroring the Debezium Oracle connector properties. They only affect the
+            // standard Debezium envelope emitted when "schema-block" is enabled.
+            if (formatJson.HasMember("decimal-handling-mode")) {
+                const std::string value = Ctx::getJsonFieldS(configFileName, Ctx::JSON_PARAMETER_LENGTH, formatJson, "decimal-handling-mode");
+                if (value == "precise")
+                    decimalHandlingMode = Format::DECIMAL_HANDLING_MODE::PRECISE;
+                else if (value == "double")
+                    decimalHandlingMode = Format::DECIMAL_HANDLING_MODE::DOUBLE;
+                else if (value == "string")
+                    decimalHandlingMode = Format::DECIMAL_HANDLING_MODE::STRING;
+                else
+                    throw ConfigurationException(30001, R"(bad JSON, invalid "decimal-handling-mode" value: ")" + value +
+                            R"(", expected: one of {"precise", "double", "string"})");
+            }
+
+            if (formatJson.HasMember("time-precision-mode")) {
+                const std::string value = Ctx::getJsonFieldS(configFileName, Ctx::JSON_PARAMETER_LENGTH, formatJson, "time-precision-mode");
+                if (value == "adaptive")
+                    timePrecisionMode = Format::TIME_PRECISION_MODE::ADAPTIVE;
+                else if (value == "connect")
+                    timePrecisionMode = Format::TIME_PRECISION_MODE::CONNECT;
+                else if (value == "isostring")
+                    timePrecisionMode = Format::TIME_PRECISION_MODE::ISOSTRING;
+                else
+                    throw ConfigurationException(30001, R"(bad JSON, invalid "time-precision-mode" value: ")" + value +
+                            R"(", expected: one of {"adaptive", "connect", "isostring"})");
+            }
+
+            if (formatJson.HasMember("binary-handling-mode")) {
+                const std::string value = Ctx::getJsonFieldS(configFileName, Ctx::JSON_PARAMETER_LENGTH, formatJson, "binary-handling-mode");
+                if (value == "bytes")
+                    binaryHandlingMode = Format::BINARY_HANDLING_MODE::BYTES;
+                else if (value == "base64")
+                    binaryHandlingMode = Format::BINARY_HANDLING_MODE::BASE64;
+                else if (value == "base64-url-safe")
+                    binaryHandlingMode = Format::BINARY_HANDLING_MODE::BASE64_URL_SAFE;
+                else if (value == "hex")
+                    binaryHandlingMode = Format::BINARY_HANDLING_MODE::HEX;
+                else
+                    throw ConfigurationException(30001, R"(bad JSON, invalid "binary-handling-mode" value: ")" + value +
+                            R"(", expected: one of {"bytes", "base64", "base64-url-safe", "hex"})");
+            }
+
+            if (formatJson.HasMember("interval-handling-mode")) {
+                const std::string value = Ctx::getJsonFieldS(configFileName, Ctx::JSON_PARAMETER_LENGTH, formatJson, "interval-handling-mode");
+                if (value == "numeric")
+                    intervalHandlingMode = Format::INTERVAL_HANDLING_MODE::NUMERIC;
+                else if (value == "string")
+                    intervalHandlingMode = Format::INTERVAL_HANDLING_MODE::STRING;
+                else
+                    throw ConfigurationException(30001, R"(bad JSON, invalid "interval-handling-mode" value: ")" + value +
+                            R"(", expected: one of {"numeric", "string"})");
             }
 
             if (formatJson.HasMember("message")) {
@@ -977,6 +1040,10 @@ namespace OpenLogReplicator {
             Format format(dbFormat, attributesFormat, intervalDtsFormat, intervalYtmFormat, messageFormat, ridFormat, redoThreadFormat, xidFormat,
                 timestampFormat, timestampMetadataFormat, timestampTzFormat, timestampType, charFormat, scnFormat, scnType, unknownFormat,
                 schemaFormat, columnFormat, unknownType, userType);
+            format.decimalHandlingMode = decimalHandlingMode;
+            format.timePrecisionMode = timePrecisionMode;
+            format.binaryHandlingMode = binaryHandlingMode;
+            format.intervalHandlingMode = intervalHandlingMode;
             if (formatType == "json" || formatType == "debezium" || formatType == "debezium-json") {
                 builder = new BuilderJson(ctx, locales, metadata, format, flushBuffer, envelopeOutput, topicPrefix, schemaChangeTopic, debeziumSchemaBlock);
             } else if (formatType == "protobuf") {

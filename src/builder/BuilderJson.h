@@ -982,6 +982,8 @@ namespace OpenLogReplicator {
         // --- Debezium compatible value encodings (see "schema-block" format option) ---
         // Kafka Connect JsonConverter encodes BYTES (incl. Decimal) as base64
         void appendBase64(const uint8_t* data, uint64_t size);
+        // Url-safe base64 without padding (Debezium: Base64.getUrlEncoder().withoutPadding())
+        void appendBase64UrlSafe(const uint8_t* data, uint64_t size);
         // Converts the decimal text held in valueBuffer (as produced by parseNumber(), e.g. "-123.45")
         // into the unscaled value and emits its base64 encoded two's complement big endian byte array,
         // exactly like java.math.BigInteger.toByteArray() (what Connect's Decimal/Bytes hold).

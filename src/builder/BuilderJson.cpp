@@ -63,6 +63,36 @@ namespace OpenLogReplicator {
         }
     }
 
+    void BuilderJson::appendBase64UrlSafe(const uint8_t* data, uint64_t size) {
+        char buffer[4];
+        uint64_t i = 0;
+        while (i + 3 <= size) {
+            const uint32_t v = (static_cast<uint32_t>(data[i]) << 16) | (static_cast<uint32_t>(data[i + 1]) << 8) | data[i + 2];
+            buffer[0] = Data::map64((v >> 18) & 0x3F);
+            buffer[1] = Data::map64((v >> 12) & 0x3F);
+            buffer[2] = Data::map64((v >> 6) & 0x3F);
+            buffer[3] = Data::map64(v & 0x3F);
+            for (const char c : buffer)
+                append(c == '+' ? '-' : (c == '/' ? '_' : c));
+            i += 3;
+        }
+        const uint64_t rest = size - i;
+        if (rest == 1) {
+            const uint32_t v = static_cast<uint32_t>(data[i]) << 16;
+            buffer[0] = Data::map64((v >> 18) & 0x3F);
+            buffer[1] = Data::map64((v >> 12) & 0x3F);
+            for (int j = 0; j < 2; ++j)
+                append(buffer[j] == '+' ? '-' : (buffer[j] == '/' ? '_' : buffer[j]));
+        } else if (rest == 2) {
+            const uint32_t v = (static_cast<uint32_t>(data[i]) << 16) | (static_cast<uint32_t>(data[i + 1]) << 8);
+            buffer[0] = Data::map64((v >> 18) & 0x3F);
+            buffer[1] = Data::map64((v >> 12) & 0x3F);
+            buffer[2] = Data::map64((v >> 6) & 0x3F);
+            for (int j = 0; j < 3; ++j)
+                append(buffer[j] == '+' ? '-' : (buffer[j] == '/' ? '_' : buffer[j]));
+        }
+    }
+
     void BuilderJson::appendDecimalBase64(int64_t scale) {
         valueBuffer[valueSize] = 0;
         const char* ptr = valueBuffer;
@@ -222,6 +252,23 @@ namespace OpenLogReplicator {
             if (currentColumn != nullptr && currentColumn->type == SysCol::COLTYPE::NUMBER) {
                 const int64_t colPrecision = currentColumn->precision > 0 ? currentColumn->precision : 38;
                 const int64_t colScale = currentColumn->scale > 0 ? currentColumn->scale : 0;
+                if (format.decimalHandlingMode == Format::DECIMAL_HANDLING_MODE::STRING) {
+                    // decimal.handling.mode=string => plain decimal text
+                    append('"');
+                    appendArr(valueBuffer, valueSize);
+                    append('"');
+                    return;
+                }
+                if (format.decimalHandlingMode == Format::DECIMAL_HANDLING_MODE::DOUBLE) {
+                    // decimal.handling.mode=double => the bare JSON number
+                    appendArr(valueBuffer, valueSize);
+                    return;
+                }
+                if (currentColumn->scale < 0) {
+                    // No scale in the dictionary => Debezium falls back to VariableScaleDecimal
+                    appendVariableScaleDecimal();
+                    return;
+                }
                 if (!(colScale == 0 && colPrecision < 19)) {
                     // Decimal: unscaled two's complement value, JsonConverter encodes it as base64
                     append('"');
@@ -229,11 +276,6 @@ namespace OpenLogReplicator {
                     append('"');
                     return;
                 }
-            }
-            if (currentColumn != nullptr && currentColumn->type == SysCol::COLTYPE::FLOAT) {
-                // Oracle FLOAT is a scale-less NUMERIC (2 bytes header + mantissa) => VariableScaleDecimal
-                appendVariableScaleDecimal();
-                return;
             }
         }
 
@@ -245,6 +287,43 @@ namespace OpenLogReplicator {
         append('"');
         appendEscape(columnName);
         append(std::string_view(R"(":")"));
+
+        if (debeziumSchemaBlock) {
+            // Debezium emits the standard Oracle ROWID text (18 characters, 6 bits per character):
+            //   data_object# (6) + relative_fno (3) + block# (6) + row# (3)
+            // This is the exact inverse of the RowId() decoding constructor.
+            char str[RowId::SIZE];
+            const auto dataObj = static_cast<uint32_t>(rowId.dataObj);
+            str[0] = Data::map64((dataObj >> 30) & 0x3F);
+            str[1] = Data::map64((dataObj >> 24) & 0x3F);
+            str[2] = Data::map64((dataObj >> 18) & 0x3F);
+            str[3] = Data::map64((dataObj >> 12) & 0x3F);
+            str[4] = Data::map64((dataObj >> 6) & 0x3F);
+            str[5] = Data::map64(dataObj & 0x3F);
+
+            const auto afn = static_cast<uint32_t>(rowId.dba >> 22) & 0x3FF;
+            str[6] = Data::map64((afn >> 12) & 0x3F);
+            str[7] = Data::map64((afn >> 6) & 0x3F);
+            str[8] = Data::map64(afn & 0x3F);
+
+            const auto block = static_cast<uint32_t>(rowId.dba) & 0x3FFFFF;
+            str[9] = Data::map64((block >> 30) & 0x3F);
+            str[10] = Data::map64((block >> 24) & 0x3F);
+            str[11] = Data::map64((block >> 18) & 0x3F);
+            str[12] = Data::map64((block >> 12) & 0x3F);
+            str[13] = Data::map64((block >> 6) & 0x3F);
+            str[14] = Data::map64(block & 0x3F);
+
+            const auto slot = static_cast<uint32_t>(rowId.slot);
+            str[15] = Data::map64((slot >> 12) & 0x3F);
+            str[16] = Data::map64((slot >> 6) & 0x3F);
+            str[17] = Data::map64(slot & 0x3F);
+
+            appendArr(str, RowId::SIZE);
+            append('"');
+            return;
+        }
+
         char str[RowId::SIZE + 1];
         rowId.toHex(str);
         appendArr(str, 18);
@@ -253,12 +332,27 @@ namespace OpenLogReplicator {
 
     void BuilderJson::columnRaw(const std::string& columnName, const uint8_t* data, uint64_t size) {
         if (debeziumSchemaBlock) {
-            // Debezium binary.handling.mode=bytes: Kafka Connect JsonConverter encodes BYTES as base64
             comma(hasPreviousColumn);
             append('"');
             appendEscape(columnName);
             append(std::string_view(R"(":")"));
-            appendBase64(data, size);
+            switch (format.binaryHandlingMode) {
+                case Format::BINARY_HANDLING_MODE::HEX:
+                    for (uint64_t j = 0; j < size; ++j)
+                        appendHex2(*(data + j));
+                    break;
+
+                case Format::BINARY_HANDLING_MODE::BASE64_URL_SAFE:
+                    appendBase64UrlSafe(data, size);
+                    break;
+
+                case Format::BINARY_HANDLING_MODE::BASE64:
+                case Format::BINARY_HANDLING_MODE::BYTES:
+                default:
+                    // bytes: Kafka Connect JsonConverter itself decodes the base64 text into a byte array
+                    appendBase64(data, size);
+                    break;
+            }
             append('"');
             return;
         }
@@ -314,10 +408,45 @@ namespace OpenLogReplicator {
                 append('"');
                 return;
             }
-            // Debezium time.precision.mode=adaptive: the unit must match the schema name chosen for the
-            // column (Oracle DATE carries no fractional seconds => millis, like the schema above)
+            // Column precision: Oracle DATE carries no fractional seconds => millis (see the schema above)
             const int64_t precision = (currentColumn != nullptr && currentColumn->type == SysCol::COLTYPE::DATE) ? 0
                     : ((currentColumn != nullptr && currentColumn->scale >= 0) ? currentColumn->scale : 6);
+
+            if (format.timePrecisionMode == Format::TIME_PRECISION_MODE::ISOSTRING) {
+                // time.precision.mode=isostring => io.debezium.time.IsoTimestamp (ISO-8601, UTC => "Z")
+                comma(hasPreviousColumn);
+                append('"');
+                appendEscape(columnName);
+                append(std::string_view(R"(":")"));
+                char buffer[24];
+                appendArr(buffer, Data::epochToIso8601(timestamp, buffer, true, false));
+                const int digits = precision > 9 ? 9 : static_cast<int>(precision > 0 ? precision : 0);
+                if (digits > 0) {
+                    append('.');
+                    char frac[10];
+                    uint64_t f = fraction;
+                    for (int i = digits - 1; i >= 0; --i) {
+                        frac[i] = Data::map10(static_cast<uint>(f % 10));
+                        f /= 10;
+                    }
+                    appendArr(frac, static_cast<uint64_t>(digits));
+                }
+                append('Z');
+                append('"');
+                return;
+            }
+            if (format.timePrecisionMode == Format::TIME_PRECISION_MODE::CONNECT) {
+                // time.precision.mode=connect => org.apache.kafka.connect.data.Timestamp (milliseconds)
+                comma(hasPreviousColumn);
+                append('"');
+                appendEscape(columnName);
+                append(std::string_view(R"(":)"));
+                appendSDec((timestamp * 1000L) + static_cast<time_t>((fraction + 500000) / 1000000));
+                return;
+            }
+
+            // Debezium time.precision.mode=adaptive: the unit must match the schema name chosen for the
+            // column (Oracle DATE carries no fractional seconds => millis, like the schema above)
             comma(hasPreviousColumn);
             append('"');
             appendEscape(columnName);
@@ -510,6 +639,7 @@ namespace OpenLogReplicator {
     void BuilderJson::columnTimestampTz(const std::string& columnName, time_t timestamp, uint64_t fraction, const std::string_view& tz) {
         if (debeziumSchemaBlock) {
             // Debezium ZonedTimestamp: ISO-8601 with offset, e.g. 2018-03-27T01:34:56.007891-11:00 (UTC => Z)
+            // NOTE: time.precision.mode does not affect TIMESTAMP WITH (LOCAL) TIME ZONE in Debezium
             const int64_t precision = (currentColumn != nullptr && currentColumn->scale >= 0) ? currentColumn->scale : 6;
             const int digits = precision > 9 ? 9 : static_cast<int>(precision);
             comma(hasPreviousColumn);
@@ -1311,7 +1441,16 @@ namespace OpenLogReplicator {
                 // Debezium OracleValueConverters.getNumericSchema(): scale present, width = precision - scale
                 const int64_t precision = column->precision > 0 ? column->precision : 38;
                 const int64_t scale = column->scale > 0 ? column->scale : 0;
-                if (scale == 0 && precision < 19) {
+                if (format.decimalHandlingMode == Format::DECIMAL_HANDLING_MODE::DOUBLE) {
+                    // decimal.handling.mode=double: every NUMBER column becomes FLOAT64
+                    append(std::string_view(R"("type":"double","optional":true)"));
+                } else if (column->scale < 0) {
+                    // No scale in the dictionary: Debezium falls back to VariableScaleDecimal
+                    append(std::string_view(R"("type":"struct","optional":true,"name":"io.debezium.data.VariableScaleDecimal","version":1,"fields":[{"field":"scale","type":"int32","optional":true},{"field":"value","type":"bytes","optional":true}]}"));
+                } else if (format.decimalHandlingMode == Format::DECIMAL_HANDLING_MODE::STRING) {
+                    // decimal.handling.mode=string: every NUMBER column becomes STRING (plain decimal text)
+                    append(std::string_view(R"("type":"string","optional":true)"));
+                } else if (scale == 0 && precision < 19) {
                     if (precision < 3)
                         append(std::string_view(R"("type":"int8","optional":true)"));
                     else if (precision < 5)
@@ -1332,7 +1471,9 @@ namespace OpenLogReplicator {
             }
 
             case SysCol::COLTYPE::FLOAT:
-                // Oracle BINARY_FLOAT => FLOAT32 (Debezium: SchemaBuilder.float32())
+                // Oracle BINARY_FLOAT => FLOAT32 (Debezium: SchemaBuilder.float32(), unaffected by
+                // decimal.handling.mode). Oracle's scale-less FLOAT (a NUMBER variant) arrives here as
+                // SysCol::COLTYPE::NUMBER and is handled by the NUMBER case above.
                 append(std::string_view(R"("type":"float","optional":true)"));
                 break;
 
@@ -1343,10 +1484,16 @@ namespace OpenLogReplicator {
 
             case SysCol::COLTYPE::DATE:
             case SysCol::COLTYPE::TIMESTAMP: {
-                // Debezium: TemporalPrecisionMode.ADAPTIVE. Oracle DATE carries scale 0 => millis.
+                // Debezium: TemporalPrecisionMode. Oracle DATE carries scale 0 => millis.
                 const int64_t precision = column->type == SysCol::COLTYPE::DATE ? 0
                         : (column->scale >= 0 ? column->scale : 6);
-                if (precision <= 3)
+                if (format.timePrecisionMode == Format::TIME_PRECISION_MODE::CONNECT) {
+                    // time.precision.mode=connect
+                    append(std::string_view(R"("type":"int64","name":"org.apache.kafka.connect.data.Timestamp","version":1,"optional":true)"));
+                } else if (format.timePrecisionMode == Format::TIME_PRECISION_MODE::ISOSTRING) {
+                    // time.precision.mode=isostring
+                    append(std::string_view(R"("type":"string","name":"io.debezium.time.IsoTimestamp","version":1,"optional":true)"));
+                } else if (precision <= 3)
                     append(std::string_view(R"("type":"int64","name":"io.debezium.time.Timestamp","version":1,"optional":true)"));
                 else if (precision <= 6)
                     append(std::string_view(R"("type":"int64","name":"io.debezium.time.MicroTimestamp","version":1,"optional":true)"));
@@ -1366,8 +1513,11 @@ namespace OpenLogReplicator {
 
             case SysCol::COLTYPE::INTERVAL_DAY_TO_SECOND:
             case SysCol::COLTYPE::INTERVAL_YEAR_TO_MONTH:
-                // Debezium interval.handling.mode=numeric (default) => io.debezium.time.MicroDuration
-                append(std::string_view(R"("type":"int64","name":"io.debezium.time.MicroDuration","version":1,"optional":true)"));
+                // interval.handling.mode: numeric => MicroDuration (INT64), string => Interval (ISO-8601)
+                if (format.intervalHandlingMode == Format::INTERVAL_HANDLING_MODE::STRING)
+                    append(std::string_view(R"("type":"string","name":"io.debezium.time.Interval","version":1,"optional":true)"));
+                else
+                    append(std::string_view(R"("type":"int64","name":"io.debezium.time.MicroDuration","version":1,"optional":true)"));
                 break;
 
             case SysCol::COLTYPE::JSON:
@@ -1377,12 +1527,17 @@ namespace OpenLogReplicator {
             case SysCol::COLTYPE::BLOB:
                 if (column->xmlType && ctx->isFlagSet(Ctx::REDO_FLAGS::EXPERIMENTAL_XMLTYPE))
                     append(std::string_view(R"("type":"string","name":"io.debezium.data.Xml","version":1,"optional":true)"));
-                else
+                else if (format.binaryHandlingMode == Format::BINARY_HANDLING_MODE::BYTES)
                     append(std::string_view(R"("type":"bytes","optional":true)"));
+                else
+                    append(std::string_view(R"("type":"string","optional":true)"));
                 break;
 
             case SysCol::COLTYPE::RAW:
-                append(std::string_view(R"("type":"bytes","optional":true)"));
+                if (format.binaryHandlingMode == Format::BINARY_HANDLING_MODE::BYTES)
+                    append(std::string_view(R"("type":"bytes","optional":true)"));
+                else
+                    append(std::string_view(R"("type":"string","optional":true)"));
                 break;
 
             default:

@@ -184,6 +184,33 @@ namespace OpenLogReplicator {
             SHOW
         };
 
+        // Behaviour switches mirroring the Debezium Oracle connector properties (used together with the
+        // "schema-block" format option, which emits the standard Debezium envelope):
+        //   decimal.handling.mode / time.precision.mode / binary.handling.mode / interval.handling.mode
+        enum class DECIMAL_HANDLING_MODE : unsigned char {
+            PRECISE = 0, // Default: int8/16/32/64 for short integers, Decimal (bytes) otherwise
+            DOUBLE  = 1, // All NUMBER columns become FLOAT64
+            STRING  = 2  // All NUMBER columns become STRING (plain decimal text)
+        };
+
+        enum class TIME_PRECISION_MODE : unsigned char {
+            ADAPTIVE  = 0, // Default: milliseconds/microseconds/nanoseconds chosen per column
+            CONNECT   = 1, // org.apache.kafka.connect.data.Timestamp (milliseconds)
+            ISOSTRING = 2  // io.debezium.time.IsoTimestamp (ISO-8601 string)
+        };
+
+        enum class BINARY_HANDLING_MODE : unsigned char {
+            BYTES           = 0, // Default: BYTES schema (JsonConverter encodes it as base64)
+            BASE64          = 1, // STRING schema holding the base64 text
+            BASE64_URL_SAFE = 2, // STRING schema holding the url-safe base64 text
+            HEX             = 3  // STRING schema holding hexadecimal digits
+        };
+
+        enum class INTERVAL_HANDLING_MODE : unsigned char {
+            NUMERIC = 0, // Default: io.debezium.time.MicroDuration (INT64, microseconds)
+            STRING  = 1  // io.debezium.time.Interval (STRING, ISO-8601)
+        };
+
         enum class VALUE_TYPE : unsigned char {
             BEFORE,
             AFTER,
@@ -219,6 +246,13 @@ namespace OpenLogReplicator {
         COLUMN_FORMAT columnFormat;
         UNKNOWN_TYPE unknownType;
         USER_TYPE userType;
+
+        // Debezium compatible behaviour (see the "schema-block" format option); defaults match the
+        // Debezium Oracle connector defaults (default member initialisers keep the constructor untouched)
+        DECIMAL_HANDLING_MODE decimalHandlingMode{DECIMAL_HANDLING_MODE::PRECISE};
+        TIME_PRECISION_MODE timePrecisionMode{TIME_PRECISION_MODE::ADAPTIVE};
+        BINARY_HANDLING_MODE binaryHandlingMode{BINARY_HANDLING_MODE::BYTES};
+        INTERVAL_HANDLING_MODE intervalHandlingMode{INTERVAL_HANDLING_MODE::NUMERIC};
 
         Format(DB_FORMAT newDbFormat, ATTRIBUTES_FORMAT newAttributesFormat, INTERVAL_DTS_FORMAT newIntervalDtsFormat,
                INTERVAL_YTM_FORMAT newIntervalYtmFormat, MESSAGE_FORMAT newMessageFormat, RID_FORMAT newRidFormat, REDO_THREAD_FORMAT newRedoThreadFormat,

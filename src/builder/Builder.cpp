@@ -386,14 +386,35 @@ namespace OpenLogReplicator {
                         }
 
                         if (debeziumSchemaBlock) {
-                            // Debezium interval.handling.mode=numeric (default) => io.debezium.time.MicroDuration
-                            // DAYS_PER_MONTH_AVG = 365.25 / 12 = 30.4375 days => 2629800000000 microseconds
-                            int64_t micros = static_cast<int64_t>((year * 12) + month) * 2629800000000LL;
-                            if (minus)
-                                micros = -micros;
                             valueSize = 0;
-                            valueBufferAppendInt(micros);
-                            columnNumber(column->name, 17, 0);
+                            if (minus)
+                                valueBuffer[valueSize++] = '-';
+                            if (format.intervalHandlingMode == Format::INTERVAL_HANDLING_MODE::STRING) {
+                                // io.debezium.time.Interval: ISO-8601 P<years>Y<months>M<days>DT<h>H<min>M<s>S
+                                valueBuffer[valueSize++] = 'P';
+                                valueBufferAppendInt(static_cast<int64_t>(year));
+                                valueBuffer[valueSize++] = 'Y';
+                                valueBufferAppendInt(static_cast<int64_t>(month));
+                                valueBuffer[valueSize++] = 'M';
+                                valueBufferAppendInt(0);
+                                valueBuffer[valueSize++] = 'D';
+                                valueBuffer[valueSize++] = 'T';
+                                valueBufferAppendInt(0);
+                                valueBuffer[valueSize++] = 'H';
+                                valueBufferAppendInt(0);
+                                valueBuffer[valueSize++] = 'M';
+                                valueBufferAppendInt(0);
+                                valueBuffer[valueSize++] = 'S';
+                                columnString(column->name);
+                            } else {
+                                // Debezium interval.handling.mode=numeric => io.debezium.time.MicroDuration
+                                // DAYS_PER_MONTH_AVG = 365.25 / 12 = 30.4375 days => 2629800000000 microseconds
+                                valueSize = 0;
+                                if (minus)
+                                    valueBuffer[valueSize++] = '-';
+                                valueBufferAppendInt(static_cast<int64_t>((year * 12) + month) * 2629800000000LL);
+                                columnNumber(column->name, 17, 0);
+                            }
                             break;
                         }
 
@@ -507,14 +528,36 @@ namespace OpenLogReplicator {
                         }
 
                         if (debeziumSchemaBlock) {
-                            // Debezium interval.handling.mode=numeric (default) => io.debezium.time.MicroDuration
-                            int64_t micros = (((static_cast<int64_t>(day) * 24 + hour) * 60 + minute) * 60 + second) * 1000000
-                                    + (static_cast<int64_t>(us) + 500) / 1000;
-                            if (minus)
-                                micros = -micros;
                             valueSize = 0;
-                            valueBufferAppendInt(micros);
-                            columnNumber(column->name, 17, 0);
+                            if (minus)
+                                valueBuffer[valueSize++] = '-';
+                            if (format.intervalHandlingMode == Format::INTERVAL_HANDLING_MODE::STRING) {
+                                // io.debezium.time.Interval: ISO-8601 P<years>Y<months>M<days>DT<h>H<min>M<s>S
+                                valueBuffer[valueSize++] = 'P';
+                                valueBufferAppendInt(0);
+                                valueBuffer[valueSize++] = 'Y';
+                                valueBufferAppendInt(0);
+                                valueBuffer[valueSize++] = 'M';
+                                valueBufferAppendInt(static_cast<int64_t>(day));
+                                valueBuffer[valueSize++] = 'D';
+                                valueBuffer[valueSize++] = 'T';
+                                valueBufferAppendInt(hour);
+                                valueBuffer[valueSize++] = 'H';
+                                valueBufferAppendInt(minute);
+                                valueBuffer[valueSize++] = 'M';
+                                valueBufferAppendInt(second);
+                                valueBuffer[valueSize++] = 'S';
+                                columnString(column->name);
+                            } else {
+                                // Debezium interval.handling.mode=numeric => io.debezium.time.MicroDuration
+                                valueSize = 0;
+                                if (minus)
+                                    valueBuffer[valueSize++] = '-';
+                                valueBufferAppendInt(
+                                        ((((static_cast<int64_t>(day) * 24 + hour) * 60 + minute) * 60 + second) * 1000000)
+                                        + ((static_cast<int64_t>(us) + 500) / 1000));
+                                columnNumber(column->name, 17, 0);
+                            }
                             break;
                         }
 
