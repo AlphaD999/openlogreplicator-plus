@@ -1446,7 +1446,7 @@ namespace OpenLogReplicator {
                     append(std::string_view(R"("type":"double","optional":true)"));
                 } else if (column->scale < 0) {
                     // No scale in the dictionary: Debezium falls back to VariableScaleDecimal
-                    append(std::string_view(R"("type":"struct","optional":true,"name":"io.debezium.data.VariableScaleDecimal","version":1,"fields":[{"field":"scale","type":"int32","optional":true},{"field":"value","type":"bytes","optional":true}]}"));
+                    append(std::string_view(R"("type":"struct","optional":true,"name":"io.debezium.data.VariableScaleDecimal","version":1,"fields":[{"field":"scale","type":"int32","optional":true},{"field":"value","type":"bytes","optional":true}])"));
                 } else if (format.decimalHandlingMode == Format::DECIMAL_HANDLING_MODE::STRING) {
                     // decimal.handling.mode=string: every NUMBER column becomes STRING (plain decimal text)
                     append(std::string_view(R"("type":"string","optional":true)"));
