@@ -1347,6 +1347,25 @@ namespace OpenLogReplicator {
             const int bytes = redoReadProbe(probe, bufferScan, blockSize);
             t->contextSet(CONTEXT::CPU);
             if (bytes >= static_cast<int>(blockSize) && (probe[0] != 0 || probe[1] != 0)) {
+                // Real bytes, but not necessarily unread redo of THIS log: an archive lives in an ASM file
+                // whose extents are reused, so behind the end of the copied log there can be blocks left over
+                // from an older log - real, non zero, and not this archive's data at all. The block header
+                // tells them apart: a block of another sequence is a leftover, a block of this sequence is the
+                // tail this reader has not read yet. Refusing the end over a leftover is what kept a reader
+                // re-reading the same position forever (60044 in a loop, and the transactions whose commits
+                // sit behind that position never completed - measured in production as the 10017 out of memory
+                // that followed it). The other end-of-archive decisions already use this very rule for the
+                // batch mode case.
+                if (blockSize >= 12 && sequence != Seq::zero()) {
+                    const Seq probeSequence(ctx->read32(probe + 8));
+                    if (probeSequence != sequence) {
+                        ctx->warning(60052, "file: " + fileName + " - position: " + std::to_string(bufferScan) +
+                                     " - the blocks behind the end of this log belong to sequence: " + probeSequence.toString() +
+                                     " (expected: " + sequence.toString() + ") - they are leftovers of a reused file, accepting the end");
+                        break;
+                    }
+                }
+
                 ctx->warning(60044, "file: " + fileName + " - position: " + std::to_string(bufferScan) +
                              " - the file holds redo data at this position (size from stat: " + std::to_string(fileSizeStat) +
                              ", from header: " + std::to_string(static_cast<uint64_t>(numBlocksHeader) * blockSize) +
