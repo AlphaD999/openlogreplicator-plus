@@ -306,6 +306,10 @@ namespace OpenLogReplicator {
 
             if (ctx->softShutdown)
                 metadata->writeCheckpoint(this, true);
+
+            // Last line of the run: the parse statistics of it, and with "always" also when they are all zero
+            // (the zeros are the answer then: no redo was parsed twice and no delivery was waited for).
+            ctx->reportParseStats(true);
         } catch (RuntimeException& ex) {
             ctx->error(ex.code, ex.msg);
             ctx->stopHard();

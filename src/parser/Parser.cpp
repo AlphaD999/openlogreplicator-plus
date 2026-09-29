@@ -1770,11 +1770,18 @@ namespace OpenLogReplicator {
                         metadata->saveFileOffset(thread, FileOffset(lwnConfirmedBlock, reader->getBlockSize()));
                         // This pass ends here and the next one starts at the last confirmed LWN boundary, so the
                         // redo between that boundary and the position this pass reached is parsed a second time.
-                        // Counted (bytes and frequency) so that the cost of the granularity is visible.
-                        if (ctx->metrics != nullptr && currentBlock > lwnConfirmedBlock) {
-                            ctx->metrics->emitParsePassesEarly(1);
-                            ctx->metrics->emitBytesParsedRepeated(static_cast<uint64_t>(currentBlock - lwnConfirmedBlock) *
-                                                                  reader->getBlockSize());
+                        // Counted (bytes and frequency) so that the cost of the granularity is visible - as plain
+                        // counters that reportParseStats() logs with every checkpoint, and as metrics when they
+                        // are compiled in (the production delivery has no Prometheus).
+                        if (currentBlock > lwnConfirmedBlock) {
+                            const uint64_t repeatedBytes = static_cast<uint64_t>(currentBlock - lwnConfirmedBlock) *
+                                                           reader->getBlockSize();
+                            ctx->statParsePassesEarly.fetch_add(1, std::memory_order_relaxed);
+                            ctx->statBytesParsedRepeated.fetch_add(repeatedBytes, std::memory_order_relaxed);
+                            if (ctx->metrics != nullptr) {
+                                ctx->metrics->emitParsePassesEarly(1);
+                                ctx->metrics->emitBytesParsedRepeated(repeatedBytes);
+                            }
                         }
                     }
                     break;

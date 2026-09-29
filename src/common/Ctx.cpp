@@ -672,14 +672,19 @@ namespace OpenLogReplicator {
                 t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_MEMORY_INIT);
             }
 
-            if (slept && metrics != nullptr) {
+            if (slept) {
                 // A re-parse ran into the swap key of a transaction that is already committed and not delivered
                 // yet, so this thread had to wait for that delivery: the count and the time it cost. A climbing
-                // counter here means re-parsed redo (see bytes_parsed_repeated) is running into undelivered
+                // counter here means re-parsed redo (see statBytesParsedRepeated) is running into undelivered
                 // transactions - the wait is what the skip-on-re-parse change is meant to remove.
-                metrics->emitDuplicateParseWaits(1);
-                if (waitSince != 0 && clock != nullptr)
-                    metrics->emitDuplicateParseWaitUs(clock->getTimeUt() - waitSince);
+                const uint64_t waitUs = (waitSince != 0 && clock != nullptr) ? clock->getTimeUt() - waitSince : 0;
+                statDuplicateParseWaits.fetch_add(1, std::memory_order_relaxed);
+                statDuplicateParseWaitUs.fetch_add(waitUs, std::memory_order_relaxed);
+                if (metrics != nullptr) {
+                    metrics->emitDuplicateParseWaits(1);
+                    if (waitUs != 0)
+                        metrics->emitDuplicateParseWaitUs(waitUs);
+                }
             }
 
             swapChunks.insert_or_assign(swapKey, sc);
@@ -870,6 +875,24 @@ namespace OpenLogReplicator {
         pending.swap(deferredSwapReleases);
         for (const SwapKey& swapKey: pending)
             swappedMemoryKeyRelease(swapKey);
+    }
+
+    void Ctx::reportParseStats(bool always) {
+        const uint64_t passesEarly = statParsePassesEarly.load(std::memory_order_relaxed);
+        const uint64_t bytesRepeated = statBytesParsedRepeated.load(std::memory_order_relaxed);
+        const uint64_t waits = statDuplicateParseWaits.load(std::memory_order_relaxed);
+        const uint64_t waitUs = statDuplicateParseWaitUs.load(std::memory_order_relaxed);
+
+        // Silent while nothing happened: a run that never re-parsed redo and never waited on an undelivered
+        // transaction has nothing to report, and one line per checkpoint is enough to notice when it has.
+        // The caller can ask for the line anyway (end of a run), then the zeros are the answer.
+        if (!always && passesEarly == 0 && bytesRepeated == 0 && waits == 0 && waitUs == 0)
+            return;
+
+        info(0, "parse statistics: parse_passes_early=" + std::to_string(passesEarly) + ", bytes_parsed_repeated=" +
+                std::to_string(bytesRepeated) + ", duplicate_parse_waits=" + std::to_string(waits) +
+                ", duplicate_parse_wait_us=" + std::to_string(waitUs) + " (the same numbers as the metrics of the "
+                "same name, which only exist in a build with Prometheus)");
     }
 
     void Ctx::swappedMemoryKeyRelease(const SwapKey& swapKey) {

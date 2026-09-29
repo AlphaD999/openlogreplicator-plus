@@ -525,6 +525,11 @@ namespace OpenLogReplicator {
 
         if (!stateWrite(checkpointName, lastCheckpointScn, ss))
             ctx->warning(60018, "file: " + checkpointName + " - couldn't write checkpoint");
+        else
+            // The parse statistics of this run (redo parsed a second time, waits for an undelivered transaction)
+            // ride along with the checkpoint cadence: it is the only way to read them in a build without metrics,
+            // which is what the production delivery is. Silent while nothing happened.
+            ctx->reportParseStats();
     }
 
     void Metadata::readCheckpoints() {

@@ -391,6 +391,18 @@ namespace OpenLogReplicator {
         bool deferSwapReleases{false};
         std::vector<SwapKey> deferredSwapReleases;
 
+        // Lightweight observability of the two costs above, for builds without metrics (the Prometheus counters
+        // of the same name only exist with LINK_LIBRARY_PROMETHEUS, which the production delivery does not
+        // enable): redo parsed a second time because a parse pass ended early, and the wait of a re-parse that
+        // ran into a transaction that is committed but not delivered yet. Reported as a single line with every
+        // checkpoint write (reportParseStats), and only when there is something to report.
+        std::atomic<uint64_t> statParsePassesEarly{0};
+        std::atomic<uint64_t> statBytesParsedRepeated{0};
+        std::atomic<uint64_t> statDuplicateParseWaits{0};
+        std::atomic<uint64_t> statDuplicateParseWaitUs{0};
+        // "always" reports the line even when all four are zero (the end of a run: the zeros are the answer then).
+        void reportParseStats(bool always = false);
+
         void releaseDeferredSwaps();
         // Executor of the out-of-parser tick. Set by the replicator (which already owns one for its own idle
         // tick): allocating a parser at the moment the pool is exhausted - exactly when the tick is needed -
