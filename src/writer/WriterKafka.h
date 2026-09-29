@@ -55,6 +55,9 @@ namespace OpenLogReplicator {
 
     public:
         static constexpr uint64_t MAX_KAFKA_MESSAGE_MB = 953;
+        // Time given to librdkafka to deliver the messages still in its queue when the producer is destroyed
+        // (see ~WriterKafka). Bounded so that a broker that is gone can not delay the shutdown forever.
+        static constexpr int KAFKA_SHUTDOWN_FLUSH_MS = 30000;
 
         WriterKafka(Ctx* newCtx, std::string newAlias, std::string newDatabase, Builder* newBuilder, Metadata* newMetadata, std::string newTopic,
                    std::string newTopicPrefix = "", bool newDynamicTopic = false, bool newEnvelopeOutput = false, std::string newSchemaChangeTopic = "");

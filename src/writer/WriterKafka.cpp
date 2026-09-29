@@ -53,9 +53,20 @@ namespace OpenLogReplicator {
         if (rkt != nullptr)
             rd_kafka_topic_destroy(rkt);
 
-        const rd_kafka_resp_err_t err = rd_kafka_fatal_error(rk, nullptr, 0);
-        if (rk != nullptr)
+        rd_kafka_resp_err_t err = RD_KAFKA_RESP_ERR_NO_ERROR;
+        if (rk != nullptr) {
+            // Drain the producer queue before destroying the handle: a message that was handed over to
+            // librdkafka - the writer already treats it as delivered and confirms its position - is dropped
+            // when the handle is destroyed, so without this flush the last transactions (and possibly the
+            // final checkpoint) of a clean shutdown silently never reach Kafka.
+            const rd_kafka_resp_err_t flushErr = rd_kafka_flush(rk, KAFKA_SHUTDOWN_FLUSH_MS);
+            if (flushErr != RD_KAFKA_RESP_ERR_NO_ERROR)
+                ctx->info(0, "Kafka producer could not flush all pending messages on shutdown (still queued: " +
+                             std::to_string(rd_kafka_outq_len(rk)) + "): " + std::string(rd_kafka_err2str(flushErr)));
+
+            err = rd_kafka_fatal_error(rk, nullptr, 0);
             rd_kafka_destroy(rk);
+        }
 
         ctx->info(0, "Kafka producer exit code: " + std::to_string(err));
     }
