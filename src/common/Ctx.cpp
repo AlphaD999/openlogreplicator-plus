@@ -672,6 +672,16 @@ namespace OpenLogReplicator {
                 t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_MEMORY_INIT);
             }
 
+            if (slept && metrics != nullptr) {
+                // A re-parse ran into the swap key of a transaction that is already committed and not delivered
+                // yet, so this thread had to wait for that delivery: the count and the time it cost. A climbing
+                // counter here means re-parsed redo (see bytes_parsed_repeated) is running into undelivered
+                // transactions - the wait is what the skip-on-re-parse change is meant to remove.
+                metrics->emitDuplicateParseWaits(1);
+                if (waitSince != 0 && clock != nullptr)
+                    metrics->emitDuplicateParseWaitUs(clock->getTimeUt() - waitSince);
+            }
+
             swapChunks.insert_or_assign(swapKey, sc);
         }
         t->contextSet(Thread::CONTEXT::CPU);

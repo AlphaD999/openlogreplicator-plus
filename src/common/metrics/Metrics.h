@@ -51,6 +51,18 @@ namespace OpenLogReplicator {
         // bytes parsed
         virtual void emitBytesParsed(uint64_t counter) = 0;
 
+        // bytes_parsed_repeated: redo bytes parsed a second time because a pass ended before reaching the next
+        // LWN boundary (STOPPED/OVERWRITTEN) and the next pass resumes at the last confirmed one
+        virtual void emitBytesParsedRepeated(uint64_t counter) = 0;
+
+        // parse_passes_early: how often a pass ends early like that - the frequency that makes the bytes above
+        virtual void emitParsePassesEarly(uint64_t counter) = 0;
+
+        // duplicate_parse_waits / duplicate_parse_wait_us: a re-parse ran into the swap key of a transaction
+        // that is already committed and not delivered yet, so the parser had to wait for its delivery (defect C)
+        virtual void emitDuplicateParseWaits(uint64_t counter) = 0;
+        virtual void emitDuplicateParseWaitUs(uint64_t counter) = 0;
+
         // bytes read
         virtual void emitBytesRead(uint64_t counter) = 0;
 

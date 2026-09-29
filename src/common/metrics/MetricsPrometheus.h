@@ -97,6 +97,20 @@ namespace OpenLogReplicator {
         prometheus::Family<prometheus::Gauge>* memoryAllocatedMb{nullptr};
         prometheus::Gauge* memoryAllocatedMbGauge{nullptr};
 
+        // bytes_parsed_repeated
+        prometheus::Family<prometheus::Counter>* bytesParsedRepeated{nullptr};
+        prometheus::Counter* bytesParsedRepeatedCounter{nullptr};
+
+        // parse_passes_early
+        prometheus::Family<prometheus::Counter>* parsePassesEarly{nullptr};
+        prometheus::Counter* parsePassesEarlyCounter{nullptr};
+
+        // duplicate_parse_waits / duplicate_parse_wait_us
+        prometheus::Family<prometheus::Counter>* duplicateParseWaits{nullptr};
+        prometheus::Counter* duplicateParseWaitsCounter{nullptr};
+        prometheus::Family<prometheus::Counter>* duplicateParseWaitUs{nullptr};
+        prometheus::Counter* duplicateParseWaitUsCounter{nullptr};
+
         // memory_used_total_mb
         prometheus::Family<prometheus::Gauge>* memoryUsedTotalMb{nullptr};
         prometheus::Gauge* memoryUsedTotalMbGauge{nullptr};

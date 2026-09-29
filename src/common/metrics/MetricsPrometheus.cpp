@@ -49,6 +49,35 @@ namespace OpenLogReplicator {
                                                  .Register(*registry);
         bytesParsedCounter = &bytesParsed->Add({});
 
+        // bytes_parsed_repeated
+        bytesParsedRepeated = &prometheus::BuildCounter().Name("bytes_parsed_repeated")
+                                                         .Help("Number of redo bytes parsed a second time in the same run because a pass "
+                                                               "ended before the next LWN boundary and the parser resumed at the last "
+                                                               "confirmed one")
+                                                         .Register(*registry);
+        bytesParsedRepeatedCounter = &bytesParsedRepeated->Add({});
+
+        // parse_passes_early
+        parsePassesEarly = &prometheus::BuildCounter().Name("parse_passes_early")
+                                                     .Help("Number of parse passes that ended early (STOPPED/OVERWRITTEN) and made the "
+                                                           "next pass resume at the last confirmed LWN boundary")
+                                                     .Register(*registry);
+        parsePassesEarlyCounter = &parsePassesEarly->Add({});
+
+        // duplicate_parse_waits
+        duplicateParseWaits = &prometheus::BuildCounter().Name("duplicate_parse_waits")
+                                                        .Help("Number of times a re-parse ran into the swap key of a transaction that is "
+                                                              "already committed and not delivered yet (the parser waits for its delivery)")
+                                                        .Register(*registry);
+        duplicateParseWaitsCounter = &duplicateParseWaits->Add({});
+
+        // duplicate_parse_wait_us
+        duplicateParseWaitUs = &prometheus::BuildCounter().Name("duplicate_parse_wait_us")
+                                                         .Help("Microseconds spent waiting for the delivery of a transaction whose swap key "
+                                                               "was met a second time")
+                                                         .Register(*registry);
+        duplicateParseWaitUsCounter = &duplicateParseWaitUs->Add({});
+
         // bytes_read
         bytesRead = &prometheus::BuildCounter().Name("bytes_read")
                                                .Help("Number of bytes read from redo log files")
@@ -289,6 +318,26 @@ namespace OpenLogReplicator {
     // bytes_parsed
     void MetricsPrometheus::emitBytesParsed(uint64_t counter) {
         bytesParsedCounter->Increment(counter);
+    }
+
+    // bytes_parsed_repeated
+    void MetricsPrometheus::emitBytesParsedRepeated(uint64_t counter) {
+        bytesParsedRepeatedCounter->Increment(counter);
+    }
+
+    // parse_passes_early
+    void MetricsPrometheus::emitParsePassesEarly(uint64_t counter) {
+        parsePassesEarlyCounter->Increment(counter);
+    }
+
+    // duplicate_parse_waits
+    void MetricsPrometheus::emitDuplicateParseWaits(uint64_t counter) {
+        duplicateParseWaitsCounter->Increment(counter);
+    }
+
+    // duplicate_parse_wait_us
+    void MetricsPrometheus::emitDuplicateParseWaitUs(uint64_t counter) {
+        duplicateParseWaitUsCounter->Increment(counter);
     }
 
     // bytes_read
