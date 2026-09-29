@@ -493,6 +493,7 @@ namespace OpenLogReplicator {
                     "redo-read-sleep-us",
                     "redo-verify-delay-us",
                     "refresh-interval-us",
+                    "ddl-filter",
                     "schema-change-topic",
                     "slice-pending-commits",
                     "state",
@@ -802,6 +803,17 @@ namespace OpenLogReplicator {
                 // When not set, DDL events are dropped and never mixed into data topics.
                 if (sourceJson.HasMember("schema-change-topic"))
                     schemaChangeTopic = Ctx::getJsonFieldS(configFileName, Ctx::JSON_PARAMETER_LENGTH, sourceJson, "schema-change-topic");
+                // Optional: report DDL/schema-change messages only for "filter.table" objects. "all" (default)
+                // keeps the current behaviour. Only the DDL message is filtered - the data dictionary is tracked
+                // from the SYS/XDB records (see Builder::ddlOutputAllowed).
+                if (sourceJson.HasMember("ddl-filter")) {
+                    const std::string ddlFilterValue = Ctx::getJsonFieldS(configFileName, Ctx::JSON_PARAMETER_LENGTH, sourceJson, "ddl-filter");
+                    if (ddlFilterValue == "filtered")
+                        ctx->ddlFilter = true;
+                    else if (ddlFilterValue != "all")
+                        throw ConfigurationException(30001, "bad JSON, invalid \"ddl-filter\" value: " + ddlFilterValue +
+                                                     ", expected: \"all\" or \"filtered\"");
+                }
                 // Optional: standard Debezium envelope with the "schema" block. Needed when the Sink
                 // connector only accepts Debezium records carrying a Connect schema (Kafka Connect
                 // JsonConverter with schemas.enable=true builds a Struct), for example the Doris Kafka
@@ -1240,7 +1252,8 @@ namespace OpenLogReplicator {
 
                         const std::string owner = Ctx::getJsonFieldS(configFileName, SysUser::NAME_LENGTH, tableElementJson, "owner");
                         const std::string table = Ctx::getJsonFieldS(configFileName, SysObj::NAME_LENGTH, tableElementJson, "table");
-                        SchemaElement* element = metadata->addElement(owner, table, DbTable::OPTIONS::DEFAULT);
+                        SchemaElement* element = metadata->addElement(owner, table,
+                                                                      DbTable::addOption(DbTable::OPTIONS::DEFAULT, DbTable::OPTIONS::FILTER_TABLE));
 
                         metadata->users.insert(owner);
 

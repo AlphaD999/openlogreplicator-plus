@@ -222,6 +222,11 @@ namespace OpenLogReplicator {
         // automatically: with "archives-server" configured and no time based position requested, the position is
         // taken from there as well (see the reader block of the configuration parser).
         bool positionSourceSet{false};
+        // Set when the source parameter "ddl-filter" is "filtered": a DDL/schema-change message whose object is a
+        // table the dictionary knows and that is not a "filter.table" target is dropped (see
+        // Builder::ddlOutputAllowed). Only the DDL message is affected - the data dictionary is tracked from the
+        // SYS/XDB records, not from the DDL message. Default false: every DDL is reported.
+        bool ddlFilter{false};
         uint disableChecks{0};
         LOG logLevel{LOG::INFO};
 

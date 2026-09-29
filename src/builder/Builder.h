@@ -1269,6 +1269,14 @@ namespace OpenLogReplicator {
         virtual void processBeginMessage(Seq sequence, Time timestamp) = 0;
         bool parseXml(const XmlCtx* xmlCtx, const uint8_t* data, uint64_t size, FileOffset fileOffset);
 
+        // "ddl-filter": report the DDL/schema-change message only for objects the user asked for. A table the
+        // dictionary knows and that is not a "filter.table" target is skipped (typically SYS.TAB$/COL$/OBJ$ and
+        // XDB.X$*, whose DDL changes are pure noise to a consumer). An object the dictionary does not know - a
+        // table being created by this very DDL, an index, a cluster - is always kept: a missing schema change is
+        // worse than a superfluous one. The data dictionary itself is not affected by this filter.
+        // Defined in Builder.cpp: DbTable is only forward declared here.
+        [[nodiscard]] bool ddlOutputAllowed(const DbTable* table) const;
+
     public:
         SystemTransaction* systemTransaction{nullptr};
         uint64_t buffersAllocated{0};

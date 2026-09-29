@@ -213,7 +213,8 @@ namespace OpenLogReplicator {
 
                         const std::string owner = Ctx::getJsonFieldS(configFileName, SysUser::NAME_LENGTH, tableElementJson, "owner");
                         const std::string table = Ctx::getJsonFieldS(configFileName, SysObj::NAME_LENGTH, tableElementJson, "table");
-                        SchemaElement* element = metadata->addElement(owner, table, DbTable::OPTIONS::DEFAULT);
+                        SchemaElement* element = metadata->addElement(owner, table,
+                                                                      DbTable::addOption(DbTable::OPTIONS::DEFAULT, DbTable::OPTIONS::FILTER_TABLE));
 
                         users.insert(owner);
 

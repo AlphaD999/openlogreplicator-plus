@@ -40,7 +40,12 @@ namespace OpenLogReplicator {
             DEFAULT      = 0,
             DEBUG_TABLE  = 1 << 0,
             SYSTEM_TABLE = 1 << 1,
-            SCHEMA_TABLE = 1 << 2
+            SCHEMA_TABLE = 1 << 2,
+            // The table comes from a "filter.table" entry of the configuration (with or without a row level
+            // "condition"). A table that is neither a filter target nor a system/dictionary table is not even
+            // loaded into the dictionary, so this bit is what tells "wanted table" from "loaded to track the
+            // dictionary" - it is what the optional DDL output filter checks (see "ddl-filter").
+            FILTER_TABLE = 1 << 3
         };
 
         enum class TABLE : unsigned char {
@@ -114,6 +119,16 @@ namespace OpenLogReplicator {
 
         static bool isSystemTable(OPTIONS options) {
             return (static_cast<uint>(options) & static_cast<uint>(OPTIONS::SYSTEM_TABLE)) != 0;
+        }
+
+        static bool isFilterTable(OPTIONS options) {
+            return (static_cast<uint>(options) & static_cast<uint>(OPTIONS::FILTER_TABLE)) != 0;
+        }
+
+        // Table options are a bit set and are built up in more than one place (the configuration and the
+        // checkpoints): the casts belong in here and not at every call site.
+        static OPTIONS addOption(OPTIONS options, OPTIONS option) {
+            return static_cast<OPTIONS>(static_cast<uint>(options) | static_cast<uint>(option));
         }
 
         friend std::ostream& operator<<(std::ostream& os, const DbTable& table);

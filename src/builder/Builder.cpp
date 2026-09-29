@@ -1817,6 +1817,10 @@ namespace OpenLogReplicator {
     }
 
     // 0x18010000
+    bool Builder::ddlOutputAllowed(const DbTable* table) const {
+        return !ctx->ddlFilter || table == nullptr || DbTable::isFilterTable(table->options);
+    }
+
     void Builder::processDdl(Seq sequence, Scn scn, Time timestamp, const RedoLogRecord* redoLogRecord1) {
         typePos fieldPos = 0;
         typeField fieldNum = 0;
@@ -1849,7 +1853,8 @@ namespace OpenLogReplicator {
                 appendDdlChunk(redoLogRecord1->data(fieldPos), fieldSize);
 
                 if (seq == cnt) {
-                    processDdl(sequence, scn, timestamp, table, redoLogRecord1->obj);
+                    if (ddlOutputAllowed(table))
+                        processDdl(sequence, scn, timestamp, table, redoLogRecord1->obj);
                     releaseDdl();
                 }
             }
@@ -1883,7 +1888,8 @@ namespace OpenLogReplicator {
         if (ctx->isFlagSet(Ctx::REDO_FLAGS::SHOW_DDL) || ddlEnabled) {
             appendDdlChunk(redoLogRecord1->data(fieldPos), fieldSize - 1U);
             if (seq == cnt) {
-                processDdl(sequence, scn, timestamp, table, redoLogRecord1->obj);
+                if (ddlOutputAllowed(table))
+                    processDdl(sequence, scn, timestamp, table, redoLogRecord1->obj);
                 releaseDdl();
             }
         }
