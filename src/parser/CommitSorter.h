@@ -32,6 +32,11 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include "../common/types/Types.h"
 
 namespace OpenLogReplicator {
+
+// Forward declaration: the delivery entry points take the thread the delivery is booked to (Ctx::accountThread,
+// stage 1) and whose swap key releases are held back until it is over - the definition is only needed by the
+// implementation, so the header does not have to pull in Ctx/Thread.
+class Thread;
     class Ctx;
     class Transaction;
 
@@ -84,26 +89,32 @@ namespace OpenLogReplicator {
         // Closed thread (instance down): its final watermark stops holding back the global low-water-mark
         void threadClosed(uint16_t thread);
         void threadReopened(uint16_t thread);
-        // Flush all events with scn <= low-water-mark
-        void flushReady(Executor* executor);
+        // Flush all events with scn <= low-water-mark. Every path that delivers takes Ctx::deliveryMtx for the
+        // whole delivery, the callbacks run outside the sorter lock. "deliveryThread" is the thread the delivery
+        // is booked to (Ctx::accountThread, stage 1) and the thread whose swap key releases are held back until
+        // the delivery is over (Ctx::deferSwapReleases, stage 2). The parser passes nothing: its deliveries are
+        // booked to the parser (Ctx::thread() falls back to it) and there is nothing to hold back.
+        void flushReady(Executor* executor, Thread* deliveryThread = nullptr);
         // Release the redo threads whose parsed SCN did not advance for "idleReleaseUs" (0 = disabled). Split
         // out of setThreadWatermark so that it can also run while nothing is being parsed.
         void refreshIdle(uint64_t currentTime, uint64_t idleReleaseUs);
         // Flush everything ignoring the watermark (soft shutdown)
-        void flushAll(Executor* executor);
-        // One tick off the parser thread: release the idle threads and flush what the low-water-mark allows.
-        // Called by the writer thread, only while the parser is blocked in Ctx::swappedMemoryInit (defect C):
-        // the release that wait is waiting for happens in the flush, and the flush is what the parser can not
-        // do while it waits. In every other situation the parser keeps driving the sorter alone.
-        void tick(Executor* executor, uint64_t currentTime, uint64_t idleReleaseUs);
+        void flushAll(Executor* executor, Thread* deliveryThread = nullptr);
+        // Stage 3, the independent delivery driver: drive the sorter off the parser thread - release the idle
+        // threads and flush what the low-water-mark allows. The parser keeps its own flush points, this is what
+        // makes the delivery independent of them: it no longer waits for the parser to reach one, it runs while
+        // the writer has nothing to write. With "flushLowest" the delivery also bypasses the low-water-mark,
+        // which is the defect C emergency: the parser is blocked in Ctx::swappedMemoryInit() waiting for the
+        // delivery it can not run itself, and while it is blocked nothing publishes a higher water-mark, so
+        // waiting for the water-mark would be waiting forever.
+        void tick(Executor* executor, uint64_t currentTime, uint64_t idleReleaseUs, Thread* deliveryThread = nullptr,
+                  bool flushLowest = false);
 
-        // Deliver the lowest buffered event(s) even though the low-water-mark has not reached them. Only for the
-        // defect C take-over: the parser is blocked in Ctx::swappedMemoryInit() waiting for exactly that delivery,
-        // and while it is blocked nothing publishes a higher water-mark, so waiting for the water-mark is waiting
-        // forever. It is safe there: the event is a *commit* (the transaction is complete), it is the lowest
-        // buffered one (nothing can be delivered out of order) and the thread that would have to catch up is the
-        // blocked parser itself.
-        void flushLowestPending(Executor* executor);
+        // Deliver the lowest buffered event(s) even though the low-water-mark has not reached them. Only called
+        // by tick() with flushLowest (the defect C emergency). It is safe there: the event is a *commit* (the
+        // transaction is complete), it is the lowest buffered one (nothing can be delivered out of order) and
+        // the thread that would have to catch up is the blocked parser itself.
+        void flushLowestPending(Executor* executor, Thread* deliveryThread = nullptr);
 
         // The low-water-mark: still the minimum over the active threads, but each thread publishes "the highest
         // commit SCN I can vouch for", which is one past its parsed position (see setThreadWatermark). Compared

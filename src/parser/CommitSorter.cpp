@@ -136,7 +136,40 @@ namespace OpenLogReplicator {
         }
     }
 
-    void CommitSorter::flushReady(Executor* executor) {
+    namespace {
+        // Stage 1 + 2 of the accounting decoupling, for a delivery that does not run on the parser: the memory
+        // and the state the delivery books have to be the delivering thread's (Ctx::thread() reads this), and
+        // the release that wakes a parser blocked in Ctx::swappedMemoryInit() has to wait for the end of the
+        // delivery - a parser that resumed into a running delivery would use the builder and book memory while
+        // the delivery is doing both. The destructor runs on every path out, including an exception from the
+        // delivery: a release that is collected and never run would leave the parser waiting forever.
+        struct DeliveryScope {
+            Ctx* ctx;
+            bool active;
+
+            DeliveryScope(Ctx* ctx, Thread* deliveryThread) : ctx(ctx), active(deliveryThread != nullptr) {
+                if (!active)
+                    return;
+                ctx->deferSwapReleases = true;
+                ctx->accountThread.store(deliveryThread, std::memory_order_relaxed);
+            }
+
+            ~DeliveryScope() {
+                if (!active)
+                    return;
+                ctx->deferSwapReleases = false;
+                ctx->accountThread.store(nullptr, std::memory_order_relaxed);
+                ctx->releaseDeferredSwaps();
+            }
+        };
+    }
+
+    void CommitSorter::flushReady(Executor* executor, Thread* deliveryThread) {
+        // One delivery at a time over every path (stage 3: the writer drives the sorter as well as the parser):
+        // the callbacks of flushUpTo() below run outside the sorter lock and write into the builder, so two
+        // deliveries must never overlap. The gate covers the whole delivery, not only the part under sorterMtx.
+        const std::unique_lock<std::mutex> deliveryLck(ctx->deliveryMtx);
+        const DeliveryScope delivery(ctx, deliveryThread);
         Scn limit;
         {
             std::lock_guard const lck(sorterMtx);
@@ -168,16 +201,29 @@ namespace OpenLogReplicator {
         flushUpTo(executor, limit);
     }
 
-    void CommitSorter::flushAll(Executor* executor) {
+    void CommitSorter::flushAll(Executor* executor, Thread* deliveryThread) {
+        const std::unique_lock<std::mutex> deliveryLck(ctx->deliveryMtx);
+        const DeliveryScope delivery(ctx, deliveryThread);
         flushUpTo(executor, Scn::none());
     }
 
-    void CommitSorter::tick(Executor* executor, uint64_t currentTime, uint64_t idleReleaseUs) {
+    void CommitSorter::tick(Executor* executor, uint64_t currentTime, uint64_t idleReleaseUs, Thread* deliveryThread,
+                            bool flushLowest) {
+        // The drive of the writer (stage 3): refreshIdle takes the sorter lock on its own and does not deliver,
+        // so it needs no gate - the delivery is the flush below, which takes the gate and books the delivery to
+        // this thread.
         refreshIdle(currentTime, idleReleaseUs);
-        flushReady(executor);
+        flushReady(executor, deliveryThread);
+        if (flushLowest)
+            // The defect C emergency: the lowest buffered event, delivered even though the water-mark has not
+            // reached it. The parser can not be delivering right now (it is the one blocked in the wait), so
+            // nothing can slip in between the flush above and this one.
+            flushLowestPending(executor, deliveryThread);
     }
 
-    void CommitSorter::flushLowestPending(Executor* executor) {
+    void CommitSorter::flushLowestPending(Executor* executor, Thread* deliveryThread) {
+        const std::unique_lock<std::mutex> deliveryLck(ctx->deliveryMtx);
+        const DeliveryScope delivery(ctx, deliveryThread);
         Scn lowest;
         {
             std::lock_guard const lck(sorterMtx);

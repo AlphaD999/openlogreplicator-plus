@@ -2554,48 +2554,25 @@ namespace OpenLogReplicator {
         if (unlikely(ctx->isTraceSet(Ctx::TRACE::SLEEP)))
             ctx->logTrace(Ctx::TRACE::SLEEP, "Builder:sleepForWriterWork");
 
-        // Defect C: the parser drives the commit sorter, but while it is blocked in Ctx::swappedMemoryInit() it
-        // can not, and the transaction it waits for is released only by the flush the sorter would have to run -
-        // a self-lock (warning 60050). The writer is idle right here (no message to deliver) and is not part of
-        // that cycle, so it takes the tick over, but only while the parser is in that wait: the normal path
-        // keeps running the sorter from the parser thread alone, in order and without locks.
-        if (ctx->parserInSwapWait.load(std::memory_order_relaxed) && metadata->commitSorter != nullptr &&
-            ctx->sorterExecutor != nullptr && metadata->commitSorter->getPendingEvents() > 0) {
-            // Stage 2: only one thread takes a tick over at a time (Ctx::writerTakeoverMtx). The delivery of a
-            // tick runs outside the sorter lock, so a second take-over in parallel would deliver at the same
-            // time, step over the accounting thread and over the deferred releases below.
-            std::unique_lock<std::mutex> takeoverLck(ctx->writerTakeoverMtx, std::try_to_lock);
-            if (takeoverLck.owns_lock()) {
-                if (!ctx->sorterTickTakenOver.exchange(true, std::memory_order_relaxed))
-                    ctx->info(0, "the parser is blocked waiting for a swapped transaction to be delivered - the writer "
-                                 "takes the commit sorter tick over to release it (defect C)");
-                // Stage 1 + 2 of the accounting decoupling: the delivery below runs on this thread while the
-                // parser is blocked in swappedMemoryInit(), so the memory and the state it books have to be this
-                // thread's and not the parser's (Ctx::thread() reads this). Stage 2 closes the window that used
-                // to stay open after the hand over: the release that wakes the parser is collected instead of
-                // run (Ctx::deferSwapReleases), and only after the delivery is finished and the accounting
-                // thread has been handed back is the parser let go - it never runs into the delivery. The guard
-                // does that on every path out, including an exception from the delivery: a release that is
-                // collected and never run would leave the parser waiting forever.
-                struct Handover {
-                    Ctx* ctx;
-
-                    ~Handover() {
-                        ctx->deferSwapReleases = false;
-                        ctx->accountThread.store(nullptr, std::memory_order_relaxed);
-                        ctx->releaseDeferredSwaps();
-                    }
-                } handover{ctx};
-
-                ctx->deferSwapReleases = true;
-                ctx->accountThread.store(t, std::memory_order_relaxed);
-                metadata->commitSorter->tick(ctx->sorterExecutor.get(), ctx->clock->getTimeUt(), ctx->idleThreadReleaseUs);
-                // Waiting for the water-mark alone would leave the parser waiting forever: it lags the parsed
-                // position by the commit that ends the parsed window (the commit SCN is the SCN of its redo
-                // record + 1) and while the parser is blocked nothing publishes a higher one - see
-                // CommitSorter::flushLowestPending().
-                metadata->commitSorter->flushLowestPending(ctx->sorterExecutor.get());
-            }
+        // Stage 3, the independent delivery driver: the writer is idle right here (no message to deliver) and is
+        // not part of the parse, so it drives the commit sorter whenever the sorter has something buffered. The
+        // delivery no longer waits for the parser to reach one of its flush points - only the low-water-mark
+        // decides what may be delivered (CommitSorter::flushReady), so the output order is unchanged and the
+        // parser keeps its own flush points. Both paths take one gate inside the sorter (Ctx::deliveryMtx).
+        //
+        // The emergency stays: while the parser is blocked in Ctx::swappedMemoryInit() (defect C, warning 60050)
+        // nothing publishes a higher water-mark, so the delivery it waits for has to bypass the water-mark.
+        if (metadata->commitSorter != nullptr && ctx->sorterExecutor != nullptr &&
+            metadata->commitSorter->getPendingEvents() > 0) {
+            const bool parserBlocked = ctx->parserInSwapWait.load(std::memory_order_relaxed);
+            if (parserBlocked && !ctx->sorterTickTakenOver.exchange(true, std::memory_order_relaxed))
+                ctx->info(0, "the parser is blocked waiting for a swapped transaction to be delivered - the writer "
+                             "takes the commit sorter tick over to release it (defect C)");
+            // The delivery is booked to this thread and its swap key releases are held back until it is over:
+            // that is what the sorter does for a delivery that does not run on the parser (stage 1 + 2, see
+            // CommitSorter::flushReady and Ctx::accountThread / Ctx::deferSwapReleases).
+            metadata->commitSorter->tick(ctx->sorterExecutor.get(), ctx->clock->getTimeUt(), ctx->idleThreadReleaseUs,
+                                         t, parserBlocked);
         } else
             ctx->sorterTickTakenOver.store(false, std::memory_order_relaxed);
 
