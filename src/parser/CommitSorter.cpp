@@ -217,7 +217,10 @@ namespace OpenLogReplicator {
         if (flushLowest)
             // The defect C emergency: the lowest buffered event, delivered even though the water-mark has not
             // reached it. The parser can not be delivering right now (it is the one blocked in the wait), so
-            // nothing can slip in between the flush above and this one.
+            // nothing can slip in between the flush above and this one. It is load bearing, not a formality: it
+            // was measured with the duplicate-Xid hook that it still has to deliver the blocking commit even
+            // with the water-mark published at every commit - the minimum over the redo threads is another
+            // thread's position there.
             flushLowestPending(executor, deliveryThread);
     }
 

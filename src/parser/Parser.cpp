@@ -848,10 +848,42 @@ namespace OpenLogReplicator {
         // (warning 60041 / error 50039) for a transaction that has in fact committed.
         transactionBuffer->dropTransaction(transaction->xid, transaction->conId, transaction->thread, transaction);
 
-        if (metadata->commitSorter != nullptr)
+        if (metadata->commitSorter != nullptr) {
             // Defer the flush until the low-water-mark over all redo threads passes the commit SCN
             metadata->commitSorter->enqueueCommit(transaction, transaction->commitScn);
-        else
+
+            // Publish the position of this thread right here and not only at the next LWN boundary: everything
+            // before the commit record is parsed (the records are parsed in order), so the commit just read is
+            // safe to deliver right away - CommitSorter::setThreadWatermark() shifts the position it is given by
+            // one, because a commit SCN is the SCN of its redo record, and that shift lands exactly on this
+            // commitScn and not one past it.
+            //
+            // Why it matters: with the position published only at the LWN boundaries the water-mark lags the
+            // parsed position by the whole rest of the window. A parser that then blocks on the swap key of
+            // exactly this transaction (defect C) stops publishing altogether - nothing else moves the
+            // water-mark past the commit it is waiting for, so it waits forever and only the emergency
+            // bypass (CommitSorter::flushLowestPending) could release it. With the commit published as it is
+            // parsed, the delivery of that commit is allowed by the ordinary path (flushReady) and the
+            // bypass is what it should be: a safety net, not the mechanism.
+            // Publish the position of this thread right here and not only at the next LWN boundary: everything
+            // before the commit record is parsed (the records are parsed in order), so the commit just read is
+            // safe to deliver right away - CommitSorter::setThreadWatermark() shifts the position it is given by
+            // one, because a commit SCN is the SCN of its redo record, and that shift lands exactly on this
+            // commitScn and not one past it.
+            //
+            // Measured (temporary duplicate-Xid hook, same window, both arms of the A/B switch this came with):
+            // publishing here keeps the water-mark of this thread on its parse position instead of on the last
+            // LWN boundary, but it does NOT by itself take the emergency bypass for a blocked parser
+            // (CommitSorter::flushLowestPending) out of the picture: what may be delivered is the minimum over
+            // all redo threads, and in the runs the minimum was another thread's position, so the bypass still
+            // had to deliver the blocking commit. It removes one of the two reasons the water-mark can lag (this
+            // thread's own) and keeps the idle timer of the thread fresh between two LWNs; the cross-thread one
+            // is what idle-thread-release-us bounds.
+            const Scn commitRecordScn = transaction->commitScn;
+            if (commitRecordScn != Scn::none() && commitRecordScn.getData() > 0)
+                metadata->commitSorter->setThreadWatermark(transaction->thread, Scn(commitRecordScn.getData() - 1),
+                                                          ctx->clock->getTimeUt(), ctx->idleThreadReleaseUs);
+        } else
             executeCommit(transaction);
 
     }
