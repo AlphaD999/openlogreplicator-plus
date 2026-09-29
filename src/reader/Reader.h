@@ -67,10 +67,17 @@ namespace OpenLogReplicator {
 
         static constexpr uint PAGE_SIZE_MAX{4096};
         static constexpr uint BAD_CDC_MAX_CNT{20};
+        // How often a position that looked empty is re-read before it is accepted as the end of the archive
+        // (see archiveEndConfirmed): the stale answer of a filesystem bridge is transient.
+        static constexpr uint END_CHECK_ATTEMPTS{3};
 
         std::string database;
         int fileCopyDes{-1};
         uint64_t fileSize{0};
+        // The size the filesystem reported (before the redo header may have raised or lowered fileSize). Kept
+        // apart because it is the only size that reflects the file itself: the header is authoritative when it
+        // says more (a bridge can report 0), but a smaller header must not hide data that is really there.
+        uint64_t fileSizeStat{0};
         Seq fileCopySequence;
         bool hintDisplayed{false};
         bool configuredBlockSum;
@@ -112,6 +119,11 @@ namespace OpenLogReplicator {
         virtual void redoClose() = 0;
         virtual REDO_CODE redoOpen() = 0;
         virtual int redoRead(uint8_t* buf, uint64_t offset, uint size) = 0;
+        // One read that neither retries nor reports anything, for the archive end verification: reading at
+        // the end of a file returns zero bytes, which is a normal answer there and not an error - going
+        // through redoRead() instead turns one probe per archive into a storm of 10005 (with the retry sleep
+        // of arch-read-sleep-us behind each of them).
+        virtual int redoReadProbe(uint8_t* buf, uint64_t offset, uint size);
         // Refresh the file size: the one taken at open time can be stale (a filesystem bridge such as asmfs
         // reports 0 for a file that is not fully visible yet, an online redo log can have grown since)
         virtual void refreshFileSize();
@@ -122,6 +134,18 @@ namespace OpenLogReplicator {
         bool read1();
         bool read2();
         void mainLoop();
+        // Is the end of this archive real? The sizes this reader knows can both be wrong: the one from stat
+        // (a filesystem bridge answers a stale, too small value and fileSize is only ever raised, so the
+        // wrong value sticks - measured 131072 for a 242688 byte archive) and the one from the redo header
+        // (a stale header read gives a too small block count as well). Accepting either as the end skips the
+        // tail of the archive in silence: measured "FINISHED, position: 131072 / 242688" lost a whole
+        // committed transaction plus a DDL with nothing at all in the log. What is left to consult is the
+        // file itself: when data is expected behind the position the parser stopped at, re-read it - real
+        // redo means the end is bogus, zeroes mean the padding of a log that was not filled up. Never finish
+        // an archive that still holds data: stop instead, the position is saved and the archive is read
+        // again with a fresh handle on the next scheduler pass (warning 60044). Not to be used where a
+        // non-empty block is the expected state (a block of another redo log, see read1 batch mode).
+        bool archiveEndConfirmed(Thread* t);
 
     public:
         const static char* REDO_MSG[static_cast<uint>(REDO_CODE::CNT)];

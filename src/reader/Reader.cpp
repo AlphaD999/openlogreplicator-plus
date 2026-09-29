@@ -293,19 +293,22 @@ namespace OpenLogReplicator {
         nextTime = ctx->read32(headerBuffer + blockSize + 200);
 
         if (numBlocksHeader != Ctx::ZERO_BLK && group == 0) {
-            // The block count from the redo header is authoritative for an archived redo log. The size from stat
-            // can be too big (padding) but also too small or zero: a filesystem bridge such as asmfs reports 0
-            // for a file that is not fully visible yet, and the reader would then poll forever on a position at
-            // or above the file size - without notifying the parser, which waits for the end of the archive in
-            // checkFinished, and without ever reading the rest of the archive.
+            // The block count from the redo header is authoritative when it says *more* than the size from
+            // stat: the size from stat can be too small or zero (a filesystem bridge such as asmfs reports 0
+            // for a file that is not fully visible yet) and the reader would then poll forever on a position
+            // at or above the file size - without notifying the parser, which waits for the end of the archive
+            // in checkFinished, and without ever reading the rest of the archive.
             const uint64_t fileSizeHeader = static_cast<uint64_t>(numBlocksHeader) * blockSize;
-            // The header may also claim a smaller size than the one from stat (padding). That correction is
-            // only allowed while nothing beyond it has been read: a size below the position already read
-            // would leave the read loop without a termination condition.
-            if (fileSize != fileSizeHeader && (fileSizeHeader > fileSize || fileSizeHeader >= bufferEnd)) {
+            if (fileSizeHeader > fileSize) {
                 fileSize = fileSizeHeader;
-                ctx->info(0, "updating redo log size to: " + std::to_string(fileSize) + " for: " + fileName);
-            } else if (fileSize != fileSizeHeader) {
+                ctx->info(0, "raising redo log size to: " + std::to_string(fileSize) + " for: " + fileName);
+            } else if (fileSizeHeader < fileSize) {
+                // A smaller header must not shorten the archive: the header block count of an archived log is
+                // not always the size of the file - measured 131072 for a 242688 byte archive, and lowering
+                // the size there stopped the reader in the middle of the archive and skipped a whole committed
+                // transaction in silence. The padding case the old correction was for ends the same way: the
+                // read loop stops at the end of the file and the blocks behind the last redo are empty (see
+                // archiveEndConfirmed).
                 ctx->info(0, "keeping redo log size: " + std::to_string(fileSize) + " (header block count suggests: " +
                           std::to_string(fileSizeHeader) + ") for: " + fileName);
             }
@@ -448,15 +451,14 @@ namespace OpenLogReplicator {
 
         // Partial online redo log file
         if (goodBlocks == 0 && group == 0) {
-            // Not a single byte was read although the archive should still hold data at this position: a
-            // filesystem bridge (asmfs) can report a size the file does not have yet and answer the read
-            // with zero bytes. Reporting the archive as finished here would silently skip the rest of it
-            // and move the checkpoint past redo that was never read, so stop instead - the position is
-            // saved and the archive is read again on the next scheduler pass.
-            if (actualRead == 0 && bufferScan < fileSize) {
-                ctx->warning(60044, "file: " + fileName + " - position: " + std::to_string(bufferScan) +
-                             " - short read before the end of file (size: " + std::to_string(fileSize) +
-                             "), the file is not fully readable yet");
+            // Not a single good block was found although the archive may still hold data at this position: a
+            // filesystem bridge (asmfs) can report a size the file does not have yet, answer the read with
+            // zero bytes or answer a shorter size - and it can return zero filled blocks over data it has not
+            // made visible yet. Reporting the archive as finished here would silently skip the rest of it and
+            // move the checkpoint past redo that was never read, so verify the end before accepting it
+            // (see archiveEndConfirmed) - if it is not the end, stop instead: the position is saved and the
+            // archive is read again on the next scheduler pass.
+            if (!archiveEndConfirmed(this)) {
                 ret = REDO_CODE::STOPPED;
                 return false;
             }
@@ -515,7 +517,11 @@ namespace OpenLogReplicator {
             }
         }
 
-        // Batch mode with a partial online redo log file
+        // Batch mode with a partial online redo log file.
+        // A block carrying another sequence is not "data that could not be read": it is a block of a
+        // different redo log, and that is precisely how this file ends here. The end verification used for
+        // the size driven decisions (archiveEndConfirmed) must therefore not be applied: it reads a
+        // non-empty block as data that was skipped, which by construction is always the case at this point.
         if (currentRet == REDO_CODE::ERROR_SEQUENCE && group == 0) {
             if (nextScnHeader != Scn::none()) {
                 ret = REDO_CODE::FINISHED;
@@ -722,8 +728,11 @@ namespace OpenLogReplicator {
                     // ">=" and not "==": the size can be revised (reloadHeader, refreshFileSize) and the
                     // read loop must never be able to sit behind a position it has already passed - it
                     // would then neither read nor notify the parser and the whole run would stall without
-                    // a single message.
-                    if (bufferEnd >= fileSize) {
+                    // a single message. Both sizes are compared: fileSize is the one that may have been
+                    // raised from the redo header, fileSizeStat the one the filesystem reported - a stale
+                    // small answer for either of them must not end the archive (see archiveEndConfirmed).
+                    const uint64_t realEnd = fileSizeStat > fileSize ? fileSizeStat : fileSize;
+                    if (bufferEnd >= realEnd) {
                         // The end of the redo log reached - but the size known here can still be too small: the
                         // redo header block count is written while the archiver copies the log, and a
                         // filesystem bridge can bound the reads by the size the file had when the handle was
@@ -745,6 +754,15 @@ namespace OpenLogReplicator {
                         if (fileSize > fileSizeBefore) {
                             ctx->info(0, "updating redo log size to: " + std::to_string(fileSize) + " for: " + fileName);
                             continue;
+                        }
+
+                        // Same rule as the other end-of-archive decision in this loop: the parser stopped
+                        // before the size we trust in, so look at the file - real redo at the position means
+                        // the end is bogus (a stale size, a zero filled block), stop and let the next pass
+                        // with a fresh handle read the tail instead of skipping it in silence.
+                        if (!archiveEndConfirmed(this)) {
+                            ret = REDO_CODE::STOPPED;
+                            break;
                         }
 
                         if (nextScnHeader != Scn::none()) {
@@ -1272,6 +1290,71 @@ namespace OpenLogReplicator {
             }
         }
         contextSet(CONTEXT::CPU);
+    }
+
+    int Reader::redoReadProbe(uint8_t* buf, uint64_t offset, uint size) {
+        return redoRead(buf, offset, size);
+    }
+
+    bool Reader::archiveEndConfirmed(Thread* t) {
+        // Neither size this reader knows can settle this on its own: the one from stat can be stale (measured
+        // 131072 for a 242688 byte archive, and it is only ever raised, so the wrong value sticks) and the
+        // block count in the redo header can be too small as well (measured the same 131072 - and the read
+        // loop used to end the archive right there). Both shapes of the anomaly - a stale size, or an empty
+        // block returned over data - skipped whole committed transactions in silence ("FINISHED, position:
+        // 131072 / 242688"). What is left to consult is the file itself: read the position the parser stopped
+        // at. Real redo there means the end is bogus (stop; the position is saved and the archive is read
+        // again with a fresh handle on the next pass), zeroes or a zero length mean padding or the real end.
+        uint64_t end = fileSizeStat;
+        if (fileSize > end)
+            end = fileSize;
+        // The sizes are trusted to decide how often to probe, not whether: when they say the file ends here,
+        // one read is still made - that is the case a stale size hides. Three when data is expected behind
+        // the position, because a stale zero answer of the bridge is transient.
+        const bool dataExpected = bufferScan < end;
+        const uint attempts = dataExpected ? END_CHECK_ATTEMPTS : 1;
+
+        if (blockSize == 0 || blockSize > PAGE_SIZE_MAX)
+            return true;
+
+        // Aligned: the file is opened with O_DIRECT, a buffer from the heap would fail with EINVAL.
+        uint8_t* probe = nullptr;
+        if (posix_memalign(reinterpret_cast<void**>(&probe), PAGE_SIZE_MAX, PAGE_SIZE_MAX) != 0)
+            return true;
+        memset(probe, 0, PAGE_SIZE_MAX);
+
+        bool confirmed = true;
+        for (uint attempt = 0; attempt < attempts; ++attempt) {
+            t->contextSet(CONTEXT::OS, REASON::OS);
+            const int bytes = redoReadProbe(probe, bufferScan, blockSize);
+            t->contextSet(CONTEXT::CPU);
+            if (bytes >= static_cast<int>(blockSize) && (probe[0] != 0 || probe[1] != 0)) {
+                ctx->warning(60044, "file: " + fileName + " - position: " + std::to_string(bufferScan) +
+                             " - the file holds redo data at this position (size from stat: " + std::to_string(fileSizeStat) +
+                             ", from header: " + std::to_string(static_cast<uint64_t>(numBlocksHeader) * blockSize) +
+                             "), the file is not fully readable yet");
+                confirmed = false;
+                break;
+            }
+            if (ctx->archReadSleepUs > 0 && attempt + 1 < attempts) {
+                t->contextSet(CONTEXT::SLEEP);
+                ctx->usleepInt(ctx->archReadSleepUs);
+                t->contextSet(CONTEXT::CPU);
+            }
+        }
+        free(probe);
+
+        if (!confirmed)
+            return false;
+
+        if (dataExpected) {
+            // The position stays empty although data was expected behind it: it is the padding of a log that
+            // was not filled up. The warning keeps visible that the tail was accepted without being read.
+            ctx->warning(60044, "file: " + fileName + " - position: " + std::to_string(bufferScan) +
+                         " - the rest of the file (size: " + std::to_string(fileSize) +
+                         ") stays empty on re-read, treating it as padding of an unfilled redo log");
+        }
+        return true;
     }
 
     bool Reader::checkFinished(Thread* t, FileOffset confirmedBufferStart) {

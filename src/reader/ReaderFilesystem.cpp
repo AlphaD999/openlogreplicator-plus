@@ -51,6 +51,15 @@ namespace OpenLogReplicator {
         }
     }
 
+    int ReaderFilesystem::redoReadProbe(uint8_t* buf, uint64_t offset, uint size) {
+        if (fileDes == -1)
+            return -1;
+        contextSet(CONTEXT::OS, REASON::OS);
+        const int bytes = pread(fileDes, buf, size, static_cast<int64_t>(offset));
+        contextSet(CONTEXT::CPU);
+        return bytes;
+    }
+
     void ReaderFilesystem::refreshFileSize() {
         struct stat fileStat{};
         const int statRet = fileDes != -1 ? fstat(fileDes, &fileStat) : stat(fileName.c_str(), &fileStat);
@@ -60,6 +69,8 @@ namespace OpenLogReplicator {
         uint64_t newFileSize = fileStat.st_size;
         if ((newFileSize & (Ctx::MIN_BLOCK_SIZE - 1)) != 0)
             newFileSize &= ~(Ctx::MIN_BLOCK_SIZE - 1);
+
+        fileSizeStat = newFileSize;
 
         // Only growth is accepted. A smaller value is a stale answer of the filesystem bridge (asmfs answers
         // 0 for a file that is not fully visible yet) and lowering the size below the position already read
@@ -86,6 +97,7 @@ namespace OpenLogReplicator {
 
         flags = O_RDONLY;
         fileSize = fileStat.st_size;
+        fileSizeStat = fileSize;
         if ((fileSize & (Ctx::MIN_BLOCK_SIZE - 1)) != 0) {
             fileSize &= ~(Ctx::MIN_BLOCK_SIZE - 1);
             ctx->warning(10071, "file: " + fileName + " size is not a multiplication of " + std::to_string(Ctx::MIN_BLOCK_SIZE) + ", reading only " +

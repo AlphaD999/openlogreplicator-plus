@@ -30,6 +30,7 @@ namespace OpenLogReplicator {
         void redoClose() override;
         REDO_CODE redoOpen() override;
         int redoRead(uint8_t* buf, uint64_t offset, uint size) override;
+        int redoReadProbe(uint8_t* buf, uint64_t offset, uint size) override;
         void refreshFileSize() override;
 
     public:
