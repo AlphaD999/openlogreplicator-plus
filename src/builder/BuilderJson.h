@@ -549,7 +549,7 @@ namespace OpenLogReplicator {
 
         template<bool fast = false>
         void appendHex2(uint8_t value) {
-            if (likely(fast || lastBuilderSize + messagePosition + 2 < OUTPUT_BUFFER_DATA_SIZE)) {
+            if (likely(fast || lastBuilderSize + messagePosition + 2 < outputBufferDataSize(ctx))) {
                 append<true>(Data::map16((value >> 4) & 0xF));
                 append<true>(Data::map16(value & 0xF));
             } else {
@@ -559,7 +559,7 @@ namespace OpenLogReplicator {
         }
 
         void appendHex3(uint16_t value) {
-            if (likely(lastBuilderSize + messagePosition + 3 < OUTPUT_BUFFER_DATA_SIZE)) {
+            if (likely(lastBuilderSize + messagePosition + 3 < outputBufferDataSize(ctx))) {
                 append<true>(Data::map16((value >> 8) & 0xF));
                 append<true>(Data::map16((value >> 4) & 0xF));
                 append<true>(Data::map16(value & 0xF));
@@ -571,7 +571,7 @@ namespace OpenLogReplicator {
         }
 
         void appendHex4(uint16_t value) {
-            if (likely(lastBuilderSize + messagePosition + 4 < OUTPUT_BUFFER_DATA_SIZE)) {
+            if (likely(lastBuilderSize + messagePosition + 4 < outputBufferDataSize(ctx))) {
                 append<true>(Data::map16((value >> 12) & 0xF));
                 append<true>(Data::map16((value >> 8) & 0xF));
                 append<true>(Data::map16((value >> 4) & 0xF));
@@ -585,7 +585,7 @@ namespace OpenLogReplicator {
         }
 
         void appendHex8(uint32_t value) {
-            if (likely(lastBuilderSize + messagePosition + 8 < OUTPUT_BUFFER_DATA_SIZE)) {
+            if (likely(lastBuilderSize + messagePosition + 8 < outputBufferDataSize(ctx))) {
                 append<true>(Data::map16((value >> 28) & 0xF));
                 append<true>(Data::map16((value >> 24) & 0xF));
                 append<true>(Data::map16((value >> 20) & 0xF));
@@ -607,7 +607,7 @@ namespace OpenLogReplicator {
         }
 
         void appendHex16(uint64_t value) {
-            if (likely(lastBuilderSize + messagePosition + 16 < OUTPUT_BUFFER_DATA_SIZE)) {
+            if (likely(lastBuilderSize + messagePosition + 16 < outputBufferDataSize(ctx))) {
                 append<true>(Data::map16((value >> 60) & 0xF));
                 append<true>(Data::map16((value >> 56) & 0xF));
                 append<true>(Data::map16((value >> 52) & 0xF));
@@ -645,7 +645,7 @@ namespace OpenLogReplicator {
         }
 
         void appendHex16Reversed(uint64_t value) {
-            if (likely(lastBuilderSize + messagePosition + 16 < OUTPUT_BUFFER_DATA_SIZE)) {
+            if (likely(lastBuilderSize + messagePosition + 16 < outputBufferDataSize(ctx))) {
                 append<true>(Data::map16((value >> 52) & 0xF));
                 append<true>(Data::map16((value >> 48) & 0xF));
                 append<true>(Data::map16((value >> 60) & 0xF));
@@ -691,12 +691,12 @@ namespace OpenLogReplicator {
                 value /= 10;
             }
 
-            if (likely(fast || lastBuilderSize + messagePosition + size < OUTPUT_BUFFER_DATA_SIZE)) {
+            if (likely(fast || lastBuilderSize + messagePosition + size < outputBufferDataSize(ctx))) {
                 uint8_t* ptr = lastBuilderQueue->data + lastBuilderSize + messagePosition;
                 for (uint i = 0; i < size; ++i)
                     *ptr++ = buffer[size - i - 1];
                 messagePosition += size;
-                ctx->assertDebug(lastBuilderSize + messagePosition < OUTPUT_BUFFER_DATA_SIZE);
+                ctx->assertDebug(lastBuilderSize + messagePosition < outputBufferDataSize(ctx));
             } else {
                 for (uint i = 0; i < size; ++i)
                     append(buffer[size - i - 1]);
@@ -718,12 +718,12 @@ namespace OpenLogReplicator {
                 }
             }
 
-            if (likely(fast || lastBuilderSize + messagePosition + size < OUTPUT_BUFFER_DATA_SIZE)) {
+            if (likely(fast || lastBuilderSize + messagePosition + size < outputBufferDataSize(ctx))) {
                 uint8_t* ptr = lastBuilderQueue->data + lastBuilderSize + messagePosition;
                 for (uint i = 0; i < size; ++i)
                     *ptr++ = buffer[size - i - 1];
                 messagePosition += size;
-                ctx->assertDebug(lastBuilderSize + messagePosition < OUTPUT_BUFFER_DATA_SIZE);
+                ctx->assertDebug(lastBuilderSize + messagePosition < outputBufferDataSize(ctx));
             } else {
                 for (uint i = 0; i < size; ++i)
                     append(buffer[size - i - 1]);
@@ -753,12 +753,12 @@ namespace OpenLogReplicator {
                 }
             }
 
-            if (likely(lastBuilderSize + messagePosition + size < OUTPUT_BUFFER_DATA_SIZE)) {
+            if (likely(lastBuilderSize + messagePosition + size < outputBufferDataSize(ctx))) {
                 uint8_t* ptr = lastBuilderQueue->data + lastBuilderSize + messagePosition;
                 for (uint i = 0; i < size; ++i)
                     *ptr++ = buffer[size - i - 1];
                 messagePosition += size;
-                ctx->assertDebug(lastBuilderSize + messagePosition < OUTPUT_BUFFER_DATA_SIZE);
+                ctx->assertDebug(lastBuilderSize + messagePosition < outputBufferDataSize(ctx));
             } else {
                 for (uint i = 0; i < size; ++i)
                     append(buffer[size - i - 1]);
@@ -777,7 +777,7 @@ namespace OpenLogReplicator {
 
         template<bool fast = false>
         void appendEscape(const char* str, uint64_t size) {
-            if (fast || likely(lastBuilderSize + messagePosition + size * 5 < OUTPUT_BUFFER_DATA_SIZE)) {
+            if (fast || likely(lastBuilderSize + messagePosition + size * 5 < outputBufferDataSize(ctx))) {
                 appendEscapeInternal<true>(str, size);
             } else {
                 appendEscapeInternal<false>(str, size);

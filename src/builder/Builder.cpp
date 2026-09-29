@@ -2520,7 +2520,7 @@ namespace OpenLogReplicator {
 
             if (ddlLast != nullptr) {
                 chunkSize = reinterpret_cast<typeTransactionSize*>(ddlLast + sizeof(uint8_t*));
-                left = Ctx::MEMORY_CHUNK_SIZE - sizeof(uint8_t*) - sizeof(uint64_t) - *chunkSize;
+                left = ctx->memoryChunkSize - sizeof(uint8_t*) - sizeof(uint64_t) - *chunkSize;
             }
 
             if (left == 0) {
@@ -2537,7 +2537,7 @@ namespace OpenLogReplicator {
                 *chunkSize = 0;
                 auto** ddlNext = reinterpret_cast<uint8_t**>(ddlLast);
                 *ddlNext = nullptr;
-                left = Ctx::MEMORY_CHUNK_SIZE - sizeof(uint8_t*) - sizeof(uint64_t);
+                left = ctx->memoryChunkSize - sizeof(uint8_t*) - sizeof(uint64_t);
             }
 
             const typeTransactionSize move = std::min(size, left);

@@ -288,7 +288,7 @@ namespace OpenLogReplicator {
                 oldSize += sizeof(BuilderMsg);
 
                 // Message in one part - sent directly from buffer
-                if (oldSize + size8 <= Builder::OUTPUT_BUFFER_DATA_SIZE) {
+                if (oldSize + size8 <= Builder::outputBufferDataSize(ctx)) {
                     createMessage(msg);
                     if (msg->isFlagSet(BuilderMsg::OUTPUT_BUFFER::REDO))
                         redo = true;
@@ -320,7 +320,7 @@ namespace OpenLogReplicator {
                             toCopy = newSize - oldSize;
                             memcpy(msg->data + copied, builderQueue->data + oldSize, toCopy);
                             builderQueue = builderQueue->next;
-                            newSize = Builder::OUTPUT_BUFFER_DATA_SIZE;
+                            newSize = Builder::outputBufferDataSize(ctx);
                             oldSize = 0;
                         } else {
                             memcpy(msg->data + copied, builderQueue->data + oldSize, toCopy);

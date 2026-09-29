@@ -174,8 +174,18 @@ namespace OpenLogReplicator {
             STREAM       = 1 << 19
         };
 
+        // Granularity of the MB based memory options (memory.min-mb, max-mb, read-buffer-*, ...): the
+        // configuration is rounded down to whole MB. The byte accounting itself uses memoryChunkSize.
         static constexpr uint64_t MEMORY_CHUNK_SIZE_MB{1};
-        static constexpr uint64_t MEMORY_CHUNK_SIZE{MEMORY_CHUNK_SIZE_MB * 1024 * 1024};
+        // Size of one pool block, which is the same as the size of one transaction data block: a transaction
+        // that holds at least one change owns at least one of them, so this is what a *small* transaction
+        // costs. With 1 MB a low-water-mark window holding ~4000 data bearing transactions needs ~4 GB, with
+        // 256 KB ~1 GB - the difference between hitting 10017 and not.
+        // Configured by memory."transaction-block-kb" (see MEMORY_CHUNK_KB_*); only values that divide
+        // MEMORY_CHUNK_SIZE_MB are accepted, so the chunk counts of the MB based options stay integral.
+        static constexpr uint64_t MEMORY_CHUNK_KB_MIN{64};
+        static constexpr uint64_t MEMORY_CHUNK_KB_MAX{1024};
+        static constexpr uint64_t MEMORY_CHUNK_KB_DEFAULT{1024};
         static constexpr uint64_t MEMORY_CHUNK_MIN_MB{32};
         // Minimum length of an archive slice (see Parser::parse): a shorter piece does not release any
         // transaction memory, it only turns into scheduling overhead - slicing at every low-water-mark
@@ -204,6 +214,26 @@ namespace OpenLogReplicator {
         static constexpr uint JSON_TAG_LENGTH{4096};
 
         static const std::string memoryModules[MEMORY_COUNT];
+
+        // Pool block / transaction data block size in bytes, set by initialize() before any thread starts
+        // (see MEMORY_CHUNK_KB_*). Every memory accounting below is in units of this block.
+        uint64_t memoryChunkSize{MEMORY_CHUNK_KB_DEFAULT * 1024};
+        // How many blocks one MB is: turns a MB based option into a block count.
+        uint64_t memoryChunksPerMb{1};
+
+        // Bytes of "chunks" blocks, rounded up to whole MB. A block can be smaller than 1 MB since
+        // memory."transaction-block-kb" and reporting 0 MB for a non-zero amount would be misleading.
+        [[nodiscard]] uint64_t chunksToMb(uint64_t chunks) const {
+            if (chunks == 0)
+                return 0;
+            constexpr uint64_t mb = MEMORY_CHUNK_SIZE_MB * 1024 * 1024;
+            return (chunks * memoryChunkSize + mb - 1) / mb;
+        }
+
+        // Number of blocks that MEMORY_CHUNK_SIZE_MB worth of memory is: the cap of a MB based amount.
+        [[nodiscard]] uint64_t mbsToChunks(uint64_t mbs) const {
+            return (mbs / MEMORY_CHUNK_SIZE_MB) * memoryChunksPerMb;
+        }
 
         uint trace{0};
         uint flags{0};
@@ -710,8 +740,8 @@ namespace OpenLogReplicator {
         [[nodiscard]] static std::string getJsonFieldS(const std::string& fileName, uint maxLength, const rapidjson::Value& value, const char* field,
                                                        uint num);
 
-        void initialize(uint64_t memoryMinMb, uint64_t memoryMaxMb, uint64_t memoryReadBufferMaxMb, uint64_t memoryReadBufferMinMb, uint64_t memorySwapMb,
-                        uint64_t memoryUnswapBufferMinMb, uint64_t memoryWriteBufferMaxMb, uint64_t memoryWriteBufferMinMb);
+        void initialize(uint64_t memoryChunkKb, uint64_t memoryMinMb, uint64_t memoryMaxMb, uint64_t memoryReadBufferMaxMb, uint64_t memoryReadBufferMinMb,
+                        uint64_t memorySwapMb, uint64_t memoryUnswapBufferMinMb, uint64_t memoryWriteBufferMaxMb, uint64_t memoryWriteBufferMinMb);
         void wakeAllOutOfMemory();
         [[nodiscard]] bool nothingToSwap(Thread* t) const;
         [[nodiscard]] uint64_t getMemoryHWM() const;

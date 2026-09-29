@@ -1397,9 +1397,9 @@ namespace OpenLogReplicator {
         while (!ctx->softShutdown) {
             // There is some work to do
             while (confirmedBufferStart < reader->getBufferEnd()) {
-                uint64_t redoBufferPos = (static_cast<uint64_t>(currentBlock) * reader->getBlockSize()) % Ctx::MEMORY_CHUNK_SIZE;
+                uint64_t redoBufferPos = (static_cast<uint64_t>(currentBlock) * reader->getBlockSize()) % ctx->memoryChunkSize;
                 const uint64_t redoBufferNum =
-                        ((static_cast<uint64_t>(currentBlock) * reader->getBlockSize()) / Ctx::MEMORY_CHUNK_SIZE) % ctx->memoryChunksReadBufferMax;
+                        ((static_cast<uint64_t>(currentBlock) * reader->getBlockSize()) / ctx->memoryChunkSize) % ctx->memoryChunksReadBufferMax;
                 const uint8_t* redoBlock = reader->redoBufferList[redoBufferNum] + redoBufferPos;
 
                 blockOffset = 16U;
@@ -1452,9 +1452,9 @@ namespace OpenLogReplicator {
                         if (recordSize4 > 0) {
                             auto* recordSize = reinterpret_cast<uint64_t*>(lwnChunks[lwnAllocated - 1]);
 
-                            if (((*recordSize + sizeof(LwnMember) + recordSize4 + 7) & 0xFFFFFFF8) > Ctx::MEMORY_CHUNK_SIZE_MB * 1024 * 1024) {
-                                if (unlikely(lwnAllocated == MAX_LWN_CHUNKS))
-                                    throw RedoLogException(50052, "all " + std::to_string(MAX_LWN_CHUNKS) + " lwn buffers allocated");
+                            if (((*recordSize + sizeof(LwnMember) + recordSize4 + 7) & 0xFFFFFFF8) > ctx->memoryChunkSize) {
+                                if (unlikely(lwnAllocated == maxLwnChunks()))
+                                    throw RedoLogException(50052, "all " + std::to_string(maxLwnChunks()) + " lwn buffers allocated");
 
                                 lwnChunks[lwnAllocated++] = ctx->getMemoryChunk(ctx->parserThread, Ctx::MEMORY::PARSER);
                                 ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
@@ -1463,7 +1463,7 @@ namespace OpenLogReplicator {
                                 *recordSize = sizeof(uint64_t);
                             }
 
-                            if (unlikely(((*recordSize + sizeof(LwnMember) + recordSize4 + 7) & 0xFFFFFFF8) > Ctx::MEMORY_CHUNK_SIZE_MB * 1024 * 1024))
+                            if (unlikely(((*recordSize + sizeof(LwnMember) + recordSize4 + 7) & 0xFFFFFFF8) > ctx->memoryChunkSize))
                                 throw RedoLogException(50053, "too big redo log record, size: " + std::to_string(recordSize4));
 
                             lwnMember = reinterpret_cast<LwnMember*>(lwnChunks[lwnAllocated - 1] + *recordSize);
@@ -1660,7 +1660,7 @@ namespace OpenLogReplicator {
                     throw RedoLogException(50055, "lwn overflow: " + std::to_string(lwnNumCnt) + "/" + std::to_string(lwnNumMax));
 
                 // Free memory
-                if (redoBufferPos == Ctx::MEMORY_CHUNK_SIZE) {
+                if (redoBufferPos == ctx->memoryChunkSize) {
                     reader->bufferFree(ctx->parserThread, redoBufferNum);
                     reader->confirmReadData(confirmedBufferStart);
                 }

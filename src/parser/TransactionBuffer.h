@@ -38,9 +38,10 @@ namespace OpenLogReplicator {
     class XmlCtx;
 
     struct TransactionChunk {
-        static constexpr uint32_t FULL_BUFFER_SIZE = Ctx::MEMORY_CHUNK_SIZE;
+        // The chunk is a whole pool block (Ctx::memoryChunkSize - see memory."transaction-block-kb"), the
+        // header below is carved out of its beginning. The usable size is runtime, use
+        // TransactionBuffer::dataBufferSize() instead of a constant.
         static constexpr uint32_t HEADER_BUFFER_SIZE = sizeof(uint64_t) + sizeof(uint32_t);
-        static constexpr uint32_t DATA_BUFFER_SIZE = FULL_BUFFER_SIZE - HEADER_BUFFER_SIZE;
 
         uint64_t elements;
         uint32_t size;
@@ -57,7 +58,13 @@ namespace OpenLogReplicator {
 
     protected:
         Ctx* ctx;
-        uint8_t buffer[TransactionChunk::DATA_BUFFER_SIZE]{};
+
+        // Usable bytes of one transaction block: the whole pool block minus the chunk header. A single redo
+        // log record (plus its row header) has to fit into it, otherwise 50040 is thrown - so the block size
+        // ("transaction-block-kb") must stay above the longest redo log record of the database.
+        [[nodiscard]] uint32_t dataBufferSize() const {
+            return static_cast<uint32_t>(ctx->memoryChunkSize) - TransactionChunk::HEADER_BUFFER_SIZE;
+        }
 
         std::mutex mtx;
         std::unordered_map<XidMap, Transaction*> xidTransactionMap;

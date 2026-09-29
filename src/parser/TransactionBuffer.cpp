@@ -152,9 +152,9 @@ namespace OpenLogReplicator {
     void TransactionBuffer::addTransactionChunk(Transaction* transaction, RedoLogRecord* redoLogRecord) {
         const typeChunkSize chunkSize = redoLogRecord->size + ROW_HEADER_TOTAL;
 
-        if (unlikely(chunkSize > TransactionChunk::DATA_BUFFER_SIZE))
+        if (unlikely(chunkSize > dataBufferSize()))
             throw RedoLogException(50040, "block size (" + std::to_string(chunkSize) + ") exceeding max block size (" +
-                                   std::to_string(TransactionChunk::DATA_BUFFER_SIZE) + "), please report this issue");
+                                   std::to_string(dataBufferSize()) + "), please report this issue");
 
         if (unlikely(transaction->lastSplit)) {
             if (unlikely((redoLogRecord->flg & OpCode::FLG_MULTIBLOCKUNDOMID) == 0))
@@ -172,7 +172,7 @@ namespace OpenLogReplicator {
         transaction->lastSplit = (redoLogRecord->flg & (OpCode::FLG_MULTIBLOCKUNDOTAIL | OpCode::FLG_MULTIBLOCKUNDOMID)) != 0;
 
         // New block
-        if (transaction->lastTc == nullptr || transaction->lastTc->size + chunkSize > TransactionChunk::DATA_BUFFER_SIZE)
+        if (transaction->lastTc == nullptr || transaction->lastTc->size + chunkSize > dataBufferSize())
             transaction->lastTc = reinterpret_cast<TransactionChunk*>(ctx->swappedMemoryGrow(ctx->parserThread, transaction->swapKey()));
 
         // Append to the chunk at the end
@@ -200,9 +200,9 @@ namespace OpenLogReplicator {
     void TransactionBuffer::addTransactionChunk(Transaction* transaction, RedoLogRecord* redoLogRecord1, const RedoLogRecord* redoLogRecord2) {
         typeChunkSize chunkSize = redoLogRecord1->size + redoLogRecord2->size + ROW_HEADER_TOTAL;
 
-        if (unlikely(chunkSize > TransactionChunk::DATA_BUFFER_SIZE))
+        if (unlikely(chunkSize > dataBufferSize()))
             throw RedoLogException(50040, "block size (" + std::to_string(chunkSize) + ") exceeding max block size (" +
-                                   std::to_string(TransactionChunk::DATA_BUFFER_SIZE) + "), please report this issue");
+                                   std::to_string(dataBufferSize()) + "), please report this issue");
 
         if (unlikely(transaction->lastSplit)) {
             if (unlikely((redoLogRecord1->opCode) != 0x0501))
@@ -233,7 +233,7 @@ namespace OpenLogReplicator {
         }
 
         // New block
-        if (transaction->lastTc == nullptr || transaction->lastTc->size + chunkSize > TransactionChunk::DATA_BUFFER_SIZE)
+        if (transaction->lastTc == nullptr || transaction->lastTc->size + chunkSize > dataBufferSize())
             transaction->lastTc = reinterpret_cast<TransactionChunk*>(ctx->swappedMemoryGrow(ctx->parserThread, transaction->swapKey()));
 
         // Append to the chunk at the end

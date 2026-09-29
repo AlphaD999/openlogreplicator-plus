@@ -178,7 +178,7 @@ namespace OpenLogReplicator {
             return blockSize;
 
         prevRead *= 2;
-        prevRead = std::min<uint64_t>(prevRead, Ctx::MEMORY_CHUNK_SIZE);
+        prevRead = std::min<uint64_t>(prevRead, ctx->memoryChunkSize);
 
         return prevRead;
     }
@@ -392,10 +392,10 @@ namespace OpenLogReplicator {
         if (bufferScan + toRead > fileSize)
             toRead = fileSize - bufferScan;
 
-        const uint64_t redoBufferPos = bufferScan % Ctx::MEMORY_CHUNK_SIZE;
-        const uint64_t redoBufferNum = (bufferScan / Ctx::MEMORY_CHUNK_SIZE) % ctx->memoryChunksReadBufferMax;
-        if (redoBufferPos + toRead > Ctx::MEMORY_CHUNK_SIZE)
-            toRead = Ctx::MEMORY_CHUNK_SIZE - redoBufferPos;
+        const uint64_t redoBufferPos = bufferScan % ctx->memoryChunkSize;
+        const uint64_t redoBufferNum = (bufferScan / ctx->memoryChunkSize) % ctx->memoryChunksReadBufferMax;
+        if (redoBufferPos + toRead > ctx->memoryChunkSize)
+            toRead = ctx->memoryChunkSize - redoBufferPos;
 
         if (toRead == 0) {
             ctx->error(40010, "file: " + fileName + " - zero to read, start: " + std::to_string(bufferStart) + ", end: " +
@@ -539,11 +539,11 @@ namespace OpenLogReplicator {
     bool Reader::read2() {
         uint maxNumBlock = (bufferScan - bufferEnd) / blockSize;
         uint goodBlocks = 0;
-        maxNumBlock = std::min<uint64_t>(maxNumBlock, Ctx::MEMORY_CHUNK_SIZE / blockSize);
+        maxNumBlock = std::min<uint64_t>(maxNumBlock, ctx->memoryChunkSize / blockSize);
 
         for (uint numBlock = 0; numBlock < maxNumBlock; ++numBlock) {
-            const uint64_t redoBufferPos = (bufferEnd + numBlock * blockSize) % Ctx::MEMORY_CHUNK_SIZE;
-            const uint64_t redoBufferNum = ((bufferEnd + numBlock * blockSize) / Ctx::MEMORY_CHUNK_SIZE) % ctx->memoryChunksReadBufferMax;
+            const uint64_t redoBufferPos = (bufferEnd + numBlock * blockSize) % ctx->memoryChunkSize;
+            const uint64_t redoBufferNum = ((bufferEnd + numBlock * blockSize) / ctx->memoryChunkSize) % ctx->memoryChunksReadBufferMax;
 
             const auto* const readTimeP = reinterpret_cast<const time_ut*>(redoBufferList[redoBufferNum] + redoBufferPos);
             if (*readTimeP + static_cast<time_ut>(ctx->redoVerifyDelayUs) < loopTime) {
@@ -558,11 +558,11 @@ namespace OpenLogReplicator {
             uint toRead = readSize(goodBlocks * blockSize);
             toRead = std::min(toRead, goodBlocks * blockSize);
 
-            const uint64_t redoBufferPos = bufferEnd % Ctx::MEMORY_CHUNK_SIZE;
-            const uint64_t redoBufferNum = (bufferEnd / Ctx::MEMORY_CHUNK_SIZE) % ctx->memoryChunksReadBufferMax;
+            const uint64_t redoBufferPos = bufferEnd % ctx->memoryChunkSize;
+            const uint64_t redoBufferNum = (bufferEnd / ctx->memoryChunkSize) % ctx->memoryChunksReadBufferMax;
 
-            if (redoBufferPos + toRead > Ctx::MEMORY_CHUNK_SIZE)
-                toRead = Ctx::MEMORY_CHUNK_SIZE - redoBufferPos;
+            if (redoBufferPos + toRead > ctx->memoryChunkSize)
+                toRead = ctx->memoryChunkSize - redoBufferPos;
 
             if (toRead == 0) {
                 ctx->error(40011, "zero to read (start: " + std::to_string(bufferStart) + ", end: " + std::to_string(bufferEnd) +
@@ -656,7 +656,7 @@ namespace OpenLogReplicator {
                     // handshake observable.
                     condReaderSleeping.wait_for(lck, std::chrono::microseconds(ctx->redoReadSleepUs));
                     contextSet(CONTEXT::MUTEX, REASON::READER_MAIN2);
-                } else if (status == STATUS::READ && !ctx->softShutdown && (bufferEnd % Ctx::MEMORY_CHUNK_SIZE) == 0) {
+                } else if (status == STATUS::READ && !ctx->softShutdown && (bufferEnd % ctx->memoryChunkSize) == 0) {
                     ctx->warning(0, "buffer full?");
                 }
             }
@@ -815,12 +815,30 @@ namespace OpenLogReplicator {
                         refreshFileSize();
 
                     // #1 read
-                    if (bufferScan < fileSize && (bufferIsFree() || (bufferScan % Ctx::MEMORY_CHUNK_SIZE) > 0)
+                    if (bufferScan < fileSize && (bufferIsFree() || (bufferScan % ctx->memoryChunkSize) > 0)
                         && (!reachedZero || lastReadTime + static_cast<time_t>(ctx->redoReadSleepUs) < loopTime))
                         if (!read1())
                             break;
 
-                    if (numBlocksHeader != Ctx::ZERO_BLK && bufferEnd >= static_cast<uint64_t>(numBlocksHeader) * blockSize) {
+                    // The block count in the header is not always the end of the archive: measured 131072 for a
+                    // 242688 byte file, and finishing there skipped the whole tail - a committed transaction
+                    // plus a DDL - in silence. Take the larger of it and the size the filesystem reported, and
+                    // verify the end before accepting it (see archiveEndConfirmed): if the position the parser
+                    // stopped at still holds redo, stop instead of finishing - the position is saved and the
+                    // archive is read again on the next scheduler pass.
+                    // Recomputed here and not reused from the check above the reads: refreshFileSize() and the
+                    // redo header can have revised the sizes in the meantime (that is the whole point of the
+                    // loop), so the decision has to be taken on the current values.
+                    const uint64_t headerEndNow = numBlocksHeader != Ctx::ZERO_BLK
+                                                      ? static_cast<uint64_t>(numBlocksHeader) * blockSize
+                                                      : 0;
+                    const uint64_t realEndNow = fileSizeStat > headerEndNow ? fileSizeStat : headerEndNow;
+                    if (realEndNow > 0 && bufferEnd >= realEndNow) {
+                        if (!archiveEndConfirmed(this)) {
+                            ret = REDO_CODE::STOPPED;
+                            break;
+                        }
+
                         if (nextScnHeader != Scn::none()) {
                             ret = REDO_CODE::FINISHED;
                             nextScn = nextScnHeader;

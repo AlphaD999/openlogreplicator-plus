@@ -63,6 +63,9 @@ namespace OpenLogReplicator {
 
     class Parser final : public CommitSorter::Executor {
     protected:
+        // One chunk per MEMORY_CHUNK_SIZE_MB: the "512*2 MB" budget of the LWN assembly buffers. The array
+        // below is reserved for the smallest allowed block (a smaller block needs proportionally more chunks
+        // to hold the same amount of data), the effective limit is maxLwnChunks().
         static constexpr uint64_t MAX_LWN_CHUNKS = static_cast<uint64_t>(512 * 2) / Ctx::MEMORY_CHUNK_SIZE_MB;
         static constexpr uint64_t MAX_RECORDS_IN_LWN = 1048576;
 
@@ -73,13 +76,18 @@ namespace OpenLogReplicator {
         RedoLogRecord zero;
         Transaction* lastTransaction{nullptr};
 
-        uint8_t* lwnChunks[MAX_LWN_CHUNKS]{};
+        uint8_t* lwnChunks[MAX_LWN_CHUNKS * (Ctx::MEMORY_CHUNK_KB_MAX / Ctx::MEMORY_CHUNK_KB_MIN)]{};
         LwnMember* lwnMembers[MAX_RECORDS_IN_LWN + 1]{};
         uint64_t lwnAllocated{0};
         uint64_t lwnAllocatedMax{0};
         Time lwnTimestamp{0};
         Scn lwnScn;
         typeBlk lwnCheckpointBlock{0};
+
+        // Chunks covered by the "512*2 MB" LWN budget at the configured block size (memory."transaction-block-kb").
+        [[nodiscard]] uint64_t maxLwnChunks() const {
+            return MAX_LWN_CHUNKS * ctx->memoryChunksPerMb;
+        }
 
         void freeLwn();
         void analyzeLwn(LwnMember* lwnMember);

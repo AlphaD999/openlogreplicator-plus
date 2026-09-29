@@ -357,7 +357,7 @@ namespace OpenLogReplicator {
             return;
         }
 
-        if (likely(lastBuilderSize + messagePosition + size * 2 + columnName.size() * 3 + 8 < OUTPUT_BUFFER_DATA_SIZE)) {
+        if (likely(lastBuilderSize + messagePosition + size * 2 + columnName.size() * 3 + 8 < outputBufferDataSize(ctx))) {
             if (hasPreviousColumn)
                 append<true>(',');
             else

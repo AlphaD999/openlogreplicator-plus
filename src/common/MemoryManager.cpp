@@ -74,7 +74,7 @@ namespace OpenLogReplicator {
                 const uint64_t allocatedMemoryMb = ctx->getAllocatedMemory();
                 const uint64_t maxMemoryMb = ctx->getMaxMemory();
                 const uint64_t blockedThreads = ctx->getBlockedThreads();
-                const uint64_t reservedMemoryMb = ctx->getReservedFreeChunks() * Ctx::MEMORY_CHUNK_SIZE_MB;
+                const uint64_t reservedMemoryMb = ctx->chunksToMb(ctx->getReservedFreeChunks());
                 const std::string memoryModulesMb = ctx->getMemoryModulesText();
 
                 {
@@ -299,10 +299,10 @@ namespace OpenLogReplicator {
 
         int flags = O_RDONLY;
         const uint64_t fileSize = fileStat.st_size;
-        if ((fileSize & (Ctx::MEMORY_CHUNK_SIZE - 1)) != 0)
+        if ((fileSize & (ctx->memoryChunkSize - 1)) != 0)
             throw RuntimeException(50072, "swap file: " + fileName + " - wrong file size: " + std::to_string(fileSize));
 
-        if (fileSize < (index + 1) * Ctx::MEMORY_CHUNK_SIZE)
+        if (fileSize < (index + 1) * ctx->memoryChunkSize)
             throw RuntimeException(50072, "swap file: " + fileName + " - too small file size: " + std::to_string(fileSize) + " to read chunk: " +
                                    std::to_string(index));
 
@@ -322,10 +322,10 @@ namespace OpenLogReplicator {
         }
 #endif
 
-        const uint64_t bytes = pread(fileDes, tc, Ctx::MEMORY_CHUNK_SIZE, index * Ctx::MEMORY_CHUNK_SIZE);
+        const uint64_t bytes = pread(fileDes, tc, ctx->memoryChunkSize, index * ctx->memoryChunkSize);
         close(fileDes);
 
-        if (bytes != Ctx::MEMORY_CHUNK_SIZE)
+        if (bytes != ctx->memoryChunkSize)
             throw RuntimeException(50072, "swap file: " + fileName + " - read returned: " + strerror(errno));
 
         {
@@ -353,7 +353,7 @@ namespace OpenLogReplicator {
                         throw RuntimeException(50072, "swap file: " + fileName + " - delete returned: " + strerror(errno));
                 } else {
                     --sc->swappedMax;
-                    if (truncate(fileName.c_str(), (sc->swappedMax + 1) * Ctx::MEMORY_CHUNK_SIZE) != 0)
+                    if (truncate(fileName.c_str(), (sc->swappedMax + 1) * ctx->memoryChunkSize) != 0)
                         throw RuntimeException(50072, "swap file: " + fileName + " - truncate returned: " + strerror(errno));
                 }
 
@@ -412,8 +412,8 @@ namespace OpenLogReplicator {
         }
 #endif
 
-        const uint64_t bytes = pwrite(fileDes, tc, Ctx::MEMORY_CHUNK_SIZE, index * Ctx::MEMORY_CHUNK_SIZE);
-        if (bytes != Ctx::MEMORY_CHUNK_SIZE) {
+        const uint64_t bytes = pwrite(fileDes, tc, ctx->memoryChunkSize, index * ctx->memoryChunkSize);
+        if (bytes != ctx->memoryChunkSize) {
             close(fileDes);
             throw RuntimeException(50072, "swap file: " + fileName + " - write returned: " + strerror(errno));
         }
@@ -434,7 +434,7 @@ namespace OpenLogReplicator {
                     remove = true;
                 } else {
                     --sc->swappedMax;
-                    truncateSize = (sc->swappedMax + 1) * Ctx::MEMORY_CHUNK_SIZE;
+                    truncateSize = (sc->swappedMax + 1) * ctx->memoryChunkSize;
                 }
                 ctx->chunksTransaction.notify_all();
             }

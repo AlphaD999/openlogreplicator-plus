@@ -522,7 +522,7 @@ namespace OpenLogReplicator {
                 }
 
                 // Split very big transactions
-                if (unlikely(maxMessageMb > 0 && builder->builderSize() + TransactionChunk::DATA_BUFFER_SIZE > maxMessageMb * 1024 * 1024)) {
+                if (unlikely(maxMessageMb > 0 && builder->builderSize() + metadata->ctx->memoryChunkSize > maxMessageMb * 1024 * 1024)) {
                     metadata->ctx->warning(60015, "big transaction divided (forced commit after " + std::to_string(builder->builderSize()) +
                                            " bytes), xid: " + xid.toString());
 

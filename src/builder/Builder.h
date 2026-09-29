@@ -109,7 +109,11 @@ namespace OpenLogReplicator {
 
     class Builder {
     public:
-        static constexpr uint64_t OUTPUT_BUFFER_DATA_SIZE = Ctx::MEMORY_CHUNK_SIZE - sizeof(BuilderQueue);
+        // Usable bytes of one output queue block: a whole pool block minus the queue header. The block is a
+        // pool block, so this follows memory."transaction-block-kb" and is no longer a compile time constant.
+        [[nodiscard]] static uint64_t outputBufferDataSize(const Ctx* ctx) {
+            return ctx->memoryChunkSize - sizeof(BuilderQueue);
+        }
 
     protected:
         // Column currently being emitted by processValue(). Writers use it to know the column type and
@@ -210,7 +214,7 @@ namespace OpenLogReplicator {
             lastBuilderSize = 0;
 
             // Message could potentially fit in one buffer
-            if (likely(copy && msg != nullptr && messageSize + messagePosition < OUTPUT_BUFFER_DATA_SIZE)) {
+            if (likely(copy && msg != nullptr && messageSize + messagePosition < outputBufferDataSize(ctx))) {
                 memcpy(nextBuffer->data, msg, messagePosition);
                 msg = reinterpret_cast<BuilderMsg*>(nextBuffer->data);
                 msg->data = nextBuffer->data + sizeof(BuilderMsg);
@@ -311,9 +315,9 @@ namespace OpenLogReplicator {
         void builderShift() {
             ++messagePosition;
 
-            if (unlikely(lastBuilderSize + messagePosition >= OUTPUT_BUFFER_DATA_SIZE))
+            if (unlikely(lastBuilderSize + messagePosition >= outputBufferDataSize(ctx)))
                 builderRotate<copy>();
-            ctx->assertDebug(lastBuilderSize + messagePosition < OUTPUT_BUFFER_DATA_SIZE);
+            ctx->assertDebug(lastBuilderSize + messagePosition < outputBufferDataSize(ctx));
         }
 
         void builderShiftFast(uint64_t bytes) {
@@ -326,12 +330,12 @@ namespace OpenLogReplicator {
             if (format.isScnTypeCommitValue())
                 scn = commitScn;
 
-            if (unlikely(lastBuilderSize + messagePosition + sizeof(BuilderMsg) >= OUTPUT_BUFFER_DATA_SIZE))
+            if (unlikely(lastBuilderSize + messagePosition + sizeof(BuilderMsg) >= outputBufferDataSize(ctx)))
                 builderRotate<true>();
 
             msg = reinterpret_cast<BuilderMsg*>(lastBuilderQueue->data + lastBuilderSize);
             builderShiftFast(sizeof(BuilderMsg));
-            ctx->assertDebug(lastBuilderSize + messagePosition < OUTPUT_BUFFER_DATA_SIZE);
+            ctx->assertDebug(lastBuilderSize + messagePosition < outputBufferDataSize(ctx));
             msg->scn = scn;
             msg->lwnScn = lwnScn;
             msg->lwnIdx = lwnIdx++;
@@ -368,7 +372,7 @@ namespace OpenLogReplicator {
             lastBuilderQueue->data[lastBuilderSize + messagePosition] = character;
             if constexpr (fast) {
                 ++messagePosition;
-                ctx->assertDebug(lastBuilderSize + messagePosition < OUTPUT_BUFFER_DATA_SIZE);
+                ctx->assertDebug(lastBuilderSize + messagePosition < outputBufferDataSize(ctx));
             } else {
                 builderShift<true>();
             }
@@ -376,10 +380,10 @@ namespace OpenLogReplicator {
 
         template<bool fast = false>
         void appendArr(const char* str, uint64_t size) {
-            if (fast || likely(lastBuilderSize + messagePosition + size < OUTPUT_BUFFER_DATA_SIZE)) {
+            if (fast || likely(lastBuilderSize + messagePosition + size < outputBufferDataSize(ctx))) {
                 memcpy(lastBuilderQueue->data + lastBuilderSize + messagePosition, str, size);
                 messagePosition += size;
-                ctx->assertDebug(lastBuilderSize + messagePosition < OUTPUT_BUFFER_DATA_SIZE);
+                ctx->assertDebug(lastBuilderSize + messagePosition < outputBufferDataSize(ctx));
             } else {
                 for (uint64_t i = 0; i < size; ++i)
                     append(*str++);
@@ -394,10 +398,10 @@ namespace OpenLogReplicator {
         template<bool fast = false>
         void append(const std::string& str) {
             const size_t size = str.length();
-            if (unlikely(lastBuilderSize + messagePosition + size < OUTPUT_BUFFER_DATA_SIZE)) {
+            if (unlikely(lastBuilderSize + messagePosition + size < outputBufferDataSize(ctx))) {
                 memcpy(lastBuilderQueue->data + lastBuilderSize + messagePosition, str.c_str(), size);
                 messagePosition += size;
-                ctx->assertDebug(lastBuilderSize + messagePosition < OUTPUT_BUFFER_DATA_SIZE);
+                ctx->assertDebug(lastBuilderSize + messagePosition < outputBufferDataSize(ctx));
             } else {
                 const char* charStr = str.c_str();
                 for (size_t i = 0; i < size; ++i)

@@ -236,6 +236,10 @@ namespace OpenLogReplicator {
         }
 
         // MEMORY
+        // Size of one pool block, which is the same as one transaction data block, in KB. It sets what a
+        // transaction holding data costs and is therefore the main lever on the "out of memory" (10017)
+        // threshold - see Ctx::MEMORY_CHUNK_KB_*.
+        uint64_t memoryChunkKb = Ctx::MEMORY_CHUNK_KB_DEFAULT;
         uint64_t memoryMinMb = 32;
         uint64_t memoryMaxMb = 2048;
         uint64_t memoryReadBufferMaxMb = 128;
@@ -257,11 +261,23 @@ namespace OpenLogReplicator {
                     "read-buffer-min-mb",
                     "swap-mb",
                     "swap-path",
+                    "transaction-block-kb",
                     "unswap-buffer-min-mb",
                     "write-buffer-max-mb",
                     "write-buffer-min-mb"
                 };
                 Ctx::checkJsonFields(configFileName, memoryJson, memoryNames);
+            }
+
+            if (memoryJson.HasMember("transaction-block-kb")) {
+                memoryChunkKb = Ctx::getJsonFieldU64(configFileName, memoryJson, "transaction-block-kb");
+                // Only a power of two that divides MEMORY_CHUNK_SIZE_MB is accepted: the MB based options
+                // above and below are converted into block counts, which stays exact only for such values.
+                if (memoryChunkKb < Ctx::MEMORY_CHUNK_KB_MIN || memoryChunkKb > Ctx::MEMORY_CHUNK_KB_MAX ||
+                    (memoryChunkKb & (memoryChunkKb - 1)) != 0 || (Ctx::MEMORY_CHUNK_SIZE_MB * 1024) % memoryChunkKb != 0)
+                    throw ConfigurationException(30001, "bad JSON, invalid \"transaction-block-kb\" value: " + std::to_string(memoryChunkKb) +
+                                                 ", expected: a power of two from " + std::to_string(Ctx::MEMORY_CHUNK_KB_MIN) + " to " +
+                                                 std::to_string(Ctx::MEMORY_CHUNK_KB_MAX) + " dividing " + std::to_string(Ctx::MEMORY_CHUNK_SIZE_MB * 1024));
             }
 
             if (memoryJson.HasMember("min-mb")) {
@@ -369,8 +385,13 @@ namespace OpenLogReplicator {
         }
 
         // MEMORY MANAGER
-        ctx->initialize(memoryMinMb, memoryMaxMb, memoryReadBufferMaxMb, memoryReadBufferMinMb, memorySwapMb, memoryUnswapBufferMinMb,
+        ctx->initialize(memoryChunkKb, memoryMinMb, memoryMaxMb, memoryReadBufferMaxMb, memoryReadBufferMinMb, memorySwapMb, memoryUnswapBufferMinMb,
                         memoryWriteBufferMaxMb, memoryWriteBufferMinMb);
+        // The size of one transaction data block decides what an open transaction costs, so it belongs into
+        // the log: it is the parameter to look at when 10017 shows up.
+        ctx->info(0, "memory: transaction block: " + std::to_string(memoryChunkKb) + " KB (\"transaction-block-kb\"), pool: " +
+                     std::to_string(memoryMinMb) + " MB - " + std::to_string(memoryMaxMb) + " MB, read buffer: " +
+                     std::to_string(memoryReadBufferMinMb) + " MB - " + std::to_string(memoryReadBufferMaxMb) + " MB");
 
         // METRICS
         if (document.HasMember("metrics")) {

@@ -329,27 +329,32 @@ namespace OpenLogReplicator {
         return {ret.GetString()};
     }
 
-    void Ctx::initialize(uint64_t memoryMinMb, uint64_t memoryMaxMb, uint64_t memoryReadBufferMaxMb, uint64_t memoryReadBufferMinMb, uint64_t memorySwapMb,
-                         uint64_t memoryUnswapBufferMinMb, uint64_t memoryWriteBufferMaxMb, uint64_t memoryWriteBufferMinMb) {
+    void Ctx::initialize(uint64_t memoryChunkKb, uint64_t memoryMinMb, uint64_t memoryMaxMb, uint64_t memoryReadBufferMaxMb, uint64_t memoryReadBufferMinMb,
+                         uint64_t memorySwapMb, uint64_t memoryUnswapBufferMinMb, uint64_t memoryWriteBufferMaxMb, uint64_t memoryWriteBufferMinMb) {
         {
             std::unique_lock const lck(memoryMtx);
-            memoryChunksMin = memoryMinMb / MEMORY_CHUNK_SIZE_MB;
-            memoryChunksMax = memoryMaxMb / MEMORY_CHUNK_SIZE_MB;
-            memoryChunksSwap = memorySwapMb / MEMORY_CHUNK_SIZE_MB;
+            // The pool block is also the transaction data block: every accounting below is in these blocks,
+            // and the MB based options are converted with mbsToChunks().
+            memoryChunkSize = memoryChunkKb * 1024;
+            memoryChunksPerMb = (MEMORY_CHUNK_SIZE_MB * 1024 * 1024) / memoryChunkSize;
 
-            memoryChunksReadBufferMax = memoryReadBufferMaxMb / MEMORY_CHUNK_SIZE_MB;
-            memoryChunksReadBufferMin = memoryReadBufferMinMb / MEMORY_CHUNK_SIZE_MB;
-            memoryChunksUnswapBufferMin = memoryUnswapBufferMinMb / MEMORY_CHUNK_SIZE_MB;
-            memoryChunksWriteBufferMax = memoryWriteBufferMaxMb / MEMORY_CHUNK_SIZE_MB;
-            memoryChunksWriteBufferMin = memoryWriteBufferMinMb / MEMORY_CHUNK_SIZE_MB;
+            memoryChunksMin = mbsToChunks(memoryMinMb);
+            memoryChunksMax = mbsToChunks(memoryMaxMb);
+            memoryChunksSwap = mbsToChunks(memorySwapMb);
+
+            memoryChunksReadBufferMax = mbsToChunks(memoryReadBufferMaxMb);
+            memoryChunksReadBufferMin = mbsToChunks(memoryReadBufferMinMb);
+            memoryChunksUnswapBufferMin = mbsToChunks(memoryUnswapBufferMinMb);
+            memoryChunksWriteBufferMax = mbsToChunks(memoryWriteBufferMaxMb);
+            memoryChunksWriteBufferMin = mbsToChunks(memoryWriteBufferMinMb);
             bufferSizeMax = memoryReadBufferMaxMb * 1024 * 1024;
-            bufferSizeFree = memoryReadBufferMaxMb / MEMORY_CHUNK_SIZE_MB;
+            bufferSizeFree = mbsToChunks(memoryReadBufferMaxMb);
 
             memoryChunks = new uint8_t*[memoryChunksMax];
             for (uint64_t i = 0; i < memoryChunksMin; ++i) {
-                memoryChunks[i] = static_cast<uint8_t*>(aligned_alloc(MEMORY_ALIGNMENT, MEMORY_CHUNK_SIZE));
+                memoryChunks[i] = static_cast<uint8_t*>(aligned_alloc(MEMORY_ALIGNMENT, memoryChunkSize));
                 if (unlikely(memoryChunks[i] == nullptr))
-                    throw RuntimeException(10016, "couldn't allocate " + std::to_string(MEMORY_CHUNK_SIZE_MB) +
+                    throw RuntimeException(10016, "couldn't allocate " + std::to_string(memoryChunkSize) +
                                            " bytes memory for: memory chunks#2");
                 ++memoryChunksAllocated;
                 ++memoryChunksFree;
@@ -358,7 +363,7 @@ namespace OpenLogReplicator {
         }
 
         if (metrics != nullptr) {
-            metrics->emitMemoryAllocatedMb(memoryChunksAllocated);
+            metrics->emitMemoryAllocatedMb(chunksToMb(memoryChunksAllocated));
             metrics->emitMemoryUsedTotalMb(0);
         }
     }
@@ -381,7 +386,7 @@ namespace OpenLogReplicator {
 
     uint64_t Ctx::getMemoryHWM() const {
         std::unique_lock const lck(memoryMtx);
-        return memoryChunksHWM * MEMORY_CHUNK_SIZE_MB;
+        return chunksToMb(memoryChunksHWM);
     }
 
     uint64_t Ctx::getFreeMemory(Thread* t) const {
@@ -389,7 +394,7 @@ namespace OpenLogReplicator {
         {
             t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_FREE_MEMORY);
             std::unique_lock const lck(memoryMtx);
-            ret = memoryChunksFree * MEMORY_CHUNK_SIZE_MB;
+            ret = chunksToMb(memoryChunksFree);
         }
         t->contextSet(Thread::CONTEXT::CPU);
         return ret;
@@ -397,12 +402,12 @@ namespace OpenLogReplicator {
 
     uint64_t Ctx::getAllocatedMemory() const {
         std::unique_lock const lck(memoryMtx);
-        return memoryChunksAllocated * MEMORY_CHUNK_SIZE_MB;
+        return chunksToMb(memoryChunksAllocated);
     }
 
     uint64_t Ctx::getMaxMemory() const {
         std::unique_lock const lck(memoryMtx);
-        return memoryChunksMax * MEMORY_CHUNK_SIZE_MB;
+        return chunksToMb(memoryChunksMax);
     }
 
     uint64_t Ctx::getBlockedThreads() const {
@@ -428,7 +433,7 @@ namespace OpenLogReplicator {
         for (uint i = 0; i < MEMORY_COUNT; ++i) {
             if (i > 0)
                 ret += ", ";
-            ret += memoryModules[i] + ": " + std::to_string(memoryModulesAllocated[i] * MEMORY_CHUNK_SIZE_MB) + "MB";
+            ret += memoryModules[i] + ": " + std::to_string(chunksToMb(memoryModulesAllocated[i])) + "MB";
         }
         return ret;
     }
@@ -438,7 +443,7 @@ namespace OpenLogReplicator {
         {
             t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_GET_SWAP);
             std::unique_lock const lck(memoryMtx);
-            ret = memoryChunksSwap * MEMORY_CHUNK_SIZE_MB;
+            ret = chunksToMb(memoryChunksSwap);
         }
         t->contextSet(Thread::CONTEXT::CPU);
         return ret;
@@ -476,10 +481,10 @@ namespace OpenLogReplicator {
 
                     if (memoryChunksAllocated < memoryChunksMax) {
                         t->contextSet(Thread::CONTEXT::OS, Thread::REASON::OS);
-                        memoryChunks[memoryChunksFree] = static_cast<uint8_t*>(aligned_alloc(MEMORY_ALIGNMENT, MEMORY_CHUNK_SIZE));
+                        memoryChunks[memoryChunksFree] = static_cast<uint8_t*>(aligned_alloc(MEMORY_ALIGNMENT, memoryChunkSize));
                         t->contextSet(Thread::CONTEXT::MEM, Thread::REASON::MEM);
                         if (unlikely(memoryChunks[memoryChunksFree] == nullptr))
-                            throw RuntimeException(10016, "couldn't allocate " + std::to_string(MEMORY_CHUNK_SIZE_MB) +
+                            throw RuntimeException(10016, "couldn't allocate " + std::to_string(memoryChunkSize) +
                                                    " bytes memory for: " + memoryModules[static_cast<uint>(module)]);
                         ++memoryChunksFree;
                         allocatedTotal = ++memoryChunksAllocated;
@@ -526,33 +531,33 @@ namespace OpenLogReplicator {
 
         if (metrics != nullptr) {
             if (allocatedTotal > 0)
-                metrics->emitMemoryAllocatedMb(allocatedTotal * MEMORY_CHUNK_SIZE_MB);
+                metrics->emitMemoryAllocatedMb(chunksToMb(allocatedTotal));
 
-            metrics->emitMemoryUsedTotalMb(usedTotal * MEMORY_CHUNK_SIZE_MB);
+            metrics->emitMemoryUsedTotalMb(chunksToMb(usedTotal));
 
             switch (module) {
                 case MEMORY::BUILDER:
-                    metrics->emitMemoryUsedMbBuilder(allocatedModule * MEMORY_CHUNK_SIZE_MB);
+                    metrics->emitMemoryUsedMbBuilder(chunksToMb(allocatedModule));
                     break;
 
                 case MEMORY::MISC:
-                    metrics->emitMemoryUsedMbMisc(allocatedModule * MEMORY_CHUNK_SIZE_MB);
+                    metrics->emitMemoryUsedMbMisc(chunksToMb(allocatedModule));
                     break;
 
                 case MEMORY::PARSER:
-                    metrics->emitMemoryUsedMbParser(allocatedModule * MEMORY_CHUNK_SIZE_MB);
+                    metrics->emitMemoryUsedMbParser(chunksToMb(allocatedModule));
                     break;
 
                 case MEMORY::READER:
-                    metrics->emitMemoryUsedMbReader(allocatedModule * MEMORY_CHUNK_SIZE_MB);
+                    metrics->emitMemoryUsedMbReader(chunksToMb(allocatedModule));
                     break;
 
                 case MEMORY::TRANSACTIONS:
-                    metrics->emitMemoryUsedMbTransactions(allocatedModule * MEMORY_CHUNK_SIZE_MB);
+                    metrics->emitMemoryUsedMbTransactions(chunksToMb(allocatedModule));
                     break;
 
                 case MEMORY::WRITER:
-                    metrics->emitMemoryUsedMbWriter(allocatedModule * MEMORY_CHUNK_SIZE_MB);
+                    metrics->emitMemoryUsedMbWriter(chunksToMb(allocatedModule));
             }
         }
 
@@ -592,33 +597,33 @@ namespace OpenLogReplicator {
         t->contextSet(Thread::CONTEXT::CPU);
         if (metrics != nullptr) {
             if (allocatedTotal > 0)
-                metrics->emitMemoryAllocatedMb(allocatedTotal * MEMORY_CHUNK_SIZE_MB);
+                metrics->emitMemoryAllocatedMb(chunksToMb(allocatedTotal));
 
-            metrics->emitMemoryUsedTotalMb(usedTotal * MEMORY_CHUNK_SIZE_MB);
+            metrics->emitMemoryUsedTotalMb(chunksToMb(usedTotal));
 
             switch (module) {
                 case MEMORY::BUILDER:
-                    metrics->emitMemoryUsedMbBuilder(allocatedModule * MEMORY_CHUNK_SIZE_MB);
+                    metrics->emitMemoryUsedMbBuilder(chunksToMb(allocatedModule));
                     break;
 
                 case MEMORY::MISC:
-                    metrics->emitMemoryUsedMbMisc(allocatedModule * MEMORY_CHUNK_SIZE_MB);
+                    metrics->emitMemoryUsedMbMisc(chunksToMb(allocatedModule));
                     break;
 
                 case MEMORY::PARSER:
-                    metrics->emitMemoryUsedMbParser(allocatedModule * MEMORY_CHUNK_SIZE_MB);
+                    metrics->emitMemoryUsedMbParser(chunksToMb(allocatedModule));
                     break;
 
                 case MEMORY::READER:
-                    metrics->emitMemoryUsedMbReader(allocatedModule * MEMORY_CHUNK_SIZE_MB);
+                    metrics->emitMemoryUsedMbReader(chunksToMb(allocatedModule));
                     break;
 
                 case MEMORY::TRANSACTIONS:
-                    metrics->emitMemoryUsedMbTransactions(allocatedModule * MEMORY_CHUNK_SIZE_MB);
+                    metrics->emitMemoryUsedMbTransactions(chunksToMb(allocatedModule));
                     break;
 
                 case MEMORY::WRITER:
-                    metrics->emitMemoryUsedMbWriter(allocatedModule * MEMORY_CHUNK_SIZE_MB);
+                    metrics->emitMemoryUsedMbWriter(chunksToMb(allocatedModule));
             }
         }
     }
@@ -888,12 +893,18 @@ namespace OpenLogReplicator {
                 "transaction would be skipped");
         if (memoryModulesAllocated[static_cast<uint>(MEMORY::READER)] > 5)
             hint("amount of disk buffer is too high, try to decrease 'memory-read-buffer-max-mb' parameter, current utilization: " +
-                    std::to_string(memoryModulesAllocated[static_cast<uint>(MEMORY::READER)] * MEMORY_CHUNK_SIZE_MB) + "MB");
-        if (swappableTransactions == 0 && openTransactions > 0)
+                    std::to_string(chunksToMb(memoryModulesAllocated[static_cast<uint>(MEMORY::READER)])) + "MB");
+        if (swappableTransactions == 0 && openTransactions > 0) {
+            // The pool usage is reported from the blocks actually handed out: the number of open transactions is
+            // not a byte figure (most of them are shells without a single change), so it can not be read as MB.
+            const uint64_t usedChunks = memoryChunksAllocated - memoryChunksFree;
             hint("the memory is held by " + std::to_string(openTransactions) + " open transaction(s) and none of them can be swapped "
-                    "out: every open transaction takes at least " + std::to_string(MEMORY_CHUNK_SIZE_MB) + " MB and only transactions "
-                    "with more than one chunk are swappable, so \"max-mb\" has to cover the peak number of concurrently open "
-                    "transactions (currently: " + std::to_string(openTransactions) + " MB) plus the read/write buffers");
+                    "out: a transaction that holds data owns at least " + std::to_string(memoryChunkSize / 1024) + " KB "
+                    "('transaction-block-kb') and only transactions owning more than one block are swappable, so \"max-mb\" has to "
+                    "cover the peak number of concurrently open transactions plus the read/write buffers (pool: " +
+                    std::to_string(chunksToMb(usedChunks)) + " MB used by " + std::to_string(openTransactions) + " open transaction(s), "
+                    "in " + std::to_string(usedChunks) + " block(s) of " + std::to_string(memoryChunkSize / 1024) + " KB)");
+        }
         throw RuntimeException(10017, "out of memory");
     }
 

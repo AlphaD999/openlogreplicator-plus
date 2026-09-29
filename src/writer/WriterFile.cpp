@@ -344,10 +344,10 @@ namespace OpenLogReplicator {
     }
 
     void WriterFile::bufferedWrite(const uint8_t* data, uint64_t size) {
-        if (bufferFill + size > Ctx::MEMORY_CHUNK_SIZE)
+        if (bufferFill + size > ctx->memoryChunkSize)
             flush();
 
-        if (size > Ctx::MEMORY_CHUNK_SIZE) {
+        if (size > ctx->memoryChunkSize) {
             unbufferedWrite(data, size);
             return;
         }
