@@ -163,6 +163,7 @@ namespace OpenLogReplicator {
         while (true) {
             SwapKey swapKey;
             SwapChunk* sc = nullptr;
+            bool takenOver = false;
             {
                 contextSet(CONTEXT::MUTEX, REASON::MEMORY_CLEAN);
                 std::unique_lock const lck(ctx->swapMtx);
@@ -171,22 +172,37 @@ namespace OpenLogReplicator {
                     return discard;
                 }
 
-                swapKey = ctx->commitedXids.back();
+                swapKey = ctx->commitedXids.back().first;
+                SwapChunk* queued = ctx->commitedXids.back().second;
                 ctx->commitedXids.pop_back();
                 const auto& it = ctx->swapChunks.find(swapKey);
-                if (it != ctx->swapChunks.end()) {
+                if (it != ctx->swapChunks.end() && it->second == queued) {
                     sc = it->second;
                     if (sc->swappedMax >= 0)
                         discard += sc->swappedMax - sc->swappedMin;
                     ctx->swapChunks.erase(it);
                     ctx->reusedTransactions.notify_all();
-                } else
-                    // The entry is already gone (Ctx::swappedMemoryKeyRelease() drops it as soon as the
-                    // transaction is delivered), but its data on disk is not - the file is still unlinked below.
+                } else {
+                    if (it != ctx->swapChunks.end())
+                        // The key was taken over while this cleanup was pending: what is registered there now is a
+                        // new entry of a duplicate parse of the same Xid (Ctx::swappedMemoryInit), not the one
+                        // this key was queued for. Removing it used to kill the run with 50070 ("swap chunk not
+                        // found ... during memory grow") as soon as that parse appended its first record, and its
+                        // swapped data lives in the very file that is unlinked below - so neither is touched.
+                        takenOver = true;
+                    else
+                        // The entry is already gone (Ctx::swappedMemoryKeyRelease() drops it as soon as the
+                        // transaction is delivered), but its data on disk is not - the file is still unlinked
+                        // below. It is only skipped when the key has a live owner again (see above).
+                        takenOver = false;
                     sc = nullptr;
+                }
             }
             contextSet(CONTEXT::CPU);
             delete sc;
+
+            if (unlikely(takenOver))
+                continue;
 
             struct stat fileStat{};
             const std::string fileName(swapPath + "/" + swapKey.fileNameSuffix() + ".swap");
@@ -246,13 +262,20 @@ namespace OpenLogReplicator {
     void MemoryManager::getChunkToUnswap(SwapKey& swapKey, int64_t& index) const {
         if (ctx->swappedFlushXid.xid.toUint() != 0) {
             const auto& it = ctx->swapChunks.find(ctx->swappedFlushXid);
-            if (unlikely(it == ctx->swapChunks.end()))
-                throw RuntimeException(50070, "swap chunk not found for transaction: " + ctx->swappedFlushXid.toString() + " during unswap");
-            const SwapChunk* sc = it->second;
-            if (sc->swappedMin > -1) {
-                index = sc->swappedMin;
-                swapKey = ctx->swappedFlushXid;
-                return;
+            if (unlikely(it == ctx->swapChunks.end())) {
+                // The transaction was released (delivered, dropped or cleaned up) while its flush was still
+                // pending: there is nothing left to unswap and the data is gone with it. Throwing here used to
+                // abort the whole run (error 50070) over a key that simply no longer exists.
+                ctx->warning(60051, "swap memory of transaction: " + ctx->swappedFlushXid.toString() + " is gone while "
+                            "its unswap was pending - nothing to unswap");
+                ctx->swappedFlushXid = SwapKey{};
+            } else {
+                const SwapChunk* sc = it->second;
+                if (sc->swappedMin > -1) {
+                    index = sc->swappedMin;
+                    swapKey = ctx->swappedFlushXid;
+                    return;
+                }
             }
         }
 
@@ -260,8 +283,12 @@ namespace OpenLogReplicator {
             return;
 
         const auto& it = ctx->swapChunks.find(ctx->swappedShrinkXid);
-        if (unlikely(it == ctx->swapChunks.end()))
-            throw RuntimeException(50070, "swap chunk not found for transaction: " + ctx->swappedShrinkXid.toString() + " during unswap");
+        if (unlikely(it == ctx->swapChunks.end())) {
+            ctx->warning(60051, "swap memory of transaction: " + ctx->swappedShrinkXid.toString() + " is gone while "
+                        "its shrink was pending - nothing to shrink");
+            ctx->swappedShrinkXid = SwapKey{};
+            return;
+        }
         const SwapChunk* sc = it->second;
         if (sc->swappedMax == -1)
             return;

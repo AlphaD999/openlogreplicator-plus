@@ -756,9 +756,19 @@ namespace OpenLogReplicator {
             t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_SWAPPED_GROW1);
             std::unique_lock const lck(swapMtx);
             const auto& it = swapChunks.find(swapKey);
-            if (unlikely(it == swapChunks.end()))
-                throw RuntimeException(50070, "swap chunk not found for transaction: " + swapKey.toString() + " during memory grow");
-            sc = it->second;
+            if (unlikely(it == swapChunks.end())) {
+                // The entry can be gone while the transaction is still being parsed: a duplicate parse of the same
+                // Xid took the key over (Ctx::swappedMemoryInit) and the delayed cleanup of the previous owner
+                // removed the entry right afterwards (MemoryManager::cleanOldTransactions). Killing the whole run
+                // over it - what this used to do, error 50070 - is worse than continuing this one transaction on a
+                // fresh entry: the parse goes on, its already swapped out data is gone and that loss is reported.
+                warning(60051, "swap memory of transaction: " + swapKey.toString() + " disappeared while it is still "
+                        "being parsed (the key was taken over by a duplicate parse of the same Xid) - its swapped "
+                        "data is lost, the transaction is continued on a fresh swap entry");
+                sc = new SwapChunk();
+                swapChunks.insert_or_assign(swapKey, sc);
+            } else
+                sc = it->second;
         }
         t->contextSet(Thread::CONTEXT::CPU);
 
@@ -862,7 +872,10 @@ namespace OpenLogReplicator {
             t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_SWAPPED_FLUSH2);
             std::unique_lock const lck(swapMtx);
             sc->chunks.clear();
-            commitedXids.push_back(swapKey);
+            // The entry stays in swapChunks until the memory manager removes it: queued together with the entry
+            // itself, so that the cleanup can tell whether the entry it finds under this key is still the one it
+            // was queued for (a duplicate parse of the same Xid can have built a new one in the meantime).
+            commitedXids.push_back({swapKey, sc});
             chunksMemoryManager.notify_all();
         }
         t->contextSet(Thread::CONTEXT::CPU);
@@ -917,8 +930,11 @@ namespace OpenLogReplicator {
             if (swappedFlushXid == swapKey)
                 swappedFlushXid = SwapKey{};
             swapChunks.erase(it);
-            // The memory manager still has to unlink the swap file, so the key is handed over to it.
-            commitedXids.push_back(swapKey);
+            // The memory manager still has to unlink the swap file, so the key is handed over to it. The entry is
+            // queued as a null identity: this one is already erased, so if the cleanup finds a live entry under
+            // the key it belongs to a duplicate parse of the same Xid and has to be left alone (it owns the swap
+            // file now).
+            commitedXids.push_back({swapKey, nullptr});
             reusedTransactions.notify_all();
         }
         delete sc;

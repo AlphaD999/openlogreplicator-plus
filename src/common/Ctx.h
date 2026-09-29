@@ -419,7 +419,12 @@ namespace OpenLogReplicator {
 
         // Per transaction swap storage, keyed by (thread, conId, xid) - see SwapKey
         std::unordered_map<SwapKey, SwapChunk*, SwapKeyHash> swapChunks;
-        std::vector<SwapKey> commitedXids;
+        // Keys whose swap file still has to be unlinked, each together with the entry it was queued for. The
+        // pointer is the identity of that entry: while the cleanup is pending, a duplicate parse of the same Xid
+        // can take the key over and build a new entry under it (Ctx::swappedMemoryInit), and the delayed cleanup
+        // must not remove - and must not unlink the file of - an entry it was never queued for
+        // (see MemoryManager::cleanOldTransactions).
+        std::vector<std::pair<SwapKey, SwapChunk*>> commitedXids;
         std::condition_variable chunksMemoryManager;
         std::condition_variable chunksTransaction;
         uint64_t swappedMB{0};
