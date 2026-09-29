@@ -2561,23 +2561,41 @@ namespace OpenLogReplicator {
         // keeps running the sorter from the parser thread alone, in order and without locks.
         if (ctx->parserInSwapWait.load(std::memory_order_relaxed) && metadata->commitSorter != nullptr &&
             ctx->sorterExecutor != nullptr && metadata->commitSorter->getPendingEvents() > 0) {
-            if (!ctx->sorterTickTakenOver.exchange(true, std::memory_order_relaxed))
-                ctx->info(0, "the parser is blocked waiting for a swapped transaction to be delivered - the writer "
-                             "takes the commit sorter tick over to release it (defect C)");
-            // Stage 1 of the accounting decoupling: the delivery below runs on this thread while the parser is
-            // blocked in swappedMemoryInit(), so the memory and the state it books have to be this thread's and
-            // not the parser's (ctx->thread() reads this). Residual, recorded on purpose: if the delivery
-            // releases the parser - the commit it waits for is the one being delivered - the parser can resume
-            // while the tick is still running and books to this thread as well until the flag is cleared. In
-            // that window the delivery and the parser also touch the builder concurrently; both still have to
-            // be serialized (stage 2).
-            ctx->accountThread.store(t, std::memory_order_relaxed);
-            metadata->commitSorter->tick(ctx->sorterExecutor.get(), ctx->clock->getTimeUt(), ctx->idleThreadReleaseUs);
-            // Waiting for the water-mark alone would leave the parser waiting forever: it lags the parsed position
-            // by the commit that ends the parsed window (the commit SCN is the SCN of its redo record + 1) and
-            // while the parser is blocked nothing publishes a higher one - see CommitSorter::flushLowestPending().
-            metadata->commitSorter->flushLowestPending(ctx->sorterExecutor.get());
-            ctx->accountThread.store(nullptr, std::memory_order_relaxed);
+            // Stage 2: only one thread takes a tick over at a time (Ctx::writerTakeoverMtx). The delivery of a
+            // tick runs outside the sorter lock, so a second take-over in parallel would deliver at the same
+            // time, step over the accounting thread and over the deferred releases below.
+            std::unique_lock<std::mutex> takeoverLck(ctx->writerTakeoverMtx, std::try_to_lock);
+            if (takeoverLck.owns_lock()) {
+                if (!ctx->sorterTickTakenOver.exchange(true, std::memory_order_relaxed))
+                    ctx->info(0, "the parser is blocked waiting for a swapped transaction to be delivered - the writer "
+                                 "takes the commit sorter tick over to release it (defect C)");
+                // Stage 1 + 2 of the accounting decoupling: the delivery below runs on this thread while the
+                // parser is blocked in swappedMemoryInit(), so the memory and the state it books have to be this
+                // thread's and not the parser's (Ctx::thread() reads this). Stage 2 closes the window that used
+                // to stay open after the hand over: the release that wakes the parser is collected instead of
+                // run (Ctx::deferSwapReleases), and only after the delivery is finished and the accounting
+                // thread has been handed back is the parser let go - it never runs into the delivery. The guard
+                // does that on every path out, including an exception from the delivery: a release that is
+                // collected and never run would leave the parser waiting forever.
+                struct Handover {
+                    Ctx* ctx;
+
+                    ~Handover() {
+                        ctx->deferSwapReleases = false;
+                        ctx->accountThread.store(nullptr, std::memory_order_relaxed);
+                        ctx->releaseDeferredSwaps();
+                    }
+                } handover{ctx};
+
+                ctx->deferSwapReleases = true;
+                ctx->accountThread.store(t, std::memory_order_relaxed);
+                metadata->commitSorter->tick(ctx->sorterExecutor.get(), ctx->clock->getTimeUt(), ctx->idleThreadReleaseUs);
+                // Waiting for the water-mark alone would leave the parser waiting forever: it lags the parsed
+                // position by the commit that ends the parsed window (the commit SCN is the SCN of its redo
+                // record + 1) and while the parser is blocked nothing publishes a higher one - see
+                // CommitSorter::flushLowestPending().
+                metadata->commitSorter->flushLowestPending(ctx->sorterExecutor.get());
+            }
         } else
             ctx->sorterTickTakenOver.store(false, std::memory_order_relaxed);
 

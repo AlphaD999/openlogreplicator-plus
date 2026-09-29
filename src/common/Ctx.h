@@ -376,6 +376,21 @@ namespace OpenLogReplicator {
         // Set while the writer is driving the sorter tick because of the flag above. Only the transition is
         // reported, so that a regression run can tell from the log whether a take-over happened at all.
         std::atomic<bool> sorterTickTakenOver{false};
+        // Only one take-over at a time: the delivery of a tick runs outside the sorter lock, so two writers
+        // taking a tick over at the same time would deliver in parallel, step over the accounting thread below
+        // and over the deferred releases. The second one skips its tick - the first delivers what is pending.
+        std::mutex writerTakeoverMtx;
+        // Stage 2 of the accounting decoupling: the delivery that runs on another thread than the parser (the
+        // writer, defect C) must not be interrupted by the parser it releases. The release of a swap key is what
+        // wakes the parser out of swappedMemoryInit(); if it resumed right there it would use the builder and
+        // book memory while the delivery is still doing both. While this is set, swappedMemoryKeyRelease() only
+        // collects the keys, and the delivering thread runs them (releaseDeferredSwaps) after its delivery is
+        // over and after the accounting thread has been handed back. Only that thread pushes and drains the
+        // vector, so it needs no lock of its own.
+        bool deferSwapReleases{false};
+        std::vector<SwapKey> deferredSwapReleases;
+
+        void releaseDeferredSwaps();
         // Executor of the out-of-parser tick. Set by the replicator (which already owns one for its own idle
         // tick): allocating a parser at the moment the pool is exhausted - exactly when the tick is needed -
         // would block on memory.

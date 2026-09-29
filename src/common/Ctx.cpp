@@ -853,7 +853,23 @@ namespace OpenLogReplicator {
         t->contextSet(Thread::CONTEXT::CPU);
     }
 
+    void Ctx::releaseDeferredSwaps() {
+        // Hand the collected keys over first: the releases below re-enter swappedMemoryKeyRelease(), which must
+        // find the flag cleared (and may collect again if it were not).
+        std::vector<SwapKey> pending;
+        pending.swap(deferredSwapReleases);
+        for (const SwapKey& swapKey: pending)
+            swappedMemoryKeyRelease(swapKey);
+    }
+
     void Ctx::swappedMemoryKeyRelease(const SwapKey& swapKey) {
+        // Stage 2: a take-over delivery must finish before the parser it releases can run again (see
+        // Ctx::deferSwapReleases). Collected here, released by the delivering thread when it is done.
+        if (unlikely(deferSwapReleases)) {
+            deferredSwapReleases.push_back(swapKey);
+            return;
+        }
+
         SwapChunk* sc = nullptr;
         {
             std::unique_lock const lck(swapMtx);
