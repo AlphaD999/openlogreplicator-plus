@@ -1689,7 +1689,14 @@ namespace OpenLogReplicator {
                         static_cast<uint64_t>(currentBlock - sliceStartBlock) * reader->getBlockSize() >= Ctx::SLICE_MIN_BYTES) {
                         slicePending = true;
                         sliceScn = lwnScn;
-                        metadata->saveFileOffset(thread, FileOffset(currentBlock, reader->getBlockSize()));
+                        // Save the NEXT LWN record's first block, not the one this record ended on: the resumed
+                        // pass treats its start block as the head of an LWN record (Parser::parse, "currentBlock
+                        // == lwnEndBlock") and reads the SCN out of it. A continuation block carries the LWN flag
+                        // as well but not the head's fields, so resuming on it read a garbage SCN and ended the
+                        // run with 50049 (measured in production: "invalid lwn scn: 11388144845283", right after
+                        // "FINISHED (sliced), position: 7340032 / 13839360" and a resume at offset: 7350784).
+                        // lwnEndBlock is exactly the head of the next record (currentBlock + lwnSize).
+                        metadata->saveFileOffset(thread, FileOffset(lwnEndBlock, reader->getBlockSize()));
                         if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
                             ctx->logTrace(Ctx::TRACE::CHECKPOINT, "slicing archive at scn: " + lwnScn.toString() + " (block " +
                                           std::to_string(currentBlock) + "), pending commits: " +
