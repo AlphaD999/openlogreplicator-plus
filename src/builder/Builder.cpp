@@ -2548,6 +2548,24 @@ namespace OpenLogReplicator {
         if (unlikely(ctx->isTraceSet(Ctx::TRACE::SLEEP)))
             ctx->logTrace(Ctx::TRACE::SLEEP, "Builder:sleepForWriterWork");
 
+        // Defect C: the parser drives the commit sorter, but while it is blocked in Ctx::swappedMemoryInit() it
+        // can not, and the transaction it waits for is released only by the flush the sorter would have to run -
+        // a self-lock (warning 60050). The writer is idle right here (no message to deliver) and is not part of
+        // that cycle, so it takes the tick over, but only while the parser is in that wait: the normal path
+        // keeps running the sorter from the parser thread alone, in order and without locks.
+        if (ctx->parserInSwapWait.load(std::memory_order_relaxed) && metadata->commitSorter != nullptr &&
+            ctx->sorterExecutor != nullptr && metadata->commitSorter->getPendingEvents() > 0) {
+            if (!ctx->sorterTickTakenOver.exchange(true, std::memory_order_relaxed))
+                ctx->info(0, "the parser is blocked waiting for a swapped transaction to be delivered - the writer "
+                             "takes the commit sorter tick over to release it (defect C)");
+            metadata->commitSorter->tick(ctx->sorterExecutor.get(), ctx->clock->getTimeUt(), ctx->idleThreadReleaseUs);
+            // Waiting for the water-mark alone would leave the parser waiting forever: it lags the parsed position
+            // by the commit that ends the parsed window (the commit SCN is the SCN of its redo record + 1) and
+            // while the parser is blocked nothing publishes a higher one - see CommitSorter::flushLowestPending().
+            metadata->commitSorter->flushLowestPending(ctx->sorterExecutor.get());
+        } else
+            ctx->sorterTickTakenOver.store(false, std::memory_order_relaxed);
+
         {
             t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::WRITER_DONE);
             std::unique_lock lck(mtx);

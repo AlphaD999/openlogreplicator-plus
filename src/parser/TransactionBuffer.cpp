@@ -33,7 +33,6 @@ If not, see <http://www.gnu.org/licenses/>. */
 namespace OpenLogReplicator {
     TransactionBuffer::TransactionBuffer(Ctx* newCtx):
         ctx(newCtx) {
-        buffer[0] = 0;
     }
 
     TransactionBuffer::~TransactionBuffer() {

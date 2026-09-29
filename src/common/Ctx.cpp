@@ -658,7 +658,12 @@ namespace OpenLogReplicator {
                 }
 
                 t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::MEMORY_BLOCKED);
+                // The parser is now out of the game: it holds no buffer lock (swapMtx is released by wait_for)
+                // and touches neither the sorter nor the builder, so the writer may drive a sorter tick and
+                // deliver the transaction this wait is waiting for (defect C).
+                parserInSwapWait.store(true, std::memory_order_relaxed);
                 reusedTransactions.wait_for(lck, std::chrono::microseconds(SWAP_WAIT_REPORT_US));
+                parserInSwapWait.store(false, std::memory_order_relaxed);
                 t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_MEMORY_INIT);
             }
 
@@ -841,6 +846,28 @@ namespace OpenLogReplicator {
             chunksMemoryManager.notify_all();
         }
         t->contextSet(Thread::CONTEXT::CPU);
+    }
+
+    void Ctx::swappedMemoryKeyRelease(const SwapKey& swapKey) {
+        SwapChunk* sc = nullptr;
+        {
+            std::unique_lock const lck(swapMtx);
+            const auto it = swapChunks.find(swapKey);
+            if (it == swapChunks.end())
+                return;
+            sc = it->second;
+            // Still holding swapped out data: that entry belongs to the purge()/MemoryManager path, which knows
+            // how to unlink the swap file - dropping it here would lose that data and the file.
+            if (!sc->chunks.empty())
+                return;
+            if (swappedFlushXid == swapKey)
+                swappedFlushXid = SwapKey{};
+            swapChunks.erase(it);
+            // The memory manager still has to unlink the swap file, so the key is handed over to it.
+            commitedXids.push_back(swapKey);
+            reusedTransactions.notify_all();
+        }
+        delete sc;
     }
 
     void Ctx::wontSwap(Thread* t, uint64_t openTransactions, uint64_t swappableTransactions) const {

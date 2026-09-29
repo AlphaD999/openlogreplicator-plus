@@ -29,7 +29,9 @@ namespace OpenLogReplicator {
             Writer(newCtx, std::move(newAlias), std::move(newDatabase), newBuilder, newMetadata),
             stream(newStream) {
         metadata->bootFailsafe = true;
-        ctx->parserThread = this;
+        // No "ctx->parserThread = this" here: this is a writer, and parserThread is what the memory accounting
+        // of the parse and the delivery path is booked against (the replicator sets it to itself). A writer
+        // claiming that role puts the transactions of the parser on the wrong account.
     }
 
     WriterStream::~WriterStream() {

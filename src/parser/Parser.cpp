@@ -853,6 +853,7 @@ namespace OpenLogReplicator {
             metadata->commitSorter->enqueueCommit(transaction, transaction->commitScn);
         else
             executeCommit(transaction);
+
     }
 
     void Parser::executeCommit(Transaction* transaction) {
@@ -1644,7 +1645,7 @@ namespace OpenLogReplicator {
                     // position and let the scheduler continue with the redo thread that is behind.
                     if (!switchRedo && ctx->slicePendingCommits > 0 && metadata->commitSorter != nullptr &&
                         metadata->commitSorter->getPendingEvents() >= ctx->slicePendingCommits &&
-                        lwnScn > metadata->commitSorter->getWatermark() &&
+                        metadata->commitSorter->isAheadOfWatermark(lwnScn) &&
                         static_cast<uint64_t>(currentBlock - sliceStartBlock) * reader->getBlockSize() >= Ctx::SLICE_MIN_BYTES) {
                         slicePending = true;
                         sliceScn = lwnScn;

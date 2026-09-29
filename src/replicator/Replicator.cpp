@@ -199,6 +199,12 @@ namespace OpenLogReplicator {
             ctx->logTrace(Ctx::TRACE::THREADS, "replicator (" + ss.str() + ") start");
         }
 
+        // Defect C: the executor of the out-of-parser sorter tick has to be created here, before this thread can
+        // get stuck in Ctx::swappedMemoryInit. It can not be created at that moment: the memory pool is at its
+        // limit then, and the thread that would have to create it is exactly the one that is blocked.
+        if (metadata->commitSorter != nullptr && ctx->sorterExecutor == nullptr)
+            ctx->sorterExecutor = std::make_unique<Parser>(ctx, builder, metadata, transactionBuffer, 0, "");
+
         try {
             metadata->waitForWriter(ctx->parserThread);
 

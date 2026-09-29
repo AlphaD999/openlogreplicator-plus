@@ -162,7 +162,7 @@ namespace OpenLogReplicator {
         uint64_t discard = 0;
         while (true) {
             SwapKey swapKey;
-            SwapChunk* sc;
+            SwapChunk* sc = nullptr;
             {
                 contextSet(CONTEXT::MUTEX, REASON::MEMORY_CLEAN);
                 std::unique_lock const lck(ctx->swapMtx);
@@ -174,13 +174,16 @@ namespace OpenLogReplicator {
                 swapKey = ctx->commitedXids.back();
                 ctx->commitedXids.pop_back();
                 const auto& it = ctx->swapChunks.find(swapKey);
-                if (it == ctx->swapChunks.end())
-                    continue;
-                sc = it->second;
-                if (sc->swappedMax >= 0)
-                    discard += sc->swappedMax - sc->swappedMin;
-                ctx->swapChunks.erase(it);
-                ctx->reusedTransactions.notify_all();
+                if (it != ctx->swapChunks.end()) {
+                    sc = it->second;
+                    if (sc->swappedMax >= 0)
+                        discard += sc->swappedMax - sc->swappedMin;
+                    ctx->swapChunks.erase(it);
+                    ctx->reusedTransactions.notify_all();
+                } else
+                    // The entry is already gone (Ctx::swappedMemoryKeyRelease() drops it as soon as the
+                    // transaction is delivered), but its data on disk is not - the file is still unlinked below.
+                    sc = nullptr;
             }
             contextSet(CONTEXT::CPU);
             delete sc;

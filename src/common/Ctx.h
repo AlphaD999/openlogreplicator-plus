@@ -33,6 +33,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include <unordered_map>
 #include <vector>
 
+#include "../parser/CommitSorter.h"
 #include "types/LobId.h"
 #include "types/Scn.h"
 #include "types/Xid.h"
@@ -318,6 +319,22 @@ namespace OpenLogReplicator {
         std::unordered_map<LobId, Xid> lobIdToXidMap;
         Thread* parserThread{nullptr};
         Thread* writerThread{nullptr};
+        // Defect C: while the parser is blocked in swappedMemoryInit() it can not drive the commit sorter, and
+        // the transaction it waits for is released by exactly that flush - the two wait on each other. The
+        // writer thread takes a sorter tick over while this flag is set (see Builder::sleepForWriterWork); in
+        // every other situation the parser keeps driving the sorter alone, so the normal path keeps the single
+        // threaded order and no lock is taken.
+        std::atomic<bool> parserInSwapWait{false};
+        // Set while the writer is driving the sorter tick because of the flag above. Only the transition is
+        // reported, so that a regression run can tell from the log whether a take-over happened at all.
+        std::atomic<bool> sorterTickTakenOver{false};
+        // Executor of the out-of-parser tick. Set by the replicator (which already owns one for its own idle
+        // tick): allocating a parser at the moment the pool is exhausted - exactly when the tick is needed -
+        // would block on memory.
+        // The executor of the commit sorter tick that runs outside the parser (defect C). Owned here on
+        // purpose: it is used from the replicator thread and from a writer thread, so it has to outlive both
+        // (Ctx does). Created once, at the start of Replicator::run(), before the writer can take a tick over.
+        std::unique_ptr<CommitSorter::Executor> sorterExecutor{nullptr};
 
         // swappedMemoryInit() waits for the same transaction to be delivered. The wait stays unbounded (see the
         // comment there), but it reports itself with this interval: an unbounded silent wait is
@@ -710,6 +727,11 @@ namespace OpenLogReplicator {
         [[nodiscard]] uint8_t* swappedMemoryShrink(Thread* t, const SwapKey& swapKey);
         void swappedMemoryFlush(Thread* t, const SwapKey& swapKey);
         void swappedMemoryRemove(Thread* t, const SwapKey& swapKey);
+        // Drop the swap key of a transaction that has been delivered. It has to happen right there: the entry is
+        // what swappedMemoryInit() waits for, so leaving it behind makes a duplicate parse of the same Xid (slice
+        // boundary, instance recovery) wait for a delivery that already happened - warning 60050, and nobody can
+        // break that wait, because the release would have to come from the transaction that is gone (defect C).
+        void swappedMemoryKeyRelease(const SwapKey& swapKey);
         void wontSwap(Thread* t, uint64_t openTransactions, uint64_t swappableTransactions) const;
 
         void stopHard();

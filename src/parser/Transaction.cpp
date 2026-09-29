@@ -574,6 +574,13 @@ namespace OpenLogReplicator {
         }
         builder->processCommit();
         metadata->ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
+
+        // The transaction is delivered: its swap key is not needed any more and has to be dropped here. Leaving
+        // it behind is what makes a duplicate parse of the same Xid (slice boundary, instance recovery) wait in
+        // Ctx::swappedMemoryInit() for a delivery that has already happened - and nothing could ever break that
+        // wait, because the release would have to come from the transaction that is already delivered
+        // (defect C, warning 60050).
+        metadata->ctx->swappedMemoryKeyRelease(swapKey());
     }
 
     void Transaction::purge(Ctx* ctx) {

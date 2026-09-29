@@ -35,6 +35,7 @@ namespace OpenLogReplicator {
         event->scn = commitScn;
         event->commit = true;
         event->transaction = transaction;
+        std::lock_guard const lck(sorterMtx);
         events[commitScn].push_back(event);
         ++pendingEvents;
     }
@@ -44,38 +45,55 @@ namespace OpenLogReplicator {
         event->scn = checkpoint.scn;
         event->commit = false;
         event->checkpoint = checkpoint;
+        std::lock_guard const lck(sorterMtx);
         events[checkpoint.scn].push_back(event);
         ++pendingEvents;
     }
 
     void CommitSorter::setThreadWatermark(uint16_t thread, Scn parsedScn, uint64_t currentTime, uint64_t idleReleaseUs) {
+        std::lock_guard const lck(sorterMtx);
+        if (parsedScn == Scn::none())
+            return;
+        // What a thread vouches for is the highest *commit SCN* it can rule out: a commit SCN is the SCN that
+        // follows its redo record, so the record at parsedScn may be the commit record of a complete transaction
+        // with commitScn == parsedScn + 1 - that transaction is safe to deliver right away, and it has to be:
+        // if parsing stops exactly there (the parser blocks on a swap key, defect C), waiting for the next
+        // water-mark means waiting forever (see flushLowestPending). A record that is not parsed yet sits at
+        // >= parsedScn + 1 and carries a commit SCN >= parsedScn + 2, so nothing incomplete is ever delivered -
+        // the low-water-mark is shifted by one for every thread, so the global ordering guarantee is unchanged.
+        const Scn parsedCeiling(parsedScn.getData() + 1);
         auto it = threadWatermark.find(thread);
         if (it == threadWatermark.end()) {
-            threadWatermark.try_emplace(thread, parsedScn);
+            threadWatermark.try_emplace(thread, parsedCeiling);
             threadWatermarkTime.try_emplace(thread, currentTime);
-        } else if (parsedScn > it->second) {
-            it->second = parsedScn;
+        } else if (parsedCeiling > it->second) {
+            it->second = parsedCeiling;
             // Only progress restarts the idle timer: being called again with an unchanged SCN is not
             // "the thread is alive", it is exactly the state a release has to recognize.
             threadWatermarkTime[thread] = currentTime;
-            if (idleThreads.erase(thread) > 0 && watermark != Scn::none() && parsedScn < watermark) {
+            if (idleThreads.erase(thread) > 0 && watermark != Scn::none() && parsedCeiling < watermark) {
                 // Back from a release while still behind the water-mark: it does not take part in the minimum
                 // until it has caught up. Its events up to the water-mark are still delivered right away - the
                 // order of that window was given up when the thread was released.
                 unalignedThreads.insert(thread);
                 if (ctx != nullptr)
                     ctx->info(0, "redo thread: " + std::to_string(thread) + " is behind the low-water-mark (scn: " +
-                              parsedScn.toString() + " < " + watermark.toString() + ") - it does not hold it back until "
+                              parsedCeiling.toString() + " < " + watermark.toString() + ") - it does not hold it back until "
                               "it has caught up");
             }
-            if (watermark != Scn::none() && parsedScn >= watermark)
+            if (watermark != Scn::none() && parsedCeiling >= watermark)
                 unalignedThreads.erase(thread);
         }
 
-        refreshIdle(currentTime, idleReleaseUs);
+        refreshIdleLocked(currentTime, idleReleaseUs);
     }
 
     void CommitSorter::refreshIdle(uint64_t currentTime, uint64_t idleReleaseUs) {
+        std::lock_guard const lck(sorterMtx);
+        refreshIdleLocked(currentTime, idleReleaseUs);
+    }
+
+    void CommitSorter::refreshIdleLocked(uint64_t currentTime, uint64_t idleReleaseUs) {
         if (idleReleaseUs == 0)
             return;
 
@@ -99,10 +117,12 @@ namespace OpenLogReplicator {
     }
 
     void CommitSorter::threadClosed(uint16_t thread) {
+        std::lock_guard const lck(sorterMtx);
         closedThreads.insert(thread);
     }
 
     void CommitSorter::threadReopened(uint16_t thread) {
+        std::lock_guard const lck(sorterMtx);
         closedThreads.erase(thread);
         // Same rule as coming back from a release: a thread that is behind the water-mark takes part in the
         // minimum again only once it has caught up (after instance recovery its tail is still to be parsed).
@@ -117,6 +137,9 @@ namespace OpenLogReplicator {
     }
 
     void CommitSorter::flushReady(Executor* executor) {
+        Scn limit;
+        {
+            std::lock_guard const lck(sorterMtx);
         // Low-water-mark: minimum parsed SCN over all active (non-closed) threads
         Scn lowWatermark = Scn::none();
         for (const auto& [thread, parsedScn]: threadWatermark) {
@@ -140,28 +163,58 @@ namespace OpenLogReplicator {
         // caught up.
         if (watermark == Scn::none() || lowWatermark > watermark)
             watermark = lowWatermark;
-        flushUpTo(executor, watermark);
+            limit = watermark;
+        }
+        flushUpTo(executor, limit);
     }
 
     void CommitSorter::flushAll(Executor* executor) {
         flushUpTo(executor, Scn::none());
     }
 
-    void CommitSorter::flushUpTo(Executor* executor, Scn limit) {
-        while (!events.empty()) {
-            const auto it = events.begin();
-            if (limit != Scn::none() && it->first > limit)
-                break;
+    void CommitSorter::tick(Executor* executor, uint64_t currentTime, uint64_t idleReleaseUs) {
+        refreshIdle(currentTime, idleReleaseUs);
+        flushReady(executor);
+    }
 
-            for (const Event* event: it->second) {
-                if (event->commit)
-                    executor->executeCommit(event->transaction);
-                else
-                    executor->executeCheckpoint(event->checkpoint);
-                delete event;
-                --pendingEvents;
+    void CommitSorter::flushLowestPending(Executor* executor) {
+        Scn lowest;
+        {
+            std::lock_guard const lck(sorterMtx);
+            if (events.empty())
+                return;
+            lowest = events.begin()->first;
+        }
+        // flushUpTo() is inclusive, so this takes exactly the lowest buffered SCN group
+        flushUpTo(executor, lowest);
+    }
+
+    void CommitSorter::flushUpTo(Executor* executor, Scn limit) {
+        // The events are taken under the lock, the callbacks run without it: the executor can enqueue new
+        // events (a system transaction enqueues its checkpoint while it is being flushed) and it also writes
+        // into the builder, so flushing under the sorter lock would either deadlock on the re-entrant enqueue
+        // or serialize the parser against the flush for no reason.
+        std::vector<Event*> ready;
+        {
+            std::lock_guard const lck(sorterMtx);
+            while (!events.empty()) {
+                const auto it = events.begin();
+                if (limit != Scn::none() && it->first > limit)
+                    break;
+
+                for (Event* event: it->second)
+                    ready.push_back(event);
+                events.erase(it);
             }
-            events.erase(it);
+            pendingEvents -= ready.size();
+        }
+
+        for (Event* event: ready) {
+            if (event->commit)
+                executor->executeCommit(event->transaction);
+            else
+                executor->executeCheckpoint(event->checkpoint);
+            delete event;
         }
     }
 

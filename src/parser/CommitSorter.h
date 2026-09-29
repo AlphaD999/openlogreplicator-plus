@@ -21,6 +21,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #define COMMIT_SORTER_H_
 
 #include <map>
+#include <mutex>
 #include <set>
 #include <vector>
 
@@ -90,12 +91,37 @@ namespace OpenLogReplicator {
         void refreshIdle(uint64_t currentTime, uint64_t idleReleaseUs);
         // Flush everything ignoring the watermark (soft shutdown)
         void flushAll(Executor* executor);
+        // One tick off the parser thread: release the idle threads and flush what the low-water-mark allows.
+        // Called by the writer thread, only while the parser is blocked in Ctx::swappedMemoryInit (defect C):
+        // the release that wait is waiting for happens in the flush, and the flush is what the parser can not
+        // do while it waits. In every other situation the parser keeps driving the sorter alone.
+        void tick(Executor* executor, uint64_t currentTime, uint64_t idleReleaseUs);
 
+        // Deliver the lowest buffered event(s) even though the low-water-mark has not reached them. Only for the
+        // defect C take-over: the parser is blocked in Ctx::swappedMemoryInit() waiting for exactly that delivery,
+        // and while it is blocked nothing publishes a higher water-mark, so waiting for the water-mark is waiting
+        // forever. It is safe there: the event is a *commit* (the transaction is complete), it is the lowest
+        // buffered one (nothing can be delivered out of order) and the thread that would have to catch up is the
+        // blocked parser itself.
+        void flushLowestPending(Executor* executor);
+
+        // The low-water-mark: still the minimum over the active threads, but each thread publishes "the highest
+        // commit SCN I can vouch for", which is one past its parsed position (see setThreadWatermark). Compared
+        // with a *parsed position* use isAheadOfWatermark() instead of the plain operators.
         [[nodiscard]] Scn getWatermark() const {
+            std::lock_guard const lck(sorterMtx);
             return watermark;
         }
 
+        // Is the position "parsedScn" of a thread ahead of the low-water-mark? The water-mark is one SCN past
+        // the position each thread vouches for, so the plain position compares with >= against it.
+        [[nodiscard]] bool isAheadOfWatermark(Scn parsedScn) const {
+            std::lock_guard const lck(sorterMtx);
+            return watermark != Scn::none() && parsedScn >= watermark;
+        }
+
         [[nodiscard]] uint64_t getPendingEvents() const {
+            std::lock_guard const lck(sorterMtx);
             return pendingEvents;
         }
 
@@ -107,10 +133,15 @@ namespace OpenLogReplicator {
         // below the low-water-mark could be flushed by flushReady, so one that is still buffered while the
         // watermark is above it means that nothing called the sorter at all
         [[nodiscard]] Scn getLowestPendingScn() const {
+            std::lock_guard const lck(sorterMtx);
             return events.empty() ? Scn::none() : events.begin()->first;
         }
 
     protected:
+        // Guards every member below and every public method: since the tick can also be driven by the writer
+        // thread (see tick) the sorter is no longer driven by the parser thread alone.
+        mutable std::mutex sorterMtx;
+
         struct Event {
             Scn scn;
             bool commit;
@@ -134,6 +165,9 @@ namespace OpenLogReplicator {
         std::set<uint16_t> unalignedThreads;
 
         void flushUpTo(Executor* executor, Scn limit);
+        // Body of refreshIdle() without the lock: setThreadWatermark() already holds it when it releases the
+        // idle threads at the end of its own work.
+        void refreshIdleLocked(uint64_t currentTime, uint64_t idleReleaseUs);
     };
 }
 
