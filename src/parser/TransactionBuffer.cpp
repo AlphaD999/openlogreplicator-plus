@@ -59,8 +59,29 @@ namespace OpenLogReplicator {
         return (xid.getData() >> 32) | (static_cast<uint64_t>(static_cast<uint16_t>(conId)) << 32) | (static_cast<uint64_t>(thread) << 48);
     }
 
+    void TransactionBuffer::addCommittedTombstone(Xid xid, typeConId conId, uint16_t thread) {
+        const XidMap xidMap = makeXidMap(xid, conId, thread);
+        std::unique_lock const lck(mtx);
+        committedXidTombstones.insert_or_assign(xidMap, xid);
+    }
+
     Transaction* TransactionBuffer::findTransaction(XmlCtx* xmlCtx, Xid xid, typeConId conId, uint16_t thread, bool old, bool add, bool rollback) {
         const XidMap xidMap = makeXidMap(xid, conId, thread);
+
+        // The Xid has committed and its redo is being read a second time: the records are the ones the commit
+        // sorter owns (already delivered, or queued), so they are dropped here. Waiting for that delivery
+        // instead is what used to block the parser on the swap key of its own transaction (defect C, 60050).
+        {
+            std::unique_lock const lck(mtx);
+            const auto tombstoneIt = committedXidTombstones.find(xidMap);
+            if (tombstoneIt != committedXidTombstones.end()) {
+                if (tombstoneIt->second == xid)
+                    return nullptr;
+                // The undo slot has moved on to another transaction: the tombstone is over.
+                committedXidTombstones.erase(tombstoneIt);
+            }
+        }
+
         Transaction* transaction;
 
         auto xidTransactionMapIt = xidTransactionMap.find(xidMap);

@@ -780,6 +780,10 @@ namespace OpenLogReplicator {
 
         Transaction* transaction = transactionBuffer->findTransaction(metadata->schema->xmlCtxDefault, redoLogRecord1->xid, redoLogRecord1->conId,
                                                                       redoLogRecord1->thread, false, true, false);
+        // The Xid is a tombstone: its redo has been read before and it has committed already, so these records
+        // are dropped (see TransactionBuffer::addCommittedTombstone) - there is no transaction to fill in.
+        if (unlikely(transaction == nullptr))
+            return;
         if (unlikely(ctx->isTraceSet(Ctx::TRACE::TRANSACTION)))
             ctx->logTrace(Ctx::TRACE::TRANSACTION, "begin  xid: " + redoLogRecord1->xid.toString() + " conId: " +
                          std::to_string(redoLogRecord1->conId) + " usn: " + std::to_string(static_cast<uint64_t>(redoLogRecord1->usn)) +
@@ -847,6 +851,10 @@ namespace OpenLogReplicator {
         // reuse the same undo slot immediately, and findTransaction() would then report a slot take-over
         // (warning 60041 / error 50039) for a transaction that has in fact committed.
         transactionBuffer->dropTransaction(transaction->xid, transaction->conId, transaction->thread, transaction);
+        // The redo of this Xid can still be read again from here on (a pass that ends early resumes at the last
+        // confirmed LWN boundary): those records belong to this committed transaction, so a re-parse of them has
+        // to be dropped instead of waiting for its delivery - see TransactionBuffer::addCommittedTombstone.
+        transactionBuffer->addCommittedTombstone(transaction->xid, transaction->conId, transaction->thread);
 
         if (metadata->commitSorter != nullptr) {
             // Defer the flush until the low-water-mark over all redo threads passes the commit SCN

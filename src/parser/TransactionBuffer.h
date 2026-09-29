@@ -68,6 +68,15 @@ namespace OpenLogReplicator {
 
         std::mutex mtx;
         std::unordered_map<XidMap, Transaction*> xidTransactionMap;
+        // Tombstones of transactions that have committed. The same redo can be read a second time in one run:
+        // a pass that ends early (STOPPED/OVERWRITTEN) resumes at the last confirmed LWN boundary, so the redo
+        // between that boundary and the position the pass had reached is parsed again. For an Xid that has
+        // committed, those records are the ones the commit sorter owns - delivered already, or queued for
+        // delivery - so they have to be dropped instead of waiting for their delivery (Ctx::swappedMemoryInit).
+        // The full Xid is kept, not only the XidMap: the map key drops the sequence number and the same undo
+        // slot is reused by later transactions, whose records must not be dropped. One entry per undo slot and
+        // thread, replaced as soon as the slot moves on to a newer transaction.
+        std::unordered_map<XidMap, Xid> committedXidTombstones;
         std::map<LobKey, uint8_t*> orphanedLobs;
 
     public:
@@ -87,6 +96,10 @@ namespace OpenLogReplicator {
         // "expected" guards against erasing an entry that meanwhile belongs to a newer transaction: with a
         // deferred commit (commit sorter) the same undo slot can be taken over before the flush happens.
         void dropTransaction(Xid xid, typeConId conId, uint16_t thread, const Transaction* expected = nullptr);
+        // Record that this Xid has committed: a second read of its redo is then dropped instead of waiting in
+        // Ctx::swappedMemoryInit() for the delivery of the transaction it belongs to. Called where the commit
+        // is handed to the commit sorter, the entry lives until the undo slot is taken over by a newer Xid.
+        void addCommittedTombstone(Xid xid, typeConId conId, uint16_t thread);
         void addTransactionChunk(Transaction* transaction, RedoLogRecord* redoLogRecord);
         void addTransactionChunk(Transaction* transaction, RedoLogRecord* redoLogRecord1, const RedoLogRecord* redoLogRecord2);
         void rollbackTransactionChunk(Transaction* transaction);
