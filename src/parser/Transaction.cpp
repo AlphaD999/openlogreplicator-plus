@@ -203,24 +203,24 @@ namespace OpenLogReplicator {
     }
 
     void Transaction::flush(Metadata* metadata, Builder* builder) {
-        metadata->ctx->swappedMemoryFlush(metadata->ctx->parserThread, swapKey());
+        metadata->ctx->swappedMemoryFlush(metadata->ctx->thread(), swapKey());
         bool opFlush;
         const uint64_t maxMessageMb = builder->getMaxMessageMb();
-        metadata->ctx->parserThread->contextSet(Thread::CONTEXT::TRAN, Thread::REASON::TRAN);
+        metadata->ctx->thread()->contextSet(Thread::CONTEXT::TRAN, Thread::REASON::TRAN);
         std::unique_lock const lckTransaction(metadata->mtxTransaction);
         std::unique_lock lckSchema(metadata->mtxSchema, std::defer_lock);
 
         if (opCodes == 0 || rollback) {
-            metadata->ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
+            metadata->ctx->thread()->contextSet(Thread::CONTEXT::CPU);
             return;
         }
         if (unlikely(metadata->ctx->isTraceSet(Ctx::TRACE::TRANSACTION)))
             metadata->ctx->logTrace(Ctx::TRACE::TRANSACTION, toString(metadata->ctx));
 
         if (system) {
-            metadata->ctx->parserThread->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::TRANSACTION_SYSTEM);
+            metadata->ctx->thread()->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::TRANSACTION_SYSTEM);
             lckSchema.lock();
-            metadata->ctx->parserThread->contextSet(Thread::CONTEXT::TRAN, Thread::REASON::TRAN);
+            metadata->ctx->thread()->contextSet(Thread::CONTEXT::TRAN, Thread::REASON::TRAN);
 
             if (unlikely(builder->systemTransaction != nullptr))
                 throw RedoLogException(50056, "system transaction already active");
@@ -234,9 +234,9 @@ namespace OpenLogReplicator {
         std::deque<const RedoLogRecord*> redo1;
         std::deque<const RedoLogRecord*> redo2;
 
-        const uint64_t mMax = metadata->ctx->swappedMemorySize(metadata->ctx->parserThread, swapKey());
+        const uint64_t mMax = metadata->ctx->swappedMemorySize(metadata->ctx->thread(), swapKey());
         for (uint64_t m = 0; m < mMax; ++m) {
-            auto* const tc = reinterpret_cast<TransactionChunk*>(metadata->ctx->swappedMemoryGet(metadata->ctx->parserThread, swapKey(), m));
+            auto* const tc = reinterpret_cast<TransactionChunk*>(metadata->ctx->swappedMemoryGet(metadata->ctx->thread(), swapKey(), m));
             uint64_t pos = 0;
             for (uint64_t i = 0; i < tc->elements; ++i) {
                 typeOp2 const op = *reinterpret_cast<const typeOp2*>(tc->buffer + pos);
@@ -549,7 +549,7 @@ namespace OpenLogReplicator {
                     transactionType = Format::TRANSACTION_TYPE::T_NONE;
 
                     for (auto k: deallocChunks)
-                        metadata->ctx->swappedMemoryRelease(metadata->ctx->parserThread, swapKey(), k);
+                        metadata->ctx->swappedMemoryRelease(metadata->ctx->thread(), swapKey(), k);
                     deallocChunks.clear();
                 }
             }
@@ -558,7 +558,7 @@ namespace OpenLogReplicator {
         }
 
         for (auto k: deallocChunks)
-            metadata->ctx->swappedMemoryRelease(metadata->ctx->parserThread, swapKey(), k);
+            metadata->ctx->swappedMemoryRelease(metadata->ctx->thread(), swapKey(), k);
         deallocChunks.clear();
 
         opCodes = 0;
@@ -573,7 +573,7 @@ namespace OpenLogReplicator {
             lckSchema.unlock();
         }
         builder->processCommit();
-        metadata->ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
+        metadata->ctx->thread()->contextSet(Thread::CONTEXT::CPU);
 
         // The transaction is delivered: its swap key is not needed any more and has to be dropped here. Leaving
         // it behind is what makes a duplicate parse of the same Xid (slice boundary, instance recovery) wait in
@@ -584,7 +584,7 @@ namespace OpenLogReplicator {
     }
 
     void Transaction::purge(Ctx* ctx) {
-        ctx->swappedMemoryRemove(ctx->parserThread, swapKey());
+        ctx->swappedMemoryRemove(ctx->thread(), swapKey());
         deallocChunks.clear();
 
         if (mergeBuffer != nullptr) {
@@ -607,7 +607,7 @@ namespace OpenLogReplicator {
                 " xid: " << xid.toString() <<
                 " flags: " << std::dec << begin << "/" << rollback << "/" << system <<
                 " op: " << std::dec << opCodes <<
-                " chunks: " << std::dec << ctx->swappedMemorySize(ctx->parserThread, swapKey()) <<
+                " chunks: " << std::dec << ctx->swappedMemorySize(ctx->thread(), swapKey()) <<
                 " sz: " << std::dec << size;
         return ss.str();
     }

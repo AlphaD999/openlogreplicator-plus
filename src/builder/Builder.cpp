@@ -53,7 +53,7 @@ namespace OpenLogReplicator {
 
         while (firstBuilderQueue != nullptr) {
             BuilderQueue* nextBuffer = firstBuilderQueue->next;
-            ctx->freeMemoryChunk(ctx->parserThread, Ctx::MEMORY::BUILDER, reinterpret_cast<uint8_t*>(firstBuilderQueue));
+            ctx->freeMemoryChunk(ctx->thread(), Ctx::MEMORY::BUILDER, reinterpret_cast<uint8_t*>(firstBuilderQueue));
             firstBuilderQueue = nextBuffer;
             --buffersAllocated;
         }
@@ -72,8 +72,8 @@ namespace OpenLogReplicator {
 
     void Builder::initialize() {
         buffersAllocated = 1;
-        firstBuilderQueue = reinterpret_cast<BuilderQueue*>(ctx->getMemoryChunk(ctx->parserThread, Ctx::MEMORY::BUILDER));
-        ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
+        firstBuilderQueue = reinterpret_cast<BuilderQueue*>(ctx->getMemoryChunk(ctx->thread(), Ctx::MEMORY::BUILDER));
+        ctx->thread()->contextSet(Thread::CONTEXT::CPU);
         firstBuilderQueue->id = 0;
         firstBuilderQueue->next = nullptr;
         firstBuilderQueue->data = reinterpret_cast<uint8_t*>(firstBuilderQueue) + sizeof(BuilderQueue);
@@ -2497,7 +2497,7 @@ namespace OpenLogReplicator {
 
         while (builderQueue->id < maxId) {
             BuilderQueue* nextBuffer = builderQueue->next;
-            ctx->freeMemoryChunk(ctx->parserThread, Ctx::MEMORY::BUILDER, reinterpret_cast<uint8_t*>(builderQueue));
+            ctx->freeMemoryChunk(ctx->thread(), Ctx::MEMORY::BUILDER, reinterpret_cast<uint8_t*>(builderQueue));
             builderQueue = nextBuffer;
         }
     }
@@ -2505,7 +2505,7 @@ namespace OpenLogReplicator {
     void Builder::releaseDdl() {
         while (ddlFirst != nullptr) {
             uint8_t* next = *reinterpret_cast<uint8_t**>(ddlFirst);
-            ctx->freeMemoryChunk(ctx->parserThread, Ctx::MEMORY::MISC, ddlFirst);
+            ctx->freeMemoryChunk(ctx->thread(), Ctx::MEMORY::MISC, ddlFirst);
             ddlFirst = next;
         }
         ddlLast = nullptr;
@@ -2524,7 +2524,7 @@ namespace OpenLogReplicator {
             }
 
             if (left == 0) {
-                uint8_t* ddlNew = ctx->getMemoryChunk(ctx->parserThread, Ctx::MEMORY::MISC, false);
+                uint8_t* ddlNew = ctx->getMemoryChunk(ctx->thread(), Ctx::MEMORY::MISC, false);
 
                 if (ddlLast != nullptr) {
                     auto** ddlNext = reinterpret_cast<uint8_t**>(ddlLast);
@@ -2564,11 +2564,20 @@ namespace OpenLogReplicator {
             if (!ctx->sorterTickTakenOver.exchange(true, std::memory_order_relaxed))
                 ctx->info(0, "the parser is blocked waiting for a swapped transaction to be delivered - the writer "
                              "takes the commit sorter tick over to release it (defect C)");
+            // Stage 1 of the accounting decoupling: the delivery below runs on this thread while the parser is
+            // blocked in swappedMemoryInit(), so the memory and the state it books have to be this thread's and
+            // not the parser's (ctx->thread() reads this). Residual, recorded on purpose: if the delivery
+            // releases the parser - the commit it waits for is the one being delivered - the parser can resume
+            // while the tick is still running and books to this thread as well until the flag is cleared. In
+            // that window the delivery and the parser also touch the builder concurrently; both still have to
+            // be serialized (stage 2).
+            ctx->accountThread.store(t, std::memory_order_relaxed);
             metadata->commitSorter->tick(ctx->sorterExecutor.get(), ctx->clock->getTimeUt(), ctx->idleThreadReleaseUs);
             // Waiting for the water-mark alone would leave the parser waiting forever: it lags the parsed position
             // by the commit that ends the parsed window (the commit SCN is the SCN of its redo record + 1) and
             // while the parser is blocked nothing publishes a higher one - see CommitSorter::flushLowestPending().
             metadata->commitSorter->flushLowestPending(ctx->sorterExecutor.get());
+            ctx->accountThread.store(nullptr, std::memory_order_relaxed);
         } else
             ctx->sorterTickTakenOver.store(false, std::memory_order_relaxed);
 

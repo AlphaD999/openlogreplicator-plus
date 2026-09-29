@@ -86,8 +86,8 @@ namespace OpenLogReplicator {
             group(newGroup),
             path(std::move(newPath)) {
         zero.clear();
-        lwnChunks[0] = ctx->getMemoryChunk(ctx->parserThread, Ctx::MEMORY::PARSER);
-        ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
+        lwnChunks[0] = ctx->getMemoryChunk(ctx->thread(), Ctx::MEMORY::PARSER);
+        ctx->thread()->contextSet(Thread::CONTEXT::CPU);
         auto* size = reinterpret_cast<uint64_t*>(lwnChunks[0]);
         *size = sizeof(uint64_t);
         lwnAllocated = 1;
@@ -97,13 +97,13 @@ namespace OpenLogReplicator {
 
     Parser::~Parser() {
         while (lwnAllocated > 0) {
-            ctx->freeMemoryChunk(ctx->parserThread, Ctx::MEMORY::PARSER, lwnChunks[--lwnAllocated]);
+            ctx->freeMemoryChunk(ctx->thread(), Ctx::MEMORY::PARSER, lwnChunks[--lwnAllocated]);
         }
     }
 
     void Parser::freeLwn() {
         while (lwnAllocated > 1) {
-            ctx->freeMemoryChunk(ctx->parserThread, Ctx::MEMORY::PARSER, lwnChunks[--lwnAllocated]);
+            ctx->freeMemoryChunk(ctx->thread(), Ctx::MEMORY::PARSER, lwnChunks[--lwnAllocated]);
         }
 
         auto* size = reinterpret_cast<uint64_t*>(lwnChunks[0]);
@@ -589,11 +589,11 @@ namespace OpenLogReplicator {
 
         const DbTable* table;
         {
-            ctx->parserThread->contextSet(Thread::CONTEXT::TRAN);
+            ctx->thread()->contextSet(Thread::CONTEXT::TRAN);
             std::unique_lock const lckTransaction(metadata->mtxTransaction);
             table = metadata->schema->checkTableDict(redoLogRecord1->obj);
         }
-        ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
+        ctx->thread()->contextSet(Thread::CONTEXT::CPU);
 
         if (table == nullptr) {
             if (!ctx->isFlagSet(Ctx::REDO_FLAGS::SCHEMALESS) && !ctx->isFlagSet(Ctx::REDO_FLAGS::SHOW_DDL)) {
@@ -624,12 +624,12 @@ namespace OpenLogReplicator {
 
     void Parser::appendToTransactionLob(RedoLogRecord* redoLogRecord1) {
         DbLob* lob;
-        ctx->parserThread->contextSet(Thread::CONTEXT::TRAN);
+        ctx->thread()->contextSet(Thread::CONTEXT::TRAN);
         {
             std::unique_lock const lckTransaction(metadata->mtxTransaction);
             lob = metadata->schema->checkLobDict(redoLogRecord1->dataObj);
         }
-        ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
+        ctx->thread()->contextSet(Thread::CONTEXT::CPU);
 
         if (lob == nullptr) {
             if (unlikely(ctx->isTraceSet(Ctx::TRACE::LOB)))
@@ -694,12 +694,12 @@ namespace OpenLogReplicator {
         }
 
         const DbTable* table;
-        ctx->parserThread->contextSet(Thread::CONTEXT::TRAN);
+        ctx->thread()->contextSet(Thread::CONTEXT::TRAN);
         {
             std::unique_lock const lckTransaction(metadata->mtxTransaction);
             table = metadata->schema->checkTableDict(redoLogRecord1->obj);
         }
-        ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
+        ctx->thread()->contextSet(Thread::CONTEXT::CPU);
 
         if (table == nullptr) {
             if (!ctx->isFlagSet(Ctx::REDO_FLAGS::SCHEMALESS)) {
@@ -752,12 +752,12 @@ namespace OpenLogReplicator {
         lastTransaction = transaction;
 
         const DbTable* table;
-        ctx->parserThread->contextSet(Thread::CONTEXT::TRAN);
+        ctx->thread()->contextSet(Thread::CONTEXT::TRAN);
         {
             std::unique_lock const lckTransaction(metadata->mtxTransaction);
             table = metadata->schema->checkTableDict(redoLogRecord1->obj);
         }
-        ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
+        ctx->thread()->contextSet(Thread::CONTEXT::CPU);
 
         if (table == nullptr) {
             if (!ctx->isFlagSet(Ctx::REDO_FLAGS::SCHEMALESS)) {
@@ -861,7 +861,7 @@ namespace OpenLogReplicator {
             (transaction->commitScn > metadata->firstSchemaScn && transaction->system)) {
             if (transaction->begin) {
                 transaction->flush(metadata, builder);
-                ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
+                ctx->thread()->contextSet(Thread::CONTEXT::CPU);
                 if (ctx->metrics != nullptr) {
                     if (transaction->rollback)
                         ctx->metrics->emitTransactionsRollbackOut(1);
@@ -915,7 +915,7 @@ namespace OpenLogReplicator {
         FileOffset minFileOffset;
         Xid minXid;
         transactionBuffer->checkpoint(minSequence, minFileOffset, minXid);
-        metadata->checkpoint(ctx->parserThread, event.thread, event.scn, event.timestamp, event.sequence, event.fileOffset, event.bytes,
+        metadata->checkpoint(ctx->thread(), event.thread, event.scn, event.timestamp, event.sequence, event.fileOffset, event.bytes,
                              minSequence, minFileOffset, minXid);
 
         if (ctx->stopCheckpoints > 0 && metadata->isNewData(event.scn, builder->lwnIdx)) {
@@ -984,12 +984,12 @@ namespace OpenLogReplicator {
             case 0x0B16: {
                 // Logminer support - KDOCMP
                 const DbTable* table;
-                ctx->parserThread->contextSet(Thread::CONTEXT::TRAN);
+                ctx->thread()->contextSet(Thread::CONTEXT::TRAN);
                 {
                     std::unique_lock const lckTransaction(metadata->mtxTransaction);
                     table = metadata->schema->checkTableDict(obj);
                 }
-                ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
+                ctx->thread()->contextSet(Thread::CONTEXT::CPU);
 
                 if (table == nullptr) {
                     if (!ctx->isFlagSet(Ctx::REDO_FLAGS::SCHEMALESS)) {
@@ -1072,12 +1072,12 @@ namespace OpenLogReplicator {
                                    std::to_string(redoLogRecord2->bdba) + "), offset: " + redoLogRecord1->fileOffset.toString());
 
         const DbTable* table;
-        ctx->parserThread->contextSet(Thread::CONTEXT::TRAN);
+        ctx->thread()->contextSet(Thread::CONTEXT::TRAN);
         {
             std::unique_lock const lckTransaction(metadata->mtxTransaction);
             table = metadata->schema->checkTableDict(obj);
         }
-        ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
+        ctx->thread()->contextSet(Thread::CONTEXT::CPU);
 
         if (table == nullptr) {
             if (!ctx->isFlagSet(Ctx::REDO_FLAGS::SCHEMALESS)) {
@@ -1153,12 +1153,12 @@ namespace OpenLogReplicator {
                                    std::to_string(redoLogRecord2->bdba) + "), offset: " + redoLogRecord1->fileOffset.toString());
 
         const DbLob* lob;
-        ctx->parserThread->contextSet(Thread::CONTEXT::TRAN);
+        ctx->thread()->contextSet(Thread::CONTEXT::TRAN);
         {
             std::unique_lock const lckTransaction(metadata->mtxTransaction);
             lob = metadata->schema->checkLobIndexDict(dataObj);
         }
-        ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
+        ctx->thread()->contextSet(Thread::CONTEXT::CPU);
 
         if (lob == nullptr && redoLogRecord2->opCode != 0x1A02) {
             if (unlikely(ctx->isTraceSet(Ctx::TRACE::LOB)))
@@ -1456,8 +1456,8 @@ namespace OpenLogReplicator {
                                 if (unlikely(lwnAllocated == maxLwnChunks()))
                                     throw RedoLogException(50052, "all " + std::to_string(maxLwnChunks()) + " lwn buffers allocated");
 
-                                lwnChunks[lwnAllocated++] = ctx->getMemoryChunk(ctx->parserThread, Ctx::MEMORY::PARSER);
-                                ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
+                                lwnChunks[lwnAllocated++] = ctx->getMemoryChunk(ctx->thread(), Ctx::MEMORY::PARSER);
+                                ctx->thread()->contextSet(Thread::CONTEXT::CPU);
                                 lwnAllocatedMax = std::max(lwnAllocated, lwnAllocatedMax);
                                 recordSize = reinterpret_cast<uint64_t*>(lwnChunks[lwnAllocated - 1]);
                                 *recordSize = sizeof(uint64_t);
@@ -1599,7 +1599,7 @@ namespace OpenLogReplicator {
                             transactionBuffer->checkpoint(minSequence, minFileOffset, minXid);
                             if (unlikely(ctx->isTraceSet(Ctx::TRACE::LWN)))
                                 ctx->logTrace(Ctx::TRACE::LWN, "* checkpoint: " + lwnScn.toString());
-                            metadata->checkpoint(ctx->parserThread, thread, lwnScn, lwnTimestamp, sequence,
+                            metadata->checkpoint(ctx->thread(), thread, lwnScn, lwnTimestamp, sequence,
                                                  FileOffset(currentBlock, reader->getBlockSize()),
                                                  static_cast<uint64_t>(currentBlock - lwnConfirmedBlock) * reader->getBlockSize(),
                                                  minSequence, minFileOffset, minXid);
@@ -1661,7 +1661,7 @@ namespace OpenLogReplicator {
 
                 // Free memory
                 if (redoBufferPos == ctx->memoryChunkSize) {
-                    reader->bufferFree(ctx->parserThread, redoBufferNum);
+                    reader->bufferFree(ctx->thread(), redoBufferNum);
                     reader->confirmReadData(confirmedBufferStart);
                 }
             }
@@ -1723,7 +1723,7 @@ namespace OpenLogReplicator {
 
                 reader->setRet(Reader::REDO_CODE::SHUTDOWN);
             } else {
-                if (reader->checkFinished(ctx->parserThread, confirmedBufferStart)) {
+                if (reader->checkFinished(ctx->thread(), confirmedBufferStart)) {
                     if (reader->getRet() == Reader::REDO_CODE::FINISHED && nextScn == Scn::none() && reader->getNextScn() != Scn::none())
                         nextScn = reader->getNextScn();
                     if (reader->getRet() == Reader::REDO_CODE::STOPPED || reader->getRet() == Reader::REDO_CODE::OVERWRITTEN)

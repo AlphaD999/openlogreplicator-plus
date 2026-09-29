@@ -205,8 +205,8 @@ namespace OpenLogReplicator {
                                        std::to_string(ctx->memoryChunksWriteBufferMax * Ctx::MEMORY_CHUNK_SIZE_MB) +
                                        ") is too small to fit a message with size: " +
                                        std::to_string(messageSize));
-            auto* nextBuffer = reinterpret_cast<BuilderQueue*>(ctx->getMemoryChunk(ctx->parserThread, Ctx::MEMORY::BUILDER));
-            ctx->parserThread->contextSet(Thread::CONTEXT::TRAN, Thread::REASON::TRAN);
+            auto* nextBuffer = reinterpret_cast<BuilderQueue*>(ctx->getMemoryChunk(ctx->thread(), Ctx::MEMORY::BUILDER));
+            ctx->thread()->contextSet(Thread::CONTEXT::TRAN, Thread::REASON::TRAN);
             nextBuffer->next = nullptr;
             nextBuffer->id = lastBuilderQueue->id + 1;
             nextBuffer->data = reinterpret_cast<uint8_t*>(nextBuffer) + sizeof(BuilderQueue);
@@ -227,13 +227,13 @@ namespace OpenLogReplicator {
             }
 
             {
-                ctx->parserThread->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::BUILDER_ROTATE);
+                ctx->thread()->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::BUILDER_ROTATE);
                 std::unique_lock const lck(mtx);
                 lastBuilderQueue->next = nextBuffer;
                 ++buffersAllocated;
                 lastBuilderQueue = nextBuffer;
             }
-            ctx->parserThread->contextSet(Thread::CONTEXT::TRAN, Thread::REASON::TRAN);
+            ctx->thread()->contextSet(Thread::CONTEXT::TRAN, Thread::REASON::TRAN);
         }
 
         void processValue(LobCtx* lobCtx, const XmlCtx* xmlCtx, const DbTable* table, typeCol col, const uint8_t* data, uint32_t size, FileOffset fileOffset,
@@ -1315,11 +1315,11 @@ namespace OpenLogReplicator {
 
         void flush() {
             {
-                ctx->parserThread->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::BUILDER_COMMIT);
+                ctx->thread()->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::BUILDER_COMMIT);
                 std::unique_lock const lck(mtx);
                 condNoWriterWork.notify_all();
             }
-            ctx->parserThread->contextSet(Thread::CONTEXT::TRAN, Thread::REASON::TRAN);
+            ctx->thread()->contextSet(Thread::CONTEXT::TRAN, Thread::REASON::TRAN);
             unconfirmedSize = 0;
         }
 

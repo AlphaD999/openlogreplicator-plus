@@ -93,7 +93,7 @@ namespace OpenLogReplicator {
                 }
 
                 {
-                    ctx->parserThread->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::TRANSACTION_DROP);
+                    ctx->thread()->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::TRANSACTION_DROP);
                     std::unique_lock const lck(mtx);
                     xidTransactionMap.erase(xidMap);
                 }
@@ -105,12 +105,12 @@ namespace OpenLogReplicator {
 
                 transaction = new Transaction(xid, conId, &orphanedLobs, xmlCtx, thread);
                 {
-                    ctx->parserThread->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::TRANSACTION_FIND);
+                    ctx->thread()->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::TRANSACTION_FIND);
                     std::unique_lock const lck(mtx);
                     xidTransactionMap.insert_or_assign(xidMap, transaction);
                 }
-                ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
-                ctx->swappedMemoryInit(ctx->parserThread, SwapKey{thread, conId, xid});
+                ctx->thread()->contextSet(Thread::CONTEXT::CPU);
+                ctx->swappedMemoryInit(ctx->thread(), SwapKey{thread, conId, xid});
 
                 if (dumpXidList.find(xid) != dumpXidList.end())
                     transaction->dump = true;
@@ -121,12 +121,12 @@ namespace OpenLogReplicator {
 
             transaction = new Transaction(xid, conId, &orphanedLobs, xmlCtx, thread);
             {
-                ctx->parserThread->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::TRANSACTION_FIND);
+                ctx->thread()->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::TRANSACTION_FIND);
                 std::unique_lock const lck(mtx);
                 xidTransactionMap.insert_or_assign(xidMap, transaction);
             }
-            ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
-            ctx->swappedMemoryInit(ctx->parserThread, SwapKey{thread, conId, xid});
+            ctx->thread()->contextSet(Thread::CONTEXT::CPU);
+            ctx->swappedMemoryInit(ctx->thread(), SwapKey{thread, conId, xid});
 
             if (dumpXidList.find(xid) != dumpXidList.end())
                 transaction->dump = true;
@@ -138,7 +138,7 @@ namespace OpenLogReplicator {
     void TransactionBuffer::dropTransaction(Xid xid, typeConId conId, uint16_t thread, const Transaction* expected) {
         const XidMap xidMap = makeXidMap(xid, conId, thread);
         {
-            ctx->parserThread->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::TRANSACTION_DROP);
+            ctx->thread()->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::TRANSACTION_DROP);
             std::unique_lock const lck(mtx);
             const auto& it = xidTransactionMap.find(xidMap);
             // With a deferred commit the same undo slot can already be taken over by the next transaction,
@@ -146,7 +146,7 @@ namespace OpenLogReplicator {
             if (it != xidTransactionMap.end() && (expected == nullptr || it->second == expected))
                 xidTransactionMap.erase(it);
         }
-        ctx->parserThread->contextSet(Thread::CONTEXT::CPU);
+        ctx->thread()->contextSet(Thread::CONTEXT::CPU);
     }
 
     void TransactionBuffer::addTransactionChunk(Transaction* transaction, RedoLogRecord* redoLogRecord) {
@@ -173,7 +173,7 @@ namespace OpenLogReplicator {
 
         // New block
         if (transaction->lastTc == nullptr || transaction->lastTc->size + chunkSize > dataBufferSize())
-            transaction->lastTc = reinterpret_cast<TransactionChunk*>(ctx->swappedMemoryGrow(ctx->parserThread, transaction->swapKey()));
+            transaction->lastTc = reinterpret_cast<TransactionChunk*>(ctx->swappedMemoryGrow(ctx->thread(), transaction->swapKey()));
 
         // Append to the chunk at the end
         auto* lastTc = transaction->lastTc;
@@ -234,7 +234,7 @@ namespace OpenLogReplicator {
 
         // New block
         if (transaction->lastTc == nullptr || transaction->lastTc->size + chunkSize > dataBufferSize())
-            transaction->lastTc = reinterpret_cast<TransactionChunk*>(ctx->swappedMemoryGrow(ctx->parserThread, transaction->swapKey()));
+            transaction->lastTc = reinterpret_cast<TransactionChunk*>(ctx->swappedMemoryGrow(ctx->thread(), transaction->swapKey()));
 
         // Append to the chunk at the end
         auto* lastTc = transaction->lastTc;
@@ -277,7 +277,7 @@ namespace OpenLogReplicator {
         if (likely(lastTc->elements > 0))
             return;
 
-        transaction->lastTc = reinterpret_cast<TransactionChunk*>(ctx->swappedMemoryShrink(ctx->parserThread, transaction->swapKey()));
+        transaction->lastTc = reinterpret_cast<TransactionChunk*>(ctx->swappedMemoryShrink(ctx->thread(), transaction->swapKey()));
     }
 
     void TransactionBuffer::mergeBlocks(uint8_t* mergeBuffer, RedoLogRecord* redoLogRecord1, const RedoLogRecord* redoLogRecord2) {

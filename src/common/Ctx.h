@@ -353,6 +353,19 @@ namespace OpenLogReplicator {
         typeTransactionSize transactionSizeMax{0};
         std::unordered_map<LobId, Xid> lobIdToXidMap;
         Thread* parserThread{nullptr};
+        // Stage 1 of the accounting decoupling: the thread the parse and the delivery path books its memory and
+        // its state to. It is the parser (the replicator) - parserThread - unless a thread that runs a delivery
+        // for it says otherwise: the writer sets this to itself for the duration of a defect C tick, so that
+        // the two threads never write the state of the same Thread object (which is what the old, hard wired
+        // parserThread did: the takeover ran Transaction::flush on the writer thread while the blocked parser
+        // was writing the same fields). Relaxed on purpose: it is read on hot paths and only has to be visible
+        // to the thread that wrote it.
+        std::atomic<Thread*> accountThread{nullptr};
+
+        [[nodiscard]] Thread* thread() const {
+            Thread* const t = accountThread.load(std::memory_order_relaxed);
+            return t != nullptr ? t : parserThread;
+        }
         Thread* writerThread{nullptr};
         // Defect C: while the parser is blocked in swappedMemoryInit() it can not drive the commit sorter, and
         // the transaction it waits for is released by exactly that flush - the two wait on each other. The
