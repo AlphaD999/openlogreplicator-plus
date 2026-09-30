@@ -46,6 +46,7 @@ namespace OpenLogReplicator {
     }
 
     void TransactionBuffer::purge() {
+        std::lock_guard const lck(mtx);
         for (const auto& [_, transaction]: xidTransactionMap) {
             transaction->purge(ctx);
             delete transaction;
@@ -344,6 +345,14 @@ namespace OpenLogReplicator {
     }
 
     void TransactionBuffer::checkpoint(Seq& minSequence, FileOffset& minFileOffset, Xid& minXid) {
+        // The walk has to hold the lock the parser takes around its inserts and erases: the same call is also
+        // executed by the delivering thread - CommitSorter::tick() -> flushUpTo() -> Parser::executeCheckpoint()
+        // runs on the writer since the delivery can be driven by it ("stage 3") - so without the lock the loop
+        // iterated a map that the parser was rehashing underneath it and dereferenced a Transaction that
+        // dropTransaction had already erased (production: signal in this loop, "ERROR 10014 stacktrace ...").
+        // With the lock the erase (and the delete that follows it) of a concurrent dropTransaction waits until
+        // the walk is over, so every element seen here is live for the whole loop.
+        std::lock_guard const lck(mtx);
         for (const auto& [_, transaction]: xidTransactionMap) {
             if (transaction->beginSequence < minSequence) {
                 minSequence = transaction->beginSequence;
