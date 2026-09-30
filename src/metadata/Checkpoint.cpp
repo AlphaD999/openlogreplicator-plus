@@ -284,6 +284,11 @@ namespace OpenLogReplicator {
                 metadata->writeCheckpoint(this, false);
                 metadata->deleteOldCheckpoints(this);
 
+                // Independent of the reader: a stall in the archive list query or in the open of an archive is a
+                // single blocking call and can not report itself. This thread wakes up ten times a second and
+                // does it instead (warning 60053).
+                ctx->slowOpWatchdog();
+
                 if (ctx->hardShutdown)
                     break;
 

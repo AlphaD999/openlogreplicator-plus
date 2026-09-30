@@ -424,6 +424,26 @@ namespace OpenLogReplicator {
         // indistinguishable from an idle run (warning 60050).
         static constexpr uint64_t SWAP_WAIT_REPORT_US{30000000};
 
+        // Telemetry of an operation that is a single blocking call and can be stuck inside it: the archived redo
+        // log list query on the connection that holds the list, and the open of an archive through the mount of
+        // its diskgroup. Such a call logs nothing at all while it does not return, so a stalled run looks exactly
+        // like an idle one (production: four threads silent for eleven minutes after the archives were already
+        // listed on the standby, then everything resumed at once). The operation publishes itself here while it
+        // is in flight - warning 60053 is emitted from Ctx::slowOpWatchdog() by a thread that is not the one
+        // blocked - and reports its total duration when it finally leaves (warning 60054).
+        // Only one such operation can be in flight at a time: they are all issued from the same loop.
+        static constexpr uint64_t SLOW_OP_REPORT_US{60000000};
+        // Reminder interval of warning 60053 while the operation still has not returned
+        static constexpr uint64_t SLOW_OP_REMIND_US{600000000};
+        static constexpr uint16_t SLOW_OP_NONE{0};
+        static constexpr uint16_t SLOW_OP_ARCH_LIST{1};
+        static constexpr uint16_t SLOW_OP_ARCH_OPEN{2};
+        std::atomic<uint16_t> slowOpKind{SLOW_OP_NONE};
+        std::atomic<uint64_t> slowOpSinceUs{0};
+        std::atomic<uint64_t> slowOpReportedUs{0};
+        mutable std::mutex slowOpMtx;
+        std::string slowOpDetail;
+
         // Per transaction swap storage, keyed by (thread, conId, xid) - see SwapKey
         std::unordered_map<SwapKey, SwapChunk*, SwapKeyHash> swapChunks;
         // Keys whose swap file still has to be unlinked, each together with the entry it was queued for. The
@@ -844,6 +864,32 @@ namespace OpenLogReplicator {
         void logTraceInt(TRACE mask, const std::string& message) const;
         void printMemoryUsageHWM() const;
         void printMemoryUsageCurrent() const;
+
+        void slowOpBegin(uint16_t kind, const std::string& detail);
+        void slowOpEnd(uint16_t kind);
+        // Called from a thread that is not the one that issued the operation (the checkpoint thread): reports
+        // warning 60053 while it is still in flight, so the stall is visible in the log while it happens.
+        void slowOpWatchdog();
+        static const char* slowOpName(uint16_t kind);
+
+        // RAII: publishes the operation while it is in flight and reports its duration on every path out,
+        // including an exception - an error must not leave a stale "in flight" record behind.
+        class SlowOp {
+            Ctx* ctx;
+            uint16_t kind;
+
+        public:
+            SlowOp(Ctx* newCtx, uint16_t newKind, const std::string& detail): ctx(newCtx), kind(newKind) {
+                ctx->slowOpBegin(kind, detail);
+            }
+
+            ~SlowOp() {
+                ctx->slowOpEnd(kind);
+            }
+
+            SlowOp(const SlowOp&) = delete;
+            SlowOp& operator=(const SlowOp&) = delete;
+        };
     };
 }
 

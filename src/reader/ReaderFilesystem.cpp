@@ -87,6 +87,11 @@ namespace OpenLogReplicator {
     Reader::REDO_CODE ReaderFilesystem::redoOpen() {
         struct stat fileStat{};
 
+        // The archive is opened through its filesystem bridge (the mount of the ASM diskgroup): stat() and open()
+        // are answered by that bridge, so a stalled query on its side blocks here with no error and no log line.
+        // Reports itself as warning 60053/60054.
+        const Ctx::SlowOp slowOp(ctx, Ctx::SLOW_OP_ARCH_OPEN, fileName);
+
         contextSet(CONTEXT::OS, REASON::OS);
         const int statRet = stat(fileName.c_str(), &fileStat);
         contextSet(CONTEXT::CPU);

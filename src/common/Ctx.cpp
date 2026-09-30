@@ -1053,6 +1053,82 @@ namespace OpenLogReplicator {
         logTrace(TRACE::THREADS, "main loop end");
     }
 
+    const char* Ctx::slowOpName(uint16_t kind) {
+        switch (kind) {
+            case SLOW_OP_ARCH_LIST:
+                return "the archived redo log list query";
+
+            case SLOW_OP_ARCH_OPEN:
+                return "the open of an archived redo log";
+
+            default:
+                return "an operation";
+        }
+    }
+
+    void Ctx::slowOpBegin(uint16_t kind, const std::string& detail) {
+        {
+            std::lock_guard const lck(slowOpMtx);
+            slowOpDetail = detail;
+        }
+        slowOpReportedUs.store(0);
+        slowOpSinceUs.store(clock->getTimeUt());
+        slowOpKind.store(kind);
+    }
+
+    void Ctx::slowOpEnd(uint16_t kind) {
+        if (slowOpKind.load() != kind)
+            return;
+
+        const uint64_t since = slowOpSinceUs.load();
+        const uint64_t now = clock->getTimeUt();
+        slowOpKind.store(SLOW_OP_NONE);
+        slowOpSinceUs.store(0);
+        slowOpReportedUs.store(0);
+
+        if (since == 0 || now <= since || now - since < SLOW_OP_REPORT_US)
+            return;
+
+        std::string detail;
+        {
+            std::lock_guard const lck(slowOpMtx);
+            detail = slowOpDetail;
+        }
+        warning(60054, std::string(slowOpName(kind)) + " (" + detail + ") returned after: " +
+                std::to_string((now - since) / 1000000) + " s - a blocking call stuck that long is what a stalled "
+                "run looks like: no archive is read and nothing else is logged while it is in flight");
+    }
+
+    void Ctx::slowOpWatchdog() {
+        const uint16_t kind = slowOpKind.load();
+        if (kind == SLOW_OP_NONE)
+            return;
+
+        const uint64_t since = slowOpSinceUs.load();
+        if (since == 0)
+            return;
+
+        const uint64_t now = clock->getTimeUt();
+        if (now <= since || now - since < SLOW_OP_REPORT_US)
+            return;
+
+        const uint64_t reported = slowOpReportedUs.load();
+        if (reported != 0 && now < reported + SLOW_OP_REMIND_US)
+            return;
+        slowOpReportedUs.store(now);
+
+        std::string detail;
+        {
+            std::lock_guard const lck(slowOpMtx);
+            detail = slowOpDetail;
+        }
+        warning(60053, std::string(slowOpName(kind)) + " (" + detail + ") has not returned for: " +
+                std::to_string((now - since) / 1000000) + " s - it is still in flight" +
+                (reported == 0 ? std::string("; the thread is inside this one call, so nothing else can move and "
+                                             "nothing else is logged - check the database connection and, for an "
+                                             "\"asm\" archive, the filesystem bridge of the mount") : std::string()));
+    }
+
     void Ctx::printStacktrace() {
         void* array[128];
         int size;

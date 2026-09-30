@@ -1809,6 +1809,12 @@ namespace OpenLogReplicator {
             sequenceStart = replicator->metadata->sequence;
 
         {
+            // This query is the arrival gate of every archive: while it does not return, no archive is read and
+            // nothing is logged (production: four threads silent for eleven minutes although the standby had the
+            // archives listed minutes earlier). Reports itself as warning 60053/60054.
+            const Ctx::SlowOp slowOp(replicator->ctx, Ctx::SLOW_OP_ARCH_LIST,
+                                     "archived redo log list on the connection that holds the list");
+
             const std::string_view listStatement = replicator->ctx->asmArchives
                     ? SQL_GET_ARCHIVE_LOG_LIST_ASM : SQL_GET_ARCHIVE_LOG_LIST;
 
