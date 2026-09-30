@@ -516,6 +516,7 @@ namespace OpenLogReplicator {
                     "refresh-interval-us",
                     "ddl-filter",
                     "schema-change-topic",
+                    "skip-unreadable-archive",
                     "slice-pending-commits",
                     "state",
                     "thread-inactive-us",
@@ -1106,6 +1107,12 @@ namespace OpenLogReplicator {
                     throw ConfigurationException(30001, "bad JSON, invalid \"arch-read-tries\" value: " +
                                                  std::to_string(ctx->archReadTries) + ", expected: one of: {1 .. 1000000000}");
             }
+
+            // An archive that cannot be opened after "arch-read-tries" attempts is fatal (10009) by default.
+            // With 1, the archive is skipped instead: 10074 reports the thread and the sequence that are not
+            // delivered and the process keeps reading the other archives (see Ctx::skipUnreadableArchive).
+            if (sourceJson.HasMember("skip-unreadable-archive"))
+                ctx->skipUnreadableArchive = (Ctx::getJsonFieldU(configFileName, sourceJson, "skip-unreadable-archive") != 0);
 
             // Archive slicing for RAC sources: bounds the transaction memory kept by the commit sorter (one
             // chunk per finished transaction that waits for the low-water-mark over the redo threads)

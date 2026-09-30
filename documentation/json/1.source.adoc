@@ -135,6 +135,14 @@ An instance that archives nothing for a long time (no log switches) would otherw
 _WARNING:_ with this parameter set the global SCN order is no longer guaranteed for the transactions of the released thread: if it delivers redo with an SCN below what has already been written, its transactions are written after transactions with a higher SCN.
 A release is reported with warning 60045.
 
+|`skip-unreadable-archive`
+|_integer_, min: 0, max: 1, default: 0
+|An archive whose header cannot be decoded - a file that is not a redo log at all, which is what a stale entry of the archive list, a file overwritten in ASM or a wrong `path-mapping` looks like - is otherwise fatal: the reader retries `arch-read-tries` times and then stops the process (error 10009).
+
+With this parameter set to 1 the archive is skipped explicitly instead: error 10074 names the thread and the sequence that are not delivered and the process keeps reading the next archived redo log of that thread. Only the skipped archive's position is advanced, the other threads and the other archives of the same thread are unaffected.
+
+_WARNING:_ the skipped archive's redo is lost downstream - the operator has to decide whether to repair the archive (and read it again by moving the source position back) or to accept the gap. Leave this at 0 when losing any redo is not acceptable: a stopped process is then at least visible.
+
 |`slice-pending-commits`
 |_integer_, min: 0, max: 10000000, default: 1024
 |With more than one redo thread (RAC): number of finished transactions waiting in the commit sorter for the low-water-mark at which the archive being parsed is sliced.

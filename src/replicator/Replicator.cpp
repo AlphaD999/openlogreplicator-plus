@@ -899,6 +899,10 @@ namespace OpenLogReplicator {
 
                 archReader->fileName = parser->path;
                 uint retry = ctx->archReadTries;
+                // Set when the archive is dropped instead of read (see 10074): the retry loop below breaks
+                // either on a successful open or on this flag, and the parser must not be parsed in the
+                // second case.
+                bool archiveSkipped = false;
 
                 while (true) {
                     if (ctx->softShutdown)
@@ -908,8 +912,24 @@ namespace OpenLogReplicator {
 
                     if (retry == 0) {
                         archReader->showHint(this, "", parser->path);
-                        throw RuntimeException(10009, "file: " + parser->path + " - failed to open after " +
-                                               std::to_string(ctx->archReadTries) + " tries");
+                        if (!ctx->skipUnreadableArchive)
+                            throw RuntimeException(10009, "file: " + parser->path + " - failed to open after " +
+                                                   std::to_string(ctx->archReadTries) + " tries");
+                        // Explicitly skip this one archive of this thread instead of stopping the process. Only
+                        // threadPos of this thread is advanced (setNextSequence defaults to thread 1, so the
+                        // thread has to be passed) and its saved offset is cleared - a leftover offset would
+                        // make the next archive of the thread start in the middle. Every other thread and every
+                        // other archive of this thread keeps being read.
+                        ctx->error(10009, "file: " + parser->path + " - failed to open after " +
+                                   std::to_string(ctx->archReadTries) + " tries");
+                        ctx->error(10074, "file: " + parser->path + " - thread: " + std::to_string(parser->thread) +
+                                   ", seq: " + parser->sequence.toString() + " - archive skipped (\"skip-unreadable-archive\"), "
+                                   "its redo is NOT delivered; reading continues with the next archived redo log of this thread");
+                        metadata->setNextSequence(parser->thread);
+                        metadata->saveFileOffset(parser->thread, FileOffset::zero());
+                        delete parser;
+                        archiveSkipped = true;
+                        break;
                     }
 
                     ctx->info(0, "archived redo log " + parser->path + " is not ready for read, sleeping " +
@@ -919,6 +939,9 @@ namespace OpenLogReplicator {
                     contextSet(CONTEXT::CPU);
                     --retry;
                 }
+
+                if (archiveSkipped)
+                    continue;
 
                 if (ctx->softShutdown)
                     break;
@@ -956,6 +979,20 @@ namespace OpenLogReplicator {
                     if (ret == Reader::REDO_CODE::STOPPED) {
                         delete parser;
                         break;
+                    }
+                    // A read or decode error inside the archive is fatal for the process as well (10047), which
+                    // makes a damaged archive a permanent outage. With "skip-unreadable-archive" the archive is
+                    // dropped and the thread moves on to its next archive, reporting what was not delivered.
+                    if (ctx->skipUnreadableArchive && (ret == Reader::REDO_CODE::ERROR_BAD_DATA || ret == Reader::REDO_CODE::ERROR_CRC ||
+                                                       ret == Reader::REDO_CODE::ERROR_READ || ret == Reader::REDO_CODE::ERROR_BLOCK)) {
+                        ctx->error(10074, "file: " + parser->path + " - thread: " + std::to_string(parser->thread) +
+                                   ", seq: " + parser->sequence.toString() + " - archive skipped after a read error: " +
+                                   std::string(Reader::REDO_MSG[static_cast<uint>(ret)]) + " (\"skip-unreadable-archive\"), "
+                                   "its redo is NOT delivered; reading continues with the next archived redo log of this thread");
+                        metadata->setNextSequence(parser->thread);
+                        metadata->saveFileOffset(parser->thread, FileOffset::zero());
+                        delete parser;
+                        continue;
                     }
                     throw RuntimeException(10047, "archive log processing returned: " + std::string(Reader::REDO_MSG[static_cast<uint>(ret)]) + ", code: " +
                                            std::to_string(static_cast<uint>(ret)));

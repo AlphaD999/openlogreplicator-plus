@@ -149,6 +149,7 @@ namespace OpenLogReplicator {
                     "redo-read-sleep-us",
                     "redo-verify-delay-us",
                     "refresh-interval-us",
+                    "skip-unreadable-archive",
                     "transaction-max-mb"
                 };
                 Ctx::checkJsonFields(configFileName, sourceJson, sourceNames);

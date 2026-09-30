@@ -341,6 +341,13 @@ namespace OpenLogReplicator {
         std::atomic<uint> dumpRedoLog{0};
         std::atomic<uint> dumpRawData{0};
         uint archReadTries{10};
+        // An archive whose header cannot be decoded (a file that is not a redo log at all: a stale entry of the
+        // archive list, a file that was overwritten in ASM, a wrong path mapping) is otherwise fatal: the reader
+        // retries archReadTries times and then stops the whole process (10009), so the operator has to restart
+        // it and skip that archive by hand - and a restart without a checkpoint starts from "now", which drops
+        // every archive in between. With this option the archive is skipped explicitly instead: 10074 names the
+        // thread and the sequence, the process keeps running and only that archive's redo is not delivered.
+        bool skipUnreadableArchive{false};
 
         typeCol columnLimit{COLUMN_LIMIT};
 

@@ -406,3 +406,10 @@ Alternatively, if the archived redo logs are meant to stay in ASM and are reache
 
 The source database runs in RAC mode with `arch-source` = `asm`, but no archived redo log row with an ASM path (`+...`) was found in `SYS.V_$ARCHIVED_LOG`.
 Remediation: Check that the archiver is running and that at least one archived redo log exists, then archive the current logs (`ALTER SYSTEM ARCHIVE LOG CURRENT` on each node). If archived redo logs do exist, the reader is connected to the wrong database.
+
+==== code 10074: "file: <file name> - thread: <thread>, seq: <sequence> - archive skipped (\"skip-unreadable-archive\"), its redo is NOT delivered; reading continues with the next archived redo log of this thread"
+
+The archive could not be opened after `arch-read-tries` attempts (or was damaged beyond its header while being read) and `skip-unreadable-archive` is set, so the archive was dropped instead of stopping the process.
+The redo of this archive is not delivered: the transactions it contains are missing downstream.
+Either repair the archive (an unreadable header is what a file that is not a redo log at all looks like - a stale entry of the archive list, a file that was overwritten, a wrong `path-mapping`) and read it again by moving the source position back, or note the thread and sequence pair as an accepted gap.
+The read error form of this message names the reason instead of the retry count.
