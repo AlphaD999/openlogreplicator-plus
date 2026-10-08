@@ -1221,6 +1221,12 @@ namespace OpenLogReplicator {
     }
 
     void BuilderJson::appendDdlSource(const DbTable* table, typeObj obj, Scn scn) {
+        // Same rule as appendSource(): the "source" timestamps describe the database time of the transaction,
+        // not the time OLR built the message.
+        const uint64_t sourceMs = commitTimestamp.getVal() != 0
+                                  ? static_cast<uint64_t>(commitTimestamp.toEpoch(ctx->hostTimezone)) * 1000
+                                  : static_cast<uint64_t>(processTsUs) / 1000;
+
         append(std::string_view(R"("source":{)"));
         bool prev = false;
 
@@ -1234,7 +1240,7 @@ namespace OpenLogReplicator {
         append('"');
         comma(prev);
         append(std::string_view(R"("ts_ms":)"));
-        appendDec(static_cast<uint64_t>(processTsUs) / 1000);
+        appendDec(sourceMs);
         comma(prev);
         append(std::string_view(R"("snapshot":"false")"));
         comma(prev);
@@ -1267,10 +1273,10 @@ namespace OpenLogReplicator {
         append('"');
         comma(prev);
         append(std::string_view(R"("ts_us":)"));
-        appendDec(static_cast<uint64_t>(processTsUs));
+        appendDec(sourceMs * 1000);
         comma(prev);
         append(std::string_view(R"("ts_ns":)"));
-        appendDec(static_cast<uint64_t>(processTsUs) * 1000);
+        appendDec(sourceMs * 1000000);
         append('}');
     }
 
@@ -1288,6 +1294,15 @@ namespace OpenLogReplicator {
         const time_t beginTm = beginTimestamp.toEpoch(ctx->hostTimezone);
         const uint64_t beginMs = static_cast<uint64_t>(beginTm) * 1000;
 
+        // Debezium semantics: the timestamps inside "source" describe the time the change was made in the
+        // database, not the time OLR built the message. Consumers (and Flink's value.source.timestamp metadata)
+        // compare them with the envelope ts_ms - which stays the processing time, see processInsert/Update/Delete
+        // - to measure the database -> connector lag, so the two must not be the same value.
+        // Redo derived transaction timestamps have second precision (sub-second part is always zero). Fall back
+        // to the wall clock only when they are unknown, for example when OLR started in the middle of the
+        // transaction and has seen neither the BEGIN nor the COMMIT record of it.
+        const uint64_t sourceMs = commitTimestamp.getVal() != 0 ? commitMs : static_cast<uint64_t>(processTsUs) / 1000;
+
         append(std::string_view(R"(,"source":{)"));
         bool prev = false;
 
@@ -1301,7 +1316,7 @@ namespace OpenLogReplicator {
         append('"');
         comma(prev);
         append(std::string_view(R"("ts_ms":)"));
-        appendDec(static_cast<uint64_t>(processTsUs) / 1000);
+        appendDec(sourceMs);
         comma(prev);
         append(std::string_view(R"("snapshot":"false")"));
         comma(prev);
@@ -1312,10 +1327,10 @@ namespace OpenLogReplicator {
         append(std::string_view(R"("sequence":null)"));
         comma(prev);
         append(std::string_view(R"("ts_us":)"));
-        appendDec(static_cast<uint64_t>(processTsUs));
+        appendDec(sourceMs * 1000);
         comma(prev);
         append(std::string_view(R"("ts_ns":)"));
-        appendDec(static_cast<uint64_t>(processTsUs) * 1000);
+        appendDec(sourceMs * 1000000);
 
         comma(prev);
         if (table != nullptr) {
