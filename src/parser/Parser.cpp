@@ -1444,6 +1444,35 @@ namespace OpenLogReplicator {
         lwnCheckpointBlock = lwnConfirmedBlock;
         bool switchRedo = false;
 
+        // Pass diagnosis (trace only, the default path does not change): a pass is the unit a slice boundary cuts,
+        // and the only thing that tells "this archive was read twice" from "this archive was read once and the
+        // second read was dropped in the tombstone of TransactionBuffer" (see 60041/60057/60058). The two deltas
+        // below are what this pass added to the process wide counters; reported next to the (thread, sequence,
+        // block, scn) range it covered they say which archive at which position re-reads happen and what they cost.
+        // Called at every place a pass can end - "passReported" keeps it to one line per pass.
+        const uint64_t passRereadDrops = ctx->statCommittedRereadDrops.load(std::memory_order_relaxed);
+        const uint64_t passResumeFallbacks = ctx->statResumeFallbacks.load(std::memory_order_relaxed);
+        Scn passFirstScn = Scn::none();
+        bool passReported = false;
+        const auto passSummary = [&](const char* reason) {
+            if (likely(!ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
+                return;
+            passReported = true;
+
+            const uint64_t rereadDrops = ctx->statCommittedRereadDrops.load(std::memory_order_relaxed);
+            const uint64_t resumeFallbacks = ctx->statResumeFallbacks.load(std::memory_order_relaxed);
+            ctx->logTrace(Ctx::TRACE::CHECKPOINT, "pass summary - " + std::string(reason) + ": thread " +
+                          std::to_string(thread) + ", seq: " + sequence.toString() + ", blocks: " +
+                          std::to_string(startBlock) + " to " + std::to_string(currentBlock) + " (resumed at: " +
+                          std::to_string(passStartBlock) + "), scn: " +
+                          (passFirstScn == Scn::none() ? std::string("none") : passFirstScn.toString()) + " to " +
+                          (lwnScn == Scn::none() ? std::string("none") : lwnScn.toString()) + ", reread drops: " +
+                          std::to_string(rereadDrops - passRereadDrops) + " (total: " + std::to_string(rereadDrops) +
+                          "), resume fallbacks: " + std::to_string(resumeFallbacks - passResumeFallbacks) +
+                          ", pending commits: " + std::to_string(metadata->commitSorter != nullptr
+                                                                 ? metadata->commitSorter->getPendingEvents() : 0));
+        };
+
         while (!ctx->softShutdown) {
             // There is some work to do
             while (confirmedBufferStart < reader->getBufferEnd()) {
@@ -1467,6 +1496,10 @@ namespace OpenLogReplicator {
                         lwnEndBlock = currentBlock + lwnSize;
                         lwnScn = ctx->readScn(redoBlock + blockOffset + 40U);
                         lwnTimestamp = ctx->read32(redoBlock + blockOffset + 64U);
+
+                        // Lower end of the SCN range the pass summary reports (diagnosis, see below)
+                        if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)) && passFirstScn == Scn::none())
+                            passFirstScn = lwnScn;
 
                         if (ctx->metrics != nullptr) {
                             const int64_t diff = ctx->clock->getTimeT() - lwnTimestamp.toEpoch(ctx->hostTimezone);
@@ -1758,8 +1791,10 @@ namespace OpenLogReplicator {
 
             // Archive sliced: the position is saved and the scheduler will resume this parser after the other
             // redo threads have been parsed (and released the memory held by the commit sorter)
-            if (slicePending)
+            if (slicePending) {
+                passSummary("sliced");
                 break;
+            }
 
             // Processing finished
             if (!switchRedo && lwnScn > Scn::zero() && confirmedBufferStart == reader->getBufferEnd() && reader->getRet() == Reader::REDO_CODE::FINISHED) {
@@ -1834,6 +1869,8 @@ namespace OpenLogReplicator {
                             }
                         }
                     }
+                    passSummary(reader->getRet() == Reader::REDO_CODE::FINISHED ? "finished" :
+                                reader->getRet() == Reader::REDO_CODE::OVERWRITTEN ? "overwritten" : "stopped");
                     break;
                 }
             }
@@ -1893,6 +1930,11 @@ namespace OpenLogReplicator {
 
         builder->flush();
         freeLwn();
+
+        // A pass that ended in none of the places above (a shutdown, or an archive read to its end)
+        if (!passReported)
+            passSummary("done");
+
         return reader->getRet();
     }
 
