@@ -477,6 +477,11 @@ namespace OpenLogReplicator {
         // and sent the analysis of the production stalls in the wrong direction. Read in the 60050 message only.
         std::atomic<uint64_t> statPendingDeliveries{0};
 
+        // Wall clock in milliseconds. Ctx.h only forward declares Clock, so the accessor is defined in Ctx.cpp
+        // (same reason as the watchdog helpers below): the writer needs it for the per message delivery lag and
+        // the builder for BuilderMsg::commitMs.
+        [[nodiscard]] uint64_t getTimeMs() const;
+
         // Telemetry of an operation that is a single blocking call and can be stuck inside it: the archived redo
         // log list query on the connection that holds the list, and the open of an archive through the mount of
         // its diskgroup. Such a call logs nothing at all while it does not return, so a stalled run looks exactly

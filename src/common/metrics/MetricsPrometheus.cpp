@@ -251,6 +251,37 @@ namespace OpenLogReplicator {
             {"state", "aborting"}
         });
 
+        // delivery_lag_ms - the age of a message when the writer hands it over: the wall clock minus the commit
+        // time of the transaction in the database (the value the payload carries as source.commit_ts_ms). The
+        // sum pairs with messages_sent, so rate(delivery_lag_ms_sum)/rate(messages_sent) is the average over a
+        // window - a gauge alone can not be averaged.
+        deliveryLagMs = &prometheus::BuildGauge().Name("delivery_lag_ms")
+                                                 .Help("Age of a message when it is handed to the writer, in milliseconds: "
+                                                       "the wall clock minus the commit time of the transaction in the database")
+                                                 .Register(*registry);
+        deliveryLagMsGauge = &deliveryLagMs->Add({});
+        deliveryLagMsSum = &prometheus::BuildCounter().Name("delivery_lag_ms_sum")
+                                                      .Help("Accumulated delivery_lag_ms: divide by the messages_sent delta for the average")
+                                                      .Register(*registry);
+        deliveryLagMsSumCounter = &deliveryLagMsSum->Add({});
+
+        // pending_commits - the backlog: commits parsed and held by the commit sorter, waiting for delivery
+        pendingCommits = &prometheus::BuildGauge().Name("pending_commits")
+                                                  .Help("Commits parsed and buffered by the commit sorter, waiting for their delivery")
+                                                  .Register(*registry);
+        pendingCommitsGauge = &pendingCommits->Add({});
+
+        // committed_reread_drops / resume_fallbacks - the slicing diagnosis counters (also in the parse statistics
+        // line of the log)
+        committedRereadDrops = &prometheus::BuildCounter().Name("committed_reread_drops")
+                                                         .Help("Records of already committed transactions dropped because their redo was read a second time")
+                                                         .Register(*registry);
+        committedRereadDropsCounter = &committedRereadDrops->Add({});
+        resumeFallbacks = &prometheus::BuildCounter().Name("resume_fallbacks")
+                                                     .Help("Passes whose saved position was not an LWN head and which restarted their archive (warning 60058)")
+                                                     .Register(*registry);
+        resumeFallbacksCounter = &resumeFallbacks->Add({});
+
         // swap_operations_mb
         swapOperationsMb = &prometheus::BuildCounter().Name("swap_operations_mb")
                                                       .Help("Operations on swap space in MB")
@@ -583,6 +614,29 @@ namespace OpenLogReplicator {
     // messages_sent
     void MetricsPrometheus::emitMessagesSent(uint64_t counter) {
         messagesSentCounter->Increment(counter);
+    }
+
+    // delivery_lag_ms
+    void MetricsPrometheus::emitDeliveryLagMs(int64_t gauge) {
+        deliveryLagMsGauge->Set(gauge);
+    }
+
+    void MetricsPrometheus::emitDeliveryLagMsSum(uint64_t counter) {
+        deliveryLagMsSumCounter->Increment(counter);
+    }
+
+    // pending_commits
+    void MetricsPrometheus::emitPendingCommits(int64_t gauge) {
+        pendingCommitsGauge->Set(gauge);
+    }
+
+    // committed_reread_drops / resume_fallbacks
+    void MetricsPrometheus::emitCommittedRereadDrops(uint64_t counter) {
+        committedRereadDropsCounter->Increment(counter);
+    }
+
+    void MetricsPrometheus::emitResumeFallbacks(uint64_t counter) {
+        resumeFallbacksCounter->Increment(counter);
     }
 
     // service_state

@@ -91,6 +91,10 @@ namespace OpenLogReplicator {
         typeObj obj;
         typeTag tagSize;
         OUTPUT_BUFFER flags;
+        // Commit time of the transaction this message carries, in milliseconds since the epoch, the same value the
+        // payload reports as "source".commit_ts_ms (0 when it is unknown). Filled by builderBegin(), read by the
+        // writer to report the per message delivery lag (Metrics::emitDeliveryLagMs).
+        uint64_t commitMs{0};
 
         bool isFlagSet(OUTPUT_BUFFER flag) const {
             return (static_cast<uint>(flags) & static_cast<uint>(flag)) != 0;
@@ -345,6 +349,12 @@ namespace OpenLogReplicator {
             msg->id = id++;
             msg->obj = obj;
             msg->flags = flags;
+            // Delivery lag reference (see BuilderMsg::commitMs): the same rule as the payload, so the metric and
+            // the message tell the same story - the redo derived commit time, and the moment the message was
+            // built when it is unknown (a transaction OLR started reading in the middle of).
+            msg->commitMs = commitTimestamp.getVal() != 0
+                            ? static_cast<uint64_t>(commitTimestamp.toEpoch(ctx->hostTimezone)) * 1000
+                            : ctx->getTimeMs();
             msg->data = lastBuilderQueue->data + lastBuilderSize + sizeof(BuilderMsg);
         }
 

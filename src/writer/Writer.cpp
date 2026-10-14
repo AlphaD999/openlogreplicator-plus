@@ -32,6 +32,22 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include "Writer.h"
 
 namespace OpenLogReplicator {
+    // delivery_lag_ms (see Metrics.h): the age of a message at the moment the writer hands it over - the wall
+    // clock now minus the commit time of the transaction in the database (BuilderMsg::commitMs, the same value the
+    // payload reports as "source".commit_ts_ms). Clamped at zero: a negative value would mean the database clock is
+    // ahead of this host, which is clock skew and not a lag. Messages without a known commit time are the ones
+    // built while OLR was reading a transaction from its middle - their reference is the build time itself, so
+    // there is no age to report.
+    static void emitDeliveryLag(const Ctx* ctx, const BuilderMsg* msg) {
+        if (msg->commitMs == 0)
+            return;
+
+        const uint64_t nowMs = ctx->getTimeMs();
+        const int64_t lagMs = nowMs > msg->commitMs ? static_cast<int64_t>(nowMs - msg->commitMs) : 0;
+        ctx->metrics->emitDeliveryLagMs(lagMs);
+        ctx->metrics->emitDeliveryLagMsSum(static_cast<uint64_t>(lagMs));
+    }
+
     Writer::Writer(Ctx* newCtx, std::string newAlias, std::string newDatabase, Builder* newBuilder, Metadata* newMetadata):
             Thread(newCtx, std::move(newAlias)),
             database(std::move(newDatabase)),
@@ -302,6 +318,7 @@ namespace OpenLogReplicator {
                         if (ctx->metrics != nullptr) {
                             ctx->metrics->emitBytesSent(msgSize);
                             ctx->metrics->emitMessagesSent(1);
+                            emitDeliveryLag(ctx, msg);
                         }
                     }
                     oldSize += size8;
@@ -340,6 +357,7 @@ namespace OpenLogReplicator {
                         if (ctx->metrics != nullptr) {
                             ctx->metrics->emitBytesSent(msgSize);
                             ctx->metrics->emitMessagesSent(1);
+                            emitDeliveryLag(ctx, msg);
                         }
                     }
                     break;

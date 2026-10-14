@@ -72,6 +72,10 @@ namespace OpenLogReplicator {
         }
     }
 
+    uint64_t Ctx::getTimeMs() const {
+        return clock->getTimeUt() / 1000;
+    }
+
     void Ctx::watchdogNote(uint16_t thread, uint64_t fileOffset, uint64_t pendingCommits) {
         if (watchdogUs == 0)
             return;

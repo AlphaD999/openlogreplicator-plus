@@ -27,6 +27,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include "../common/Ctx.h"
 #include "../common/exception/ConfigurationException.h"
 #include "../common/exception/RuntimeException.h"
+#include "../common/metrics/Metrics.h"
 #include "../common/DbTable.h"
 #include "../common/table/SysObj.h"
 #include "../common/table/SysUser.h"
@@ -280,6 +281,11 @@ namespace OpenLogReplicator {
         }
 
         try {
+            // Deltas of the monotonic diagnosis counters for the metrics: the interface increments, so what belongs
+            // to one interval is the difference to the last emission (see Metrics.h).
+            uint64_t lastRereadDrops = 0;
+            uint64_t lastResumeFallbacks = 0;
+
             while (!ctx->hardShutdown) {
                 metadata->writeCheckpoint(this, false);
                 metadata->deleteOldCheckpoints(this);
@@ -294,6 +300,19 @@ namespace OpenLogReplicator {
                 // which the parser can sit on the delivery mutex - so it is the second place that looks.
                 if (unlikely(ctx->watchdogUs > 0))
                     ctx->watchdogCheck(metadata->probeTransactionMutex());
+
+                // Pipeline metrics (see Metrics.h): the delivery backlog and the slicing diagnosis counters. This
+                // thread wakes ten times a second and is never blocked by a delivery, so a Prometheus scrape gets
+                // a fresh value from here. pending_commits is the mirror commit sorter keeps (Ctx.h).
+                if (ctx->metrics != nullptr) {
+                    const uint64_t rereadDrops = ctx->statCommittedRereadDrops.load(std::memory_order_relaxed);
+                    const uint64_t resumeFallbacks = ctx->statResumeFallbacks.load(std::memory_order_relaxed);
+                    ctx->metrics->emitCommittedRereadDrops(rereadDrops - lastRereadDrops);
+                    ctx->metrics->emitResumeFallbacks(resumeFallbacks - lastResumeFallbacks);
+                    lastRereadDrops = rereadDrops;
+                    lastResumeFallbacks = resumeFallbacks;
+                    ctx->metrics->emitPendingCommits(static_cast<int64_t>(ctx->statPendingDeliveries.load(std::memory_order_relaxed)));
+                }
 
                 if (ctx->hardShutdown)
                     break;

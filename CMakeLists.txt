@@ -145,7 +145,18 @@ if (WITH_RDKAFKA)
 endif ()
 
 if (WITH_PROMETHEUS)
-    target_link_libraries(OpenLogReplicator prometheus-cpp-core prometheus-cpp-pull)
+    # A static install of prometheus-cpp carries civetweb (the HTTP server of the pull library) as its own
+    # libraries: link them when they are there, exactly like the static zstd above. The group keeps the order
+    # safe - pull references core and civetweb, and a static archive is only searched once.
+    find_library(PROMETHEUS_CIVETWEB_LIB NAMES civetweb PATHS ${WITH_PROMETHEUS}/lib NO_DEFAULT_PATH)
+    find_library(PROMETHEUS_CIVETWEB_CPP_LIB NAMES civetweb-cpp PATHS ${WITH_PROMETHEUS}/lib NO_DEFAULT_PATH)
+    set(PROMETHEUS_EXTRA_LIBS "")
+    if (PROMETHEUS_CIVETWEB_LIB AND PROMETHEUS_CIVETWEB_CPP_LIB)
+        set(PROMETHEUS_EXTRA_LIBS ${PROMETHEUS_CIVETWEB_CPP_LIB} ${PROMETHEUS_CIVETWEB_LIB})
+    endif ()
+    message(STATUS "Prometheus: ${WITH_PROMETHEUS}, extra libraries: ${PROMETHEUS_EXTRA_LIBS}")
+    target_link_libraries(OpenLogReplicator -Wl,--start-group prometheus-cpp-pull prometheus-cpp-core
+            ${PROMETHEUS_EXTRA_LIBS} -Wl,--end-group)
 endif ()
 
 if (WITH_PROTOBUF)
@@ -159,7 +170,9 @@ if (WITH_PROTOBUF)
     target_link_libraries(StreamClient Threads::Threads)
 
     if (WITH_PROMETHEUS)
-        target_link_libraries(StreamClient prometheus-cpp-core prometheus-cpp-pull)
+        # Same group and same extra libraries as OpenLogReplicator above
+        target_link_libraries(StreamClient -Wl,--start-group prometheus-cpp-pull prometheus-cpp-core
+                ${PROMETHEUS_EXTRA_LIBS} -Wl,--end-group)
     endif ()
 
     if (WITH_ZEROMQ)

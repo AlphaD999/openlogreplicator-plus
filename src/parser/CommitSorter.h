@@ -135,6 +135,11 @@ class Thread;
         // type in this header (Ctx.h includes it).
         [[nodiscard]] uint64_t getPendingEvents() const;
 
+        // Mirror of pendingEvents into Ctx::statPendingDeliveries, called with sorterMtx held whenever the value
+        // changes (also defined in CommitSorter.cpp: Ctx is incomplete here). Warning 60050 and the pending_commits
+        // metric read that mirror without taking the sorter lock - a delivery may be in flight and call back in.
+        void syncPendingEvents() const;
+
         // Diagnostics only (warning 60047): the per thread watermarks, with the threads that do not hold back
         // the low-water-mark any more marked accordingly
         [[nodiscard]] std::string getThreadWatermarksText() const;

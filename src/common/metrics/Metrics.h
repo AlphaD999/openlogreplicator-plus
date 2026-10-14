@@ -149,6 +149,23 @@ namespace OpenLogReplicator {
         virtual void emitTransactionsRollbackPartial(uint64_t counter) = 0;
         virtual void emitTransactionsCommitSkip(uint64_t counter) = 0;
         virtual void emitTransactionsRollbackSkip(uint64_t counter) = 0;
+
+        // delivery_lag_ms: the age of a message at the moment the writer hands it over, in milliseconds - the
+        // wall clock at the send minus the commit time of the transaction in the database, which is the value the
+        // payload carries as "source".commit_ts_ms. It is the delivery side counterpart of checkpoint_lag (which
+        // is the parse side): a rising delivery_lag_ms while checkpoint_lag stays flat means the parser keeps up
+        // and the delivery or the consumer is the bottleneck.
+        virtual void emitDeliveryLagMs(int64_t gauge) = 0;
+        // delivery_lag_ms_sum: the same value accumulated, so that rate(delivery_lag_ms_sum)/rate(messages_sent)
+        // gives the average lag over a window (a gauge can not be averaged by Prometheus).
+        virtual void emitDeliveryLagMsSum(uint64_t counter) = 0;
+        // pending_commits: commits parsed and held by the commit sorter, still waiting for their delivery. The
+        // backlog of the pipeline: growing while bytes_parsed keeps rising names the delivery side.
+        virtual void emitPendingCommits(int64_t gauge) = 0;
+        // committed_reread_drops / resume_fallbacks: the slicing diagnosis counters, also reported in the parse
+        // statistics line of the log, so that the same numbers are visible where the monitoring is scraped.
+        virtual void emitCommittedRereadDrops(uint64_t counter) = 0;
+        virtual void emitResumeFallbacks(uint64_t counter) = 0;
     };
 }
 

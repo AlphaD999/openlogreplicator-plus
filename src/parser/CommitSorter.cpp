@@ -38,6 +38,7 @@ namespace OpenLogReplicator {
         std::lock_guard const lck(sorterMtx);
         events[commitScn].push_back(event);
         ++pendingEvents;
+        syncPendingEvents();
     }
 
     void CommitSorter::enqueueCheckpoint(const CheckpointEvent& checkpoint) {
@@ -48,6 +49,7 @@ namespace OpenLogReplicator {
         std::lock_guard const lck(sorterMtx);
         events[checkpoint.scn].push_back(event);
         ++pendingEvents;
+        syncPendingEvents();
     }
 
     void CommitSorter::setThreadWatermark(uint16_t thread, Scn parsedScn, uint64_t currentTime, uint64_t idleReleaseUs) {
@@ -164,13 +166,17 @@ namespace OpenLogReplicator {
         };
     }
 
+    void CommitSorter::syncPendingEvents() const {
+        ctx->statPendingDeliveries.store(pendingEvents, std::memory_order_relaxed);
+    }
+
     uint64_t CommitSorter::getPendingEvents() const {
         std::lock_guard const lck(sorterMtx);
         // Mirror for warning 60050 (Ctx::statPendingDeliveries): that message is written by the parser while it
         // is blocked in Ctx::swappedMemoryInit, and it must not take this lock - a delivery may be in flight and
-        // call back into the sorter. This getter runs on the parse path (the slice decision) and in the 60047
-        // warning, so the mirror is fresh exactly when a stall has to be explained.
-        ctx->statPendingDeliveries.store(pendingEvents, std::memory_order_relaxed);
+        // call back into the sorter. Every change keeps the mirror in step (syncPendingEvents), so the
+        // pending_commits metric read by the checkpoint thread is just as fresh as this getter.
+        syncPendingEvents();
         return pendingEvents;
     }
 
@@ -266,6 +272,7 @@ namespace OpenLogReplicator {
                 events.erase(it);
             }
             pendingEvents -= ready.size();
+            syncPendingEvents();
         }
 
         for (Event* event: ready) {

@@ -160,6 +160,24 @@ namespace OpenLogReplicator {
         prometheus::Gauge* serviceStateFinishingGauge{nullptr};
         prometheus::Gauge* serviceStateAbortingGauge{nullptr};
 
+        // delivery_lag_ms: the age of the message when the writer hands it over (see Metrics.h). The sum pairs
+        // with messages_sent, so rate(delivery_lag_ms_sum)/rate(messages_sent) is the average over a window.
+        prometheus::Family<prometheus::Gauge>* deliveryLagMs{nullptr};
+        prometheus::Gauge* deliveryLagMsGauge{nullptr};
+        prometheus::Family<prometheus::Counter>* deliveryLagMsSum{nullptr};
+        prometheus::Counter* deliveryLagMsSumCounter{nullptr};
+
+        // pending_commits: commits buffered by the commit sorter, waiting for their delivery
+        prometheus::Family<prometheus::Gauge>* pendingCommits{nullptr};
+        prometheus::Gauge* pendingCommitsGauge{nullptr};
+
+        // committed_reread_drops / resume_fallbacks: the slicing diagnosis counters (also in the parse statistics
+        // line of the log)
+        prometheus::Family<prometheus::Counter>* committedRereadDrops{nullptr};
+        prometheus::Counter* committedRereadDropsCounter{nullptr};
+        prometheus::Family<prometheus::Counter>* resumeFallbacks{nullptr};
+        prometheus::Counter* resumeFallbacksCounter{nullptr};
+
     public:
         MetricsPrometheus(TAG_NAMES newTagNames, std::string newBind);
         ~MetricsPrometheus() override;
@@ -172,6 +190,15 @@ namespace OpenLogReplicator {
 
         // bytes parsed
         void emitBytesParsed(uint64_t counter) override;
+
+        // bytes_parsed_repeated / parse_passes_early / duplicate_parse_waits / duplicate_parse_wait_us: the re-read
+        // and swap wait diagnosis counters (see Metrics.h). Declared here: the implementation used them from the
+        // start but this header never declared them, which stayed invisible because the delivery is built without
+        // Prometheus - the omission surfaced only when the metrics module was compiled for the first time.
+        void emitBytesParsedRepeated(uint64_t counter) override;
+        void emitParsePassesEarly(uint64_t counter) override;
+        void emitDuplicateParseWaits(uint64_t counter) override;
+        void emitDuplicateParseWaitUs(uint64_t counter) override;
 
         // bytes read
         void emitBytesRead(uint64_t counter) override;
@@ -235,6 +262,17 @@ namespace OpenLogReplicator {
 
         // messages sent
         void emitMessagesSent(uint64_t counter) override;
+
+        // delivery_lag_ms
+        void emitDeliveryLagMs(int64_t gauge) override;
+        void emitDeliveryLagMsSum(uint64_t counter) override;
+
+        // pending_commits
+        void emitPendingCommits(int64_t gauge) override;
+
+        // committed_reread_drops / resume_fallbacks
+        void emitCommittedRereadDrops(uint64_t counter) override;
+        void emitResumeFallbacks(uint64_t counter) override;
 
         // swap_operations
         void emitSwapOperationsMbDiscard(uint64_t counter) override;
