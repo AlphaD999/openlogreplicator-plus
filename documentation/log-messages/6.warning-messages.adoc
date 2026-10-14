@@ -338,6 +338,20 @@ This used to be a fatal error (50070) and stopped the whole replicator, in the r
 the situation appearing. Each event is counted in the `swap_entry_missing` counter of the `parse statistics`
 line, so a run tells "it never happened" apart from "it happened and was survived".
 
+==== code 60058: "the saved position of this pass (block <number>) is not the head of an lwn record in: <file> - the pass restarts at the beginning of this archive (the records of the transactions that were already delivered are dropped, the open ones are read again)"
+
+With archive slicing on (`slice-pending-commits`), a pass saves the position it has to continue from and the next
+pass of that archive starts there. The saved position is meant to be the head of the next LWN record, but that is
+not a guarantee: it can be stale (the archive was already resumed and the position was consumed) or it can point
+at a block that is not an LWN head at all. Instead of ending the run - error 50051 did exactly that, measured in
+production: "invalid lwn scn: 11388144845283" right after "FINISHED (sliced), position: 7340032 / 13839360" - the
+pass restarts at the first block of the archive. The records of the transactions that were already delivered are
+dropped by the tombstone (`committed_reread_drops`), the transactions that are still open are read again, and the
+archive is read once more: a cost, not a fault.
+
+Counted in the `resume_fallbacks` counter of the `parse statistics` line. A delivery with slicing on should show
+zero here - anything above zero means the saved positions are not usable and the archive is being read again.
+
 
 At most one message per 30 seconds. A run that reports this has to be restarted (`pkill` +
 restart): the scheduler resumes from the checkpoint and the saved file offsets, so the data is not lost, it is
