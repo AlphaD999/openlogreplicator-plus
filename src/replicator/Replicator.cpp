@@ -834,6 +834,10 @@ namespace OpenLogReplicator {
                         }
                     }
 
+                    // Waiting for an archive is an expected wait, not a stalled parser: 60056 reports it, the
+                    // progress watchdog (60055) must stay quiet.
+                    ctx->watchdogNoteIdle();
+
                     if (unlikely(ctx->isTraceSet(Ctx::TRACE::ARCHIVE_LIST)))
                         ctx->logTrace(Ctx::TRACE::ARCHIVE_LIST, "archived redo log missing for seq: " + metadata->sequence.toString() +
                                       ", sleeping");

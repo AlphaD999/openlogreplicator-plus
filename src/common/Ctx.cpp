@@ -63,6 +63,73 @@ namespace OpenLogReplicator {
         tzset();
         logTimezone = -timezone;
         hostTimezone = -timezone;
+        // Watchdog (see Ctx.h): the environment variable is the for the test rig, the configuration key the
+        // production way; the environment wins so that a rig run can enable it without touching the config.
+        const char* const watchdogEnv = getenv("OLR_WATCHDOG");
+        if (watchdogEnv != nullptr) {
+            const uint64_t seconds = strtoull(watchdogEnv, nullptr, 10);
+            watchdogUs = seconds * 1000000;
+        }
+    }
+
+    void Ctx::watchdogNote(uint16_t thread, uint64_t fileOffset, uint64_t pendingCommits) {
+        if (watchdogUs == 0)
+            return;
+        watchdogProgressUt.store(clock->getTimeUt(), std::memory_order_relaxed);
+        watchdogThread.store(thread, std::memory_order_relaxed);
+        watchdogOffset.store(fileOffset, std::memory_order_relaxed);
+        watchdogPending.store(pendingCommits, std::memory_order_relaxed);
+    }
+
+    void Ctx::watchdogNoteIdle() {
+        if (watchdogUs == 0)
+            return;
+        watchdogProgressUt.store(clock->getTimeUt(), std::memory_order_relaxed);
+    }
+
+    void Ctx::watchdogCheck(const std::string& extraBusy) {
+        if (watchdogUs == 0)
+            return;
+
+        const uint64_t now = clock->getTimeUt();
+        const uint64_t progress = watchdogProgressUt.load(std::memory_order_relaxed);
+        if (progress == 0 || now - progress < watchdogUs)
+            return;
+
+        // Back off like the archive wait does: the first report at the threshold, then every doubling interval
+        // up to eight times the threshold, so a parser that is stuck for hours does not flood the log.
+        uint64_t interval = watchdogUs;
+        const uint64_t reports = watchdogWarnCount.load(std::memory_order_relaxed);
+        for (uint64_t n = 0; n < reports && interval < watchdogUs * 8; ++n)
+            interval *= 2;
+
+        uint64_t last = watchdogWarnUt.load(std::memory_order_relaxed);
+        if (last != 0 && now - last < interval)
+            return;
+        // Only one thread reports (the writer and the checkpoint thread both look at it)
+        if (!watchdogWarnUt.compare_exchange_strong(last, now, std::memory_order_relaxed))
+            return;
+        watchdogWarnCount.fetch_add(1, std::memory_order_relaxed);
+
+        std::ostringstream ss;
+        ss << "the parser made no progress for: " << ((now - progress) / 1000000) << " s (thread: "
+           << watchdogThread.load(std::memory_order_relaxed) << ", file offset: " << watchdogOffset.load(std::memory_order_relaxed)
+           << ", pending commits: " << watchdogPending.load(std::memory_order_relaxed);
+
+        // Name the locks that are held right now - the whole point of the probe: it tells which of the three
+        // waits that have no trace line of their own the parser is sitting in.
+        std::string busy;
+        if (!deliveryMtx.try_lock())
+            busy += " deliveryMtx";
+        else
+            deliveryMtx.unlock();
+        if (!swapMtx.try_lock())
+            busy += " swapMtx";
+        else
+            swapMtx.unlock();
+        busy += extraBusy;
+        ss << ") - locks held right now:" << (busy.empty() ? " none of the probed ones" : busy);
+        warning(60055, ss.str());
     }
 
     Ctx::~Ctx() {

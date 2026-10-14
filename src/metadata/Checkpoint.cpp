@@ -289,6 +289,12 @@ namespace OpenLogReplicator {
                 // does it instead (warning 60053).
                 ctx->slowOpWatchdog();
 
+                // Parser progress watchdog (see Ctx.h, warning 60055). This thread wakes ten times a second and
+                // keeps waking even when the writer is blocked in a delivery, which is exactly the state in
+                // which the parser can sit on the delivery mutex - so it is the second place that looks.
+                if (unlikely(ctx->watchdogUs > 0))
+                    ctx->watchdogCheck(metadata->probeTransactionMutex());
+
                 if (ctx->hardShutdown)
                     break;
 

@@ -2559,6 +2559,12 @@ namespace OpenLogReplicator {
         if (unlikely(ctx->isTraceSet(Ctx::TRACE::SLEEP)))
             ctx->logTrace(Ctx::TRACE::SLEEP, "Builder:sleepForWriterWork");
 
+        // Parser progress watchdog (see Ctx.h): the writer is idle here, which is exactly the state it is in
+        // while the parser is stuck. The transaction mutex is probed here because only this class knows the
+        // Metadata object; the delivery and swap mutexes are probed by Ctx::watchdogCheck itself.
+        if (unlikely(ctx->watchdogUs > 0))
+            ctx->watchdogCheck(metadata->probeTransactionMutex());
+
         // Stage 3, the independent delivery driver: the writer is idle right here (no message to deliver) and is
         // not part of the parse, so it drives the commit sorter whenever the sorter has something buffered. The
         // delivery no longer waits for the parser to reach one of its flush points - only the low-water-mark

@@ -119,6 +119,17 @@ namespace OpenLogReplicator {
         // Transaction schema consistency mutex
         std::mutex mtxTransaction;
 
+        // Parser progress watchdog probe (see Ctx.h, warning 60055): the delivery holds this mutex for the whole
+        // flush of a transaction, and a parser that waits for it has no trace line of its own - so the probe
+        // names it instead of letting the stall look like an idle run.
+        [[nodiscard]] std::string probeTransactionMutex() {
+            if (mtxTransaction.try_lock()) {
+                mtxTransaction.unlock();
+                return "";
+            }
+            return " mtxTransaction";
+        }
+
         // Checkpoint information
         std::mutex mtxCheckpoint;
         typeResetlogs resetlogs{0};

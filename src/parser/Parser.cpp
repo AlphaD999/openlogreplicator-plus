@@ -1442,6 +1442,10 @@ namespace OpenLogReplicator {
                         ((static_cast<uint64_t>(currentBlock) * reader->getBlockSize()) / ctx->memoryChunkSize) % ctx->memoryChunksReadBufferMax;
                 const uint8_t* redoBlock = reader->redoBufferList[redoBufferNum] + redoBufferPos;
 
+                // Watchdog (Ctx::watchdogCheck): where the parser was the last time it moved
+                ctx->watchdogNote(thread, static_cast<uint64_t>(currentBlock) * reader->getBlockSize(),
+                                  metadata->commitSorter != nullptr ? metadata->commitSorter->getPendingEvents() : 0);
+
                 blockOffset = 16U;
                 // New LWN block
                 if (currentBlock == lwnEndBlock) {

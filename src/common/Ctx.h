@@ -324,6 +324,29 @@ namespace OpenLogReplicator {
         // word - production waited 21 minutes for the next archive without a single warning). 0 disables it.
         // The report repeats with a doubling interval, capped at eight times this value.
         uint64_t archWaitWarnUs{60000000};
+
+        // Parser progress watchdog (diagnostic, off by default): "watchdog-us" > 0 (or the environment variable
+        // OLR_WATCHDOG in seconds, which wins) makes a thread that is idle report a parser that did not advance
+        // for that long. The report carries the position of the parser and a try_lock probe of the locks that
+        // can hold it: a stall inside Parser::parse() used to be completely silent - no trace line, no warning -
+        // while the delivery kept running, so it was indistinguishable from an idle run (measured in
+        // production: 1,020 s with zero parse progress and zero messages).
+        uint64_t watchdogUs{0};
+        std::atomic<uint64_t> watchdogProgressUt{0};
+        std::atomic<uint64_t> watchdogWarnUt{0};
+        std::atomic<uint64_t> watchdogWarnCount{0};
+        std::atomic<uint16_t> watchdogThread{0};
+        std::atomic<uint64_t> watchdogOffset{0};
+        std::atomic<uint64_t> watchdogPending{0};
+        // Called from the parse loop and from the places that wait for archives: an expected wait must not look
+        // like a stall. Cheap enough to be called per redo block while the watchdog is enabled. (Defined in
+        // Ctx.cpp: this header only forward declares Clock.)
+        void watchdogNote(uint16_t thread, uint64_t fileOffset, uint64_t pendingCommits);
+        // Refresh only the timestamp (a wait that is expected, e.g. no archive to read: 60056 reports it)
+        void watchdogNoteIdle();
+        // Report a parser without progress (warning 60055); "extraBusy" is what the caller's own lock probe
+        // found, the locks of this class are probed here.
+        void watchdogCheck(const std::string& extraBusy);
         // Archive slicing: when this many finished transactions wait in the commit sorter for the low-water-mark,
         // the current archive is sliced so that the other redo threads are parsed first. One memory chunk (1 MB)
         // is held per waiting transaction, so this bounds the memory used by the transactions of one archive.

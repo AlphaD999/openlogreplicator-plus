@@ -504,6 +504,7 @@ namespace OpenLogReplicator {
                     "arch-read-sleep-us",
                     "arch-read-tries",
                     "arch-wait-warn-us",
+                    "watchdog-us",
                     "debug",
                     "filter",
                     "flags",
@@ -1113,6 +1114,11 @@ namespace OpenLogReplicator {
             // at all is the silent case: warning 60056 reports it after "arch-wait-warn-us" microseconds.
             if (sourceJson.HasMember("arch-wait-warn-us"))
                 ctx->archWaitWarnUs = Ctx::getJsonFieldU64(configFileName, sourceJson, "arch-wait-warn-us");
+
+            // Parser progress watchdog (see Ctx.h): warning 60055 after a parser that made no progress for this
+            // long. 0 (the default) keeps it off; the environment variable OLR_WATCHDOG=<seconds> overrides it.
+            if (sourceJson.HasMember("watchdog-us"))
+                ctx->watchdogUs = Ctx::getJsonFieldU64(configFileName, sourceJson, "watchdog-us");
 
             // An archive that cannot be opened after "arch-read-tries" attempts is fatal (10009) by default.
             // With 1, the archive is skipped instead: 10074 reports the thread and the sequence that are not
