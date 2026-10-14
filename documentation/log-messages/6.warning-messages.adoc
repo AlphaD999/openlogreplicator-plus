@@ -296,6 +296,49 @@ current low-water-mark, the per thread watermarks (a thread released by `idle-th
 instance recovery is marked as such), how many archives are still in the list, how many were dropped as already
 parsed and how many are parked waiting for a missing predecessor.
 
+==== code 60055: "the parser made no progress for: <number> s (thread: <number>, file offset: <number>, pending commits: <number>) - locks held right now: <deliveryMtx|swapMtx|mtxTransaction|none of the probed ones>"
+
+Only reported when the parser progress watchdog is enabled (`watchdog-us` in the `source` element, or the
+environment variable `OLR_WATCHDOG` in seconds - it wins). It is meant to be switched on when a run has to be
+diagnosed; with the default (off) it does not cost more than a predictable branch per redo block.
+
+The parser did not advance for the configured time. The message carries the last position it was seen at (redo
+thread, file offset, commits waiting for delivery) and the result of a `try_lock` probe of the three locks that
+can hold it without a trace line of their own: `deliveryMtx` (a delivery is in flight, `CommitSorter::flushReady`),
+`mtxTransaction` (the schema/transaction mutex, held for a whole transaction flush) and `swapMtx` (the swap
+memory of the transactions). The probe is read only and released immediately; nothing about the call order
+changes.
+
+A parser waiting for the next archive of a thread is expected and is reported by 60056 instead - the watchdog
+stays quiet for it. The warning repeats with a doubling interval (capped at eight times the threshold).
+
+==== code 60056: "no archived redo log to read for: <number> s - the archive list source reports thread <number>: expected seq <number>, highest known seq <number>; ... (\"arch-wait-warn-us\")"
+
+Reported in archives-only mode when the archive list source (for example `V$ARCHIVED_LOG` on the standby) hands
+out no row for the sequence a redo thread needs, for longer than `arch-wait-warn-us` (microseconds, 1000000
+default, `source` element). It names, per redo thread, the sequence that thread needs and the highest sequence
+the source itself knows - so a source that is complete but does not advance (standby stopped applying, archive
+destination full, `MRP` stuck) is told apart from one that is behind. Repeated with a doubling interval; an INFO
+line is written when the sequence arrives ("... arrived after <number> s").
+
+Before this warning existed both cases were silent: only a `TRACE` line with the archive list was written, which
+is not enabled in production runs.
+
+==== code 60057: "the swap entry of transaction: <xid> (thread: <number>, conId: <number>) is already gone during \"<stage>\" (the same Xid was parsed a second time and took the key over, or the delayed cleanup of the previous owner ran first) - the swapped out data of that transaction is not available any more, the parse continues without it"
+
+The swap memory entry of a transaction that the parser (or the delivery) is working on has disappeared. That
+happens when the same Xid is parsed a second time and takes the swap key over, or when the delayed cleanup of the
+previous owner runs first. The entry carries the swapped out data of one transaction; once it is gone the answer
+to "read it back" is "there is none", so `swappedMemorySize` returns 0, `swappedMemoryGet` and
+`swappedMemoryShrink` return a null chunk and `swappedMemoryRelease` returns without doing anything - the parse
+goes on and the delivery order and content of every other transaction are untouched (the entry was gone before
+anything of this transaction was written out).
+
+This used to be a fatal error (50070) and stopped the whole replicator, in the reproduction rig within seconds of
+the situation appearing. Each event is counted in the `swap_entry_missing` counter of the `parse statistics`
+line, so a run tells "it never happened" apart from "it happened and was survived".
+
+
 At most one message per 30 seconds. A run that reports this has to be restarted (`pkill` +
 restart): the scheduler resumes from the checkpoint and the saved file offsets, so the data is not lost, it is
 only delayed.
