@@ -204,12 +204,18 @@ namespace OpenLogReplicator {
             if (unlikely(takenOver))
                 continue;
 
-            struct stat fileStat{};
+            // A swap file exists only for a transaction that was really written out. This replaces asking the
+            // filesystem about every delivered transaction: a stat() of a name that does not exist leaves a
+            // negative dentry in the kernel, and those are only reclaimed when memory gets tight (production:
+            // ~700 lookups/s, ~60M/day, ~18 GB of dentry cache holding no data at all).
+            if (filesOnDisk.erase(swapKey) == 0)
+                continue;
+
             const std::string fileName(swapPath + "/" + swapKey.fileNameSuffix() + ".swap");
-            if (stat(fileName.c_str(), &fileStat) == 0) {
-                if (unlink(fileName.c_str()) != 0)
-                    ctx->error(10010, "file: " + fileName + " - delete returned: " + strerror(errno));
-            }
+            // The file is registered as existing (swap() stored the key), so this is a plain delete; ENOENT is
+            // tolerated for the case that unswap() removed the file in between.
+            if (unlink(fileName.c_str()) != 0 && errno != ENOENT)
+                ctx->error(10010, "file: " + fileName + " - delete returned: " + strerror(errno));
         }
     }
 
@@ -378,6 +384,9 @@ namespace OpenLogReplicator {
                     sc->swappedMin = sc->swappedMax = -1;
                     if (unlink(fileName.c_str()) != 0)
                         throw RuntimeException(50072, "swap file: " + fileName + " - delete returned: " + strerror(errno));
+                    // The file is gone now: the cleanup must not look for it any more. The truncate branch
+                    // below keeps the file, so its key stays in the set.
+                    filesOnDisk.erase(swapKey);
                 } else {
                     --sc->swappedMax;
                     if (truncate(fileName.c_str(), (sc->swappedMax + 1) * ctx->memoryChunkSize) != 0)
@@ -445,6 +454,9 @@ namespace OpenLogReplicator {
             throw RuntimeException(50072, "swap file: " + fileName + " - write returned: " + strerror(errno));
         }
         close(fileDes);
+        // The file exists from here on. This is what makes cleanOldTransactions() delete it: a key that is not
+        // in the set has no file, so the cleanup does not have to ask the filesystem about it at all.
+        filesOnDisk.insert(swapKey);
         ++ctx->swappedMB;
         bool remove = false;
         uint64_t truncateSize(0);
@@ -472,6 +484,7 @@ namespace OpenLogReplicator {
         if (remove) {
             if (unlink(fileName.c_str()) != 0)
                 throw RuntimeException(50072, "swap file: " + fileName + " - delete returned: " + strerror(errno));
+            filesOnDisk.erase(swapKey);
             return false;
         }
         if (truncateSize > 0) {
