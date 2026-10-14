@@ -131,10 +131,9 @@ class Thread;
             return watermark != Scn::none() && parsedScn >= watermark;
         }
 
-        [[nodiscard]] uint64_t getPendingEvents() const {
-            std::lock_guard const lck(sorterMtx);
-            return pendingEvents;
-        }
+        // Defined in CommitSorter.cpp: it mirrors the value into Ctx for warning 60050, and Ctx is an incomplete
+        // type in this header (Ctx.h includes it).
+        [[nodiscard]] uint64_t getPendingEvents() const;
 
         // Diagnostics only (warning 60047): the per thread watermarks, with the threads that do not hold back
         // the low-water-mark any more marked accordingly

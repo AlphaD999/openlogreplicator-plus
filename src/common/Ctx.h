@@ -463,6 +463,12 @@ namespace OpenLogReplicator {
         // indistinguishable from an idle run (warning 60050).
         static constexpr uint64_t SWAP_WAIT_REPORT_US{30000000};
 
+        // Number of commits the sorter has buffered but not delivered yet, mirrored from the sorter by
+        // CommitSorter::getPendingEvents(). Warning 60050 used to report commitedXids.size() as "committed and
+        // waiting for delivery", which is a different thing (swap entries waiting for their file to be removed)
+        // and sent the analysis of the production stalls in the wrong direction. Read in the 60050 message only.
+        std::atomic<uint64_t> statPendingDeliveries{0};
+
         // Telemetry of an operation that is a single blocking call and can be stuck inside it: the archived redo
         // log list query on the connection that holds the list, and the open of an archive through the mount of
         // its diskgroup. Such a call logs nothing at all while it does not return, so a stalled run looks exactly

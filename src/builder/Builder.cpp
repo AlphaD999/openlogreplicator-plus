@@ -2596,6 +2596,15 @@ namespace OpenLogReplicator {
             t->contextSet(Thread::CONTEXT::WAIT, Thread::REASON::WRITER_NO_WORK);
             if (queueSize > 0)
                 condNoWriterWork.wait_for(lck, std::chrono::nanoseconds(nanoseconds));
+            else if (ctx->parserInSwapWait.load(std::memory_order_relaxed))
+                // Defect C: the parser is blocked in Ctx::swappedMemoryInit() waiting for the delivery of a
+                // transaction that holds the swap key it needs. The tick above (flushLowestPending) releases the
+                // buffered commits one group per call, so with the five second idle wait below the parser waits
+                // minutes for its key (measured in production: 1,020 s; in the rig: 318 pending commits and no
+                // progress for 8 minutes). While it is blocked, come back a hundred times a second instead: it is
+                // the same tick on the same path - only the rate the waiter can live with. The delivery itself
+                // stays serialized by Ctx::deliveryMtx, so nothing else changes.
+                condNoWriterWork.wait_for(lck, std::chrono::milliseconds(10));
             else
                 condNoWriterWork.wait_for(lck, std::chrono::seconds(5));
         }

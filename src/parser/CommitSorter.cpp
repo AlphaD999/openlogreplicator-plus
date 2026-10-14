@@ -164,6 +164,16 @@ namespace OpenLogReplicator {
         };
     }
 
+    uint64_t CommitSorter::getPendingEvents() const {
+        std::lock_guard const lck(sorterMtx);
+        // Mirror for warning 60050 (Ctx::statPendingDeliveries): that message is written by the parser while it
+        // is blocked in Ctx::swappedMemoryInit, and it must not take this lock - a delivery may be in flight and
+        // call back into the sorter. This getter runs on the parse path (the slice decision) and in the 60047
+        // warning, so the mirror is fresh exactly when a stall has to be explained.
+        ctx->statPendingDeliveries.store(pendingEvents, std::memory_order_relaxed);
+        return pendingEvents;
+    }
+
     void CommitSorter::flushReady(Executor* executor, Thread* deliveryThread) {
         // One delivery at a time over every path (stage 3: the writer drives the sorter as well as the parser):
         // the callbacks of flushUpTo() below run outside the sorter lock and write into the builder, so two

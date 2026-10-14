@@ -752,10 +752,14 @@ namespace OpenLogReplicator {
                     waitSince = now;
                 if (now >= waitSince + SWAP_WAIT_REPORT_US && (lastReport == 0 || now >= lastReport + SWAP_WAIT_REPORT_US)) {
                     warning(60050, "swap memory of transaction: " + swapKey.toString() + " is still held after " +
-                            std::to_string((now - waitSince) / 1000000) + " s of waiting for its delivery (swapped "
-                            "transactions: " + std::to_string(swapChunks.size()) + ", committed and waiting for "
-                            "delivery: " + std::to_string(commitedXids.size()) + ") - the same transaction is parsed "
-                            "twice (slice boundary / instance recovery), or its delivery is stalled (see 60045/60047)");
+                            std::to_string((now - waitSince) / 1000000) + " s of waiting for its delivery (swap entries: " +
+                            std::to_string(swapChunks.size()) + ", swap entries waiting for their file to be removed: " +
+                            std::to_string(commitedXids.size()) + ", commits waiting for delivery: " +
+                            std::to_string(statPendingDeliveries.load(std::memory_order_relaxed)) + ", waits so far: " +
+                            std::to_string(statDuplicateParseWaits.load(std::memory_order_relaxed)) + ") - the holder of the "
+                            "key is not deliverable right now (a re-parse of an Xid that is committed but not delivered "
+                            "yet), so the wait is bounded only by the rate at which the delivery is driven (see 60047 for "
+                            "the water-marks and the writer log for the sorter tick)");
                     lastReport = now;
                 }
 
