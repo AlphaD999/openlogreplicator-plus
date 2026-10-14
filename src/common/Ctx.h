@@ -444,6 +444,10 @@ namespace OpenLogReplicator {
         // afterwards (defect C). Reported as warning 60057 and counted here, so a run tells "it never happened"
         // from "it happened and was survived" - the same shape as swappedMemoryGrow does it with 60051.
         std::atomic<uint64_t> statSwapEntryMissing{0};
+        // Records of a transaction that has already committed, dropped because their redo was read a second
+        // time (the tombstone in TransactionBuffer). Counted so that a run tells "the redo was never read
+        // twice" from "it was, and the second read was dropped instead of delivering the rows again".
+        std::atomic<uint64_t> statCommittedRereadDrops{0};
         // "always" reports the line even when all four are zero (the end of a run: the zeros are the answer then).
         void reportParseStats(bool always = false);
         // One swap entry disappeared while the parser was still using it: counted and reported as warning 60057

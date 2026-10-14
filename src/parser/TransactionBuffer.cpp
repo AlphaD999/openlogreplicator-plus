@@ -61,9 +61,19 @@ namespace OpenLogReplicator {
     }
 
     void TransactionBuffer::addCommittedTombstone(Xid xid, typeConId conId, uint16_t thread) {
-        const XidMap xidMap = makeXidMap(xid, conId, thread);
+        const CommittedKey key{makeXidMap(xid, conId, thread), xid.sqn()};
+
         std::unique_lock const lck(mtx);
-        committedXidTombstones.insert_or_assign(xidMap, xid);
+        if (!committedXids.insert(key).second)
+            return;
+
+        committedXidOrder.push_back(key);
+        // Bound by count: the oldest commit forgets first. The re-parse window (the redo that is read a second
+        // time) is a few archives, so the last commits of a few minutes are what has to stay here.
+        while (committedXidOrder.size() > COMMITTED_XIDS_KEEP) {
+            committedXids.erase(committedXidOrder.front());
+            committedXidOrder.pop_front();
+        }
     }
 
     Transaction* TransactionBuffer::findTransaction(XmlCtx* xmlCtx, Xid xid, typeConId conId, uint16_t thread, bool old, bool add, bool rollback) {
@@ -71,15 +81,16 @@ namespace OpenLogReplicator {
 
         // The Xid has committed and its redo is being read a second time: the records are the ones the commit
         // sorter owns (already delivered, or queued), so they are dropped here. Waiting for that delivery
-        // instead is what used to block the parser on the swap key of its own transaction (defect C, 60050).
+        // instead is what used to block the parser on the swap key of its own transaction (defect C, 60050),
+        // and *not* dropping them here is what delivered whole transactions twice: the tombstone used to be one
+        // entry per undo slot, replaced as soon as the slot moved on, which a re-parse over thousands of
+        // transactions walks right past.
         {
             std::unique_lock const lck(mtx);
-            const auto tombstoneIt = committedXidTombstones.find(xidMap);
-            if (tombstoneIt != committedXidTombstones.end()) {
-                if (tombstoneIt->second == xid)
-                    return nullptr;
-                // The undo slot has moved on to another transaction: the tombstone is over.
-                committedXidTombstones.erase(tombstoneIt);
+            const auto committedIt = committedXids.find(CommittedKey{xidMap, xid.sqn()});
+            if (committedIt != committedXids.end()) {
+                ctx->statCommittedRereadDrops.fetch_add(1, std::memory_order_relaxed);
+                return nullptr;
             }
         }
 

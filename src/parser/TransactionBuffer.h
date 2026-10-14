@@ -20,10 +20,12 @@ If not, see <http://www.gnu.org/licenses/>. */
 #ifndef TRANSACTION_BUFFER_H_
 #define TRANSACTION_BUFFER_H_
 
+#include <deque>
 #include <map>
 #include <mutex>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "../common/Ctx.h"
 #include "../common/LobKey.h"
@@ -68,15 +70,45 @@ namespace OpenLogReplicator {
 
         std::mutex mtx;
         std::unordered_map<XidMap, Transaction*> xidTransactionMap;
-        // Tombstones of transactions that have committed. The same redo can be read a second time in one run:
-        // a pass that ends early (STOPPED/OVERWRITTEN) resumes at the last confirmed LWN boundary, so the redo
-        // between that boundary and the position the pass had reached is parsed again. For an Xid that has
-        // committed, those records are the ones the commit sorter owns - delivered already, or queued for
-        // delivery - so they have to be dropped instead of waiting for their delivery (Ctx::swappedMemoryInit).
-        // The full Xid is kept, not only the XidMap: the map key drops the sequence number and the same undo
-        // slot is reused by later transactions, whose records must not be dropped. One entry per undo slot and
-        // thread, replaced as soon as the slot moves on to a newer transaction.
-        std::unordered_map<XidMap, Xid> committedXidTombstones;
+
+        // Tombstones of the transactions that have committed in this run. The same redo can be read a second
+        // time in one run (a slice resume, a pass that ended early, an instance recovery), and the records of a
+        // transaction that has committed belong to the commit sorter - delivered already or queued - so they
+        // have to be dropped here instead of waiting for their delivery (Ctx::swappedMemoryInit).
+        //
+        // What has to be dropped is not only the newest transaction of an undo slot: a re-parse spans thousands
+        // of transactions, so by the time the redo of an older Xid is read again its undo slot has been reused
+        // (and the newer transactions have committed too). Keeping one entry per slot dropped that knowledge,
+        // the re-read built a second Transaction for an Xid that was already delivered and its rows were
+        // delivered twice. Measured in the reproduction rig with slicing on: 179,275 rows delivered for 100,070
+        // distinct row ids - 79,205 rows twice, all of thread 2 - while slicing off delivered exactly 101,000
+        // rows with no duplicate. The set below is bounded by count, so it covers the re-parse window (a few
+        // archives) and not the whole run.
+        struct CommittedKey {
+            // The same Xid value can exist on two RAC threads: their undo spaces are independent, so the thread
+            // and the container are part of the identity (XidMap holds both), plus the sequence number that the
+            // XidMap drops.
+            XidMap xidMap;
+            typeSqn sqn;
+
+            bool operator==(const CommittedKey& other) const {
+                return xidMap == other.xidMap && sqn == other.sqn;
+            }
+        };
+
+        struct CommittedKeyHash {
+            size_t operator()(const CommittedKey& key) const noexcept {
+                return std::hash<uint64_t>()(key.xidMap ^ (static_cast<uint64_t>(key.sqn) << 17));
+            }
+        };
+
+        std::unordered_set<CommittedKey, CommittedKeyHash> committedXids;
+        std::deque<CommittedKey> committedXidOrder;
+
+        // How many committed transactions are remembered. About 32 bytes per entry holds one entry per commit
+        // of the last few minutes at the transaction rates this engine is built for - the redo that is read a
+        // second time is a few archives, so the window has to be minutes, not hours.
+        static constexpr uint64_t COMMITTED_XIDS_KEEP{2000000};
         std::map<LobKey, uint8_t*> orphanedLobs;
 
     public:
