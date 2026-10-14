@@ -1868,6 +1868,21 @@ namespace OpenLogReplicator {
                 // instances always look CLOSED while they are in fact archiving.
                 replicator->observeArchiveSequence(static_cast<uint16_t>(thread), sequence, replicator->ctx->clock->getTimeUt());
 
+                // The list is bound by the *lowest* expected sequence across all threads, while the per-thread
+                // sequences drift apart by hundreds of thousands (a RAC thread whose sequence counter is much
+                // higher makes every pass return its whole recent history). Rows below what their own thread
+                // still needs were parsed by an earlier pass and are dropped here, before a Parser object is
+                // built for them - queueing them only produces a walk over already parsed archives, a Parser
+                // construction and two trace lines per row (production: 23,710 such rows in 27 minutes, 260 per
+                // pass, every one of them below the expected sequence of its own thread). The check in
+                // Replicator::processArchivedRedoLogs stays: a sequence can still become stale between this
+                // query and the moment the queue entry is processed.
+                const Seq expectedSequence = replicator->metadata->threadSequence(static_cast<uint16_t>(thread));
+                if (expectedSequence != Seq::zero() && expectedSequence != Seq::none() && sequence < expectedSequence) {
+                    ret = stmt.next();
+                    continue;
+                }
+
                 std::string mappedPath(path.data());
                 replicator->applyMapping(mappedPath);
 
