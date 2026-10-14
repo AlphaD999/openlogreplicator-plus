@@ -83,6 +83,14 @@ namespace OpenLogReplicator {
         // it (warning 60047, at most one message per 30 s). Both are reset as soon as a pass does real work.
         uint64_t idleSince{0};
         uint64_t lastIdleReport{0};
+        // Start of the current "the archive list returned nothing at all" period, when it was reported last and
+        // how many times - warning 60056. Reset as soon as an archive is available again, which is reported
+        // with an INFO line so that the end of a stall is visible in the log as well.
+        uint64_t archWaitSince{0};
+        uint64_t archWaitReportTime{0};
+        uint64_t archWaitReportCount{0};
+        // "expected sequence of every known thread against the highest sequence the source reported", for 60056
+        [[nodiscard]] std::string archiveWaitState() const;
 
         void cleanArchList();
         // Index of the archive with the lowest SCN still to be parsed in archiveRedoQueue

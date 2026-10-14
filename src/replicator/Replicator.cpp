@@ -782,6 +782,18 @@ namespace OpenLogReplicator {
         return it->second;
     }
 
+    std::string Replicator::archiveWaitState() const {
+        if (threadMaxSequence.empty())
+            return "the archive list source does not know any redo thread yet";
+
+        std::ostringstream ss;
+        ss << "the archive list source reports";
+        for (const auto& entry: threadMaxSequence)
+            ss << " thread " << entry.first << ": expected seq " << metadata->threadSequence(entry.first).toString() << ", highest known seq "
+               << entry.second.toString() << ";";
+        return ss.str();
+    }
+
     bool Replicator::processArchivedRedoLogs() {
         Reader::REDO_CODE ret;
         Parser* parser;
@@ -801,6 +813,27 @@ namespace OpenLogReplicator {
 
             if (archiveRedoQueue.empty()) {
                 if (ctx->isFlagSet(Ctx::REDO_FLAGS::ARCH_ONLY)) {
+                    const uint64_t nowUs = ctx->clock->getTimeUt();
+                    if (archWaitSince == 0)
+                        archWaitSince = nowUs;
+
+                    // An empty list is the one silent case: no row of the list mentions the archives of any
+                    // thread, so 60027/60038 (which need a later archive of the same thread to be present) can
+                    // not fire and the source looks idle. Report it - with the expected sequence of every thread
+                    // against the highest sequence the source reported - and back off, so a source that is down
+                    // for hours does not fill the log while a source that is minutes late is still visible.
+                    if (ctx->archWaitWarnUs > 0 && nowUs - archWaitSince >= ctx->archWaitWarnUs) {
+                        uint64_t interval = ctx->archWaitWarnUs;
+                        for (uint64_t n = 0; n < archWaitReportCount && interval < ctx->archWaitWarnUs * 8; ++n)
+                            interval *= 2;
+                        if (archWaitReportTime == 0 || nowUs - archWaitReportTime >= interval) {
+                            archWaitReportTime = nowUs;
+                            ++archWaitReportCount;
+                            ctx->warning(60056, "no archived redo log to read for: " + std::to_string((nowUs - archWaitSince) / 1000000) +
+                                         " s - " + archiveWaitState() + " (\"arch-wait-warn-us\")");
+                        }
+                    }
+
                     if (unlikely(ctx->isTraceSet(Ctx::TRACE::ARCHIVE_LIST)))
                         ctx->logTrace(Ctx::TRACE::ARCHIVE_LIST, "archived redo log missing for seq: " + metadata->sequence.toString() +
                                       ", sleeping");
@@ -810,6 +843,12 @@ namespace OpenLogReplicator {
                 } else {
                     break;
                 }
+            } else if (archWaitSince != 0) {
+                ctx->info(0, "archived redo log available after: " + std::to_string((ctx->clock->getTimeUt() - archWaitSince) / 1000000) +
+                          " s of waiting for the archive list source");
+                archWaitSince = 0;
+                archWaitReportTime = 0;
+                archWaitReportCount = 0;
             }
 
             if (unlikely(ctx->isTraceSet(Ctx::TRACE::THREADS))) {

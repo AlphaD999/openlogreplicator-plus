@@ -503,6 +503,7 @@ namespace OpenLogReplicator {
                     "arch",
                     "arch-read-sleep-us",
                     "arch-read-tries",
+                    "arch-wait-warn-us",
                     "debug",
                     "filter",
                     "flags",
@@ -1107,6 +1108,11 @@ namespace OpenLogReplicator {
                     throw ConfigurationException(30001, "bad JSON, invalid \"arch-read-tries\" value: " +
                                                  std::to_string(ctx->archReadTries) + ", expected: one of: {1 .. 1000000000}");
             }
+
+            // A missing archive whose thread moved on is reported by 60027/60038. A source that returns no row
+            // at all is the silent case: warning 60056 reports it after "arch-wait-warn-us" microseconds.
+            if (sourceJson.HasMember("arch-wait-warn-us"))
+                ctx->archWaitWarnUs = Ctx::getJsonFieldU64(configFileName, sourceJson, "arch-wait-warn-us");
 
             // An archive that cannot be opened after "arch-read-tries" attempts is fatal (10009) by default.
             // With 1, the archive is skipped instead: 10074 reports the thread and the sequence that are not

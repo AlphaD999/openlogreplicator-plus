@@ -318,6 +318,12 @@ namespace OpenLogReplicator {
         uint64_t redoVerifyDelayUs{0};
         uint64_t archReadSleepUs{10000000};
         uint64_t refreshIntervalUs{10000000};
+        // Report a source that hands out no archive at all after this many microseconds of waiting. The empty
+        // list is the one silent case: 60027/60038 need a later archive of the same thread in the list to fire,
+        // so a source that returns nothing at all used to look like an idle run (only TRACE::ARCHIVE_LIST said a
+        // word - production waited 21 minutes for the next archive without a single warning). 0 disables it.
+        // The report repeats with a doubling interval, capped at eight times this value.
+        uint64_t archWaitWarnUs{60000000};
         // Archive slicing: when this many finished transactions wait in the commit sorter for the low-water-mark,
         // the current archive is sliced so that the other redo threads are parsed first. One memory chunk (1 MB)
         // is held per waiting transaction, so this bounds the memory used by the transactions of one archive.
