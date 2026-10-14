@@ -724,14 +724,29 @@ namespace OpenLogReplicator {
             logTrace(TRACE::TRANSACTION, "swap memory stalled transaction: " + swapKey.toString());
     }
 
+    void Ctx::swappedEntryMissing(const char* stage, const SwapKey& swapKey) {
+        statSwapEntryMissing.fetch_add(1, std::memory_order_relaxed);
+        warning(60057, "the swap entry of transaction: " + swapKey.toString() + " is already gone during \"" + stage +
+                "\" (the same Xid was parsed a second time and took the key over, or the delayed cleanup of the "
+                "previous owner ran first) - the swapped out data of that transaction is not available any more, "
+                "the parse continues without it");
+    }
+
     uint64_t Ctx::swappedMemorySize(Thread* t, const SwapKey& swapKey) const {
         uint64_t ret;
         {
             t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_SWAPPED_SIZE);
             std::unique_lock const lck(swapMtx);
+
             const auto& it = swapChunks.find(swapKey);
-            if (unlikely(it == swapChunks.end()))
-                throw RuntimeException(50070, "swap chunk not found for transaction: " + swapKey.toString() + " during memory size");
+            if (unlikely(it == swapChunks.end())) {
+                // The entry can be gone while the transaction is still being parsed (see swappedEntryMissing).
+                // Killing the whole run over it - what this used to do, error 50070 - is worse than reading no
+                // chunk at all: the data is not in the swap file any more, so the answer is "there is none".
+                t->contextSet(Thread::CONTEXT::CPU);
+                const_cast<Ctx*>(this)->swappedEntryMissing("memory size", swapKey);
+                return 0;
+            }
             const SwapChunk* sc = it->second;
             ret = sc->chunks.size();
         }
@@ -744,8 +759,11 @@ namespace OpenLogReplicator {
             t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_SWAPPED_GET);
             std::unique_lock lck(swapMtx);
             const auto& it = swapChunks.find(swapKey);
-            if (unlikely(it == swapChunks.end()))
-                throw RuntimeException(50070, "swap chunk not found for transaction: " + swapKey.toString() + " during memory get");
+            if (unlikely(it == swapChunks.end())) {
+                t->contextSet(Thread::CONTEXT::CPU);
+                swappedEntryMissing("memory get", swapKey);
+                return nullptr;
+            }
             const SwapChunk* sc = it->second;
 
             while (!hardShutdown) {
@@ -769,8 +787,13 @@ namespace OpenLogReplicator {
             t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_SWAPPED_RELEASE);
             std::unique_lock const lck(swapMtx);
             const auto& it = swapChunks.find(swapKey);
-            if (unlikely(it == swapChunks.end()))
-                throw RuntimeException(50070, "swap chunk not found for transaction: " + swapKey.toString() + " during memory release");
+            if (unlikely(it == swapChunks.end())) {
+                // Nothing to give back: the entry (and with it every chunk of it) is already gone. Releasing is
+                // idempotent by nature - the caller only wanted the memory back, and it is not held any more.
+                t->contextSet(Thread::CONTEXT::CPU);
+                swappedEntryMissing("memory release", swapKey);
+                return;
+            }
             SwapChunk* sc = it->second;
             tc = sc->chunks.at(index);
             sc->chunks[index] = nullptr;
@@ -821,8 +844,13 @@ namespace OpenLogReplicator {
             t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_SWAPPED_SHRINK1);
             std::unique_lock const lck(swapMtx);
             const auto& it = swapChunks.find(swapKey);
-            if (unlikely(it == swapChunks.end()))
-                throw RuntimeException(50070, "swap chunk not found for transaction: " + swapKey.toString() + " during memory shrink");
+            if (unlikely(it == swapChunks.end())) {
+                // No last chunk to unlink: the rollback ends here, which is a valid final state (the same answer
+                // the caller gets when the entry exists but has no chunk left).
+                t->contextSet(Thread::CONTEXT::CPU);
+                swappedEntryMissing("memory shrink", swapKey);
+                return nullptr;
+            }
             sc = it->second;
             tc = sc->chunks.back();
             sc->chunks.pop_back();
@@ -925,17 +953,19 @@ namespace OpenLogReplicator {
         const uint64_t bytesRepeated = statBytesParsedRepeated.load(std::memory_order_relaxed);
         const uint64_t waits = statDuplicateParseWaits.load(std::memory_order_relaxed);
         const uint64_t waitUs = statDuplicateParseWaitUs.load(std::memory_order_relaxed);
+        const uint64_t swapMissing = statSwapEntryMissing.load(std::memory_order_relaxed);
 
-        // Silent while nothing happened: a run that never re-parsed redo and never waited on an undelivered
-        // transaction has nothing to report, and one line per checkpoint is enough to notice when it has.
-        // The caller can ask for the line anyway (end of a run), then the zeros are the answer.
-        if (!always && passesEarly == 0 && bytesRepeated == 0 && waits == 0 && waitUs == 0)
+        // Silent while nothing happened: a run that never re-parsed redo, never waited on an undelivered
+        // transaction and never lost a swap entry has nothing to report, and one line per checkpoint is enough
+        // to notice when it has. The caller can ask for the line anyway (end of a run), then the zeros are the
+        // answer.
+        if (!always && passesEarly == 0 && bytesRepeated == 0 && waits == 0 && waitUs == 0 && swapMissing == 0)
             return;
 
         info(0, "parse statistics: parse_passes_early=" + std::to_string(passesEarly) + ", bytes_parsed_repeated=" +
                 std::to_string(bytesRepeated) + ", duplicate_parse_waits=" + std::to_string(waits) +
-                ", duplicate_parse_wait_us=" + std::to_string(waitUs) + " (the same numbers as the metrics of the "
-                "same name, which only exist in a build with Prometheus)");
+                ", duplicate_parse_wait_us=" + std::to_string(waitUs) + ", swap_entry_missing=" + std::to_string(swapMissing) +
+                " (the same numbers as the metrics of the same name, which only exist in a build with Prometheus)");
     }
 
     void Ctx::swappedMemoryKeyRelease(const SwapKey& swapKey) {

@@ -416,8 +416,15 @@ namespace OpenLogReplicator {
         std::atomic<uint64_t> statBytesParsedRepeated{0};
         std::atomic<uint64_t> statDuplicateParseWaits{0};
         std::atomic<uint64_t> statDuplicateParseWaitUs{0};
+        // Swap entries that were already gone when the parser asked for them: the same Xid was parsed a second
+        // time, took the swap key over, and the delayed cleanup of the previous owner removed the entry right
+        // afterwards (defect C). Reported as warning 60057 and counted here, so a run tells "it never happened"
+        // from "it happened and was survived" - the same shape as swappedMemoryGrow does it with 60051.
+        std::atomic<uint64_t> statSwapEntryMissing{0};
         // "always" reports the line even when all four are zero (the end of a run: the zeros are the answer then).
         void reportParseStats(bool always = false);
+        // One swap entry disappeared while the parser was still using it: counted and reported as warning 60057
+        void swappedEntryMissing(const char* stage, const SwapKey& swapKey);
 
         void releaseDeferredSwaps();
         // Executor of the out-of-parser tick. Set by the replicator (which already owns one for its own idle

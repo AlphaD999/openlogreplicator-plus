@@ -237,6 +237,11 @@ namespace OpenLogReplicator {
         const uint64_t mMax = metadata->ctx->swappedMemorySize(metadata->ctx->thread(), swapKey());
         for (uint64_t m = 0; m < mMax; ++m) {
             auto* const tc = reinterpret_cast<TransactionChunk*>(metadata->ctx->swappedMemoryGet(metadata->ctx->thread(), swapKey(), m));
+            // The swap entry can be gone (60057): the chunk is not in the swap file any more, so there is nothing
+            // to deliver for it - the rest of the transaction is unaffected.
+            if (unlikely(tc == nullptr))
+                continue;
+
             uint64_t pos = 0;
             for (uint64_t i = 0; i < tc->elements; ++i) {
                 typeOp2 const op = *reinterpret_cast<const typeOp2*>(tc->buffer + pos);
