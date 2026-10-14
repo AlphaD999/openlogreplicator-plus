@@ -270,6 +270,9 @@ namespace OpenLogReplicator {
         uint64_t memoryChunksAllocated{0};
         uint64_t memoryChunksFree{0};
         uint64_t memoryChunksHWM{0};
+        // Set when a chunk is returned after the pool itself has been released (see freeMemoryChunk): only
+        // the first one is reported, the rest is silence - it happens while the process is going down.
+        bool memoryPoolGoneReported{false};
         // Threads currently waiting for a free chunk. The memory manager reports a possible deadlock when
         // somebody is blocked and no chunk can be swapped out to make room.
         uint64_t memoryBlockedThreads{0};

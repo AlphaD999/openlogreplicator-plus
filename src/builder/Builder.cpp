@@ -1939,6 +1939,11 @@ namespace OpenLogReplicator {
 
         valueBufferOld = valueBuffer;
         valueSizeOld = valueSize;
+        // The old buffer belongs to valueBufferOld from here on: clear the member before the allocation, so a
+        // throw out of "new" (or of anything before the new buffer is installed) cannot leave the same pointer
+        // in both members - the destructor deletes both and would free it twice.
+        valueBuffer = nullptr;
+        valueBufferSize = 0;
         valueBuffer = new char[VALUE_BUFFER_MIN];
         valueBufferSize = VALUE_BUFFER_MIN;
         valueSize = 0;
@@ -2562,7 +2567,10 @@ namespace OpenLogReplicator {
         //
         // The emergency stays: while the parser is blocked in Ctx::swappedMemoryInit() (defect C, warning 60050)
         // nothing publishes a higher water-mark, so the delivery it waits for has to bypass the water-mark.
-        if (metadata->commitSorter != nullptr && ctx->sorterExecutor != nullptr &&
+        // A hard shutdown (a fatal error) must not start another delivery: at that moment the replicator
+        // thread is already tearing its state down (transactionBuffer->purge()), and the two run without a
+        // common lock.
+        if (metadata->commitSorter != nullptr && ctx->sorterExecutor != nullptr && !ctx->hardShutdown &&
             metadata->commitSorter->getPendingEvents() > 0) {
             const bool parserBlocked = ctx->parserInSwapWait.load(std::memory_order_relaxed);
             if (parserBlocked && !ctx->sorterTickTakenOver.exchange(true, std::memory_order_relaxed))

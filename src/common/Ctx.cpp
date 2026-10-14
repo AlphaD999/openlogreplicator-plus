@@ -66,6 +66,14 @@ namespace OpenLogReplicator {
     }
 
     Ctx::~Ctx() {
+        // The sorter executor can be a Parser (Replicator::run hands one over, Ctx owns it on purpose), and a
+        // Parser gives its redo chunks back to the pool when it is destroyed. It has to go before the pool:
+        // the body of this destructor runs before the members are destroyed, so releasing the chunks afterwards
+        // would write into an array that is already gone. Measured with a malloc interposer in the
+        // reproduction rig: the fault was at 0x1fe0 = nullptr + 1020 * 8, a released and cleared array with
+        // the pool counters still reporting free chunks.
+        sorterExecutor.reset();
+
         lobIdToXidMap.clear();
 
         while (memoryChunksAllocated > 0) {
@@ -523,6 +531,14 @@ namespace OpenLogReplicator {
             memoryModulesHWM[static_cast<uint>(module)] = std::max(memoryModulesAllocated[static_cast<uint>(module)],
                                                                    memoryModulesHWM[static_cast<uint>(module)]);
             chunk = memoryChunks[memoryChunksFree];
+            // The pool owns exactly the chunks that sit in the slots [0, memoryChunksFree): a chunk in use is
+            // held by its caller alone. The slot that was just popped has to be cleared, otherwise it keeps a
+            // copy of the pointer - and when that chunk is later given back to the OS (the branch of
+            // freeMemoryChunk that shrinks the pool) the copy stays inside [0, memoryChunksAllocated), so the
+            // destructor frees the same address a second time. Measured with a malloc interposer in the local
+            // reproduction rig: the second free came from ~Ctx() and glibc reported "corrupted size vs.
+            // prev_size while consolidating" right after the shutdown lines.
+            memoryChunks[memoryChunksFree] = nullptr;
         }
         t->contextSet(Thread::CONTEXT::CPU);
 
@@ -569,6 +585,20 @@ namespace OpenLogReplicator {
         uint64_t usedTotal = 0;
         uint64_t allocatedTotal = 0;
         t->contextSet(Thread::CONTEXT::MEM, Thread::REASON::MEM);
+
+        // Defence in depth: if a chunk is returned after the pool has been released, there is nothing left to
+        // book and the counter array can not be touched - the chunk is still ours and goes back to the OS.
+        if (unlikely(memoryChunks == nullptr)) {
+            if (!memoryPoolGoneReported) {
+                memoryPoolGoneReported = true;
+                warning(60059, "a memory chunk is returned after the memory pool was released (shutdown order) - "
+                               "the chunk is given back to the OS directly");
+            }
+            t->contextSet(Thread::CONTEXT::OS, Thread::REASON::OS);
+            free(chunk);
+            t->contextSet(Thread::CONTEXT::CPU);
+            return;
+        }
         {
             std::unique_lock const lck(memoryMtx);
 
