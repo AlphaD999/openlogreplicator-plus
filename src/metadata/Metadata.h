@@ -55,6 +55,14 @@ namespace OpenLogReplicator {
     struct ThreadPos {
         Seq sequence{Seq::none()};
         FileOffset fileOffset;
+        // The archive the offset below belongs to. The parser saves its position per thread, but a thread has
+        // more than one archive in flight (the scheduler picks the best one of the thread queue, and a sliced
+        // archive waits for its resume): storing the offset alone let any archive of that thread take it over,
+        // so the archive that it was saved for restarted at the beginning of the file (whole archive parsed a
+        // second time - measured: 193,568 records of already committed transactions dropped in one run) and the
+        // one that took it over started inside the file, skipping everything before that block (measured: 930
+        // rows of a bulk transaction never delivered).
+        Seq fileOffsetSequence{Seq::none()};
         Scn firstScn{Scn::none()};
         Scn nextScn{Scn::none()};
         bool closed{false};
@@ -139,6 +147,8 @@ namespace OpenLogReplicator {
         Seq sequence{Seq::none()};
         Seq lastSequence{Seq::none()};
         FileOffset fileOffset;
+        // Thread 1 view of ThreadPos::fileOffsetSequence (see there): the offset belongs to this archive
+        Seq fileOffsetSequence{Seq::none()};
         Scn firstScn{Scn::none()};
         Scn nextScn{Scn::none()};
         Scn clientScn{Scn::none()};
@@ -182,9 +192,11 @@ namespace OpenLogReplicator {
         void setNextSequence(uint16_t thread = 1);
         ThreadPos& threadPosGet(uint16_t thread);
         [[nodiscard]] Seq threadSequence(uint16_t thread) const;
-        // Parser thread accessors (called from the parser thread itself, no locking needed)
-        FileOffset takeFileOffset(uint16_t thread);
-        void saveFileOffset(uint16_t thread, FileOffset newFileOffset);
+        // Parser thread accessors (called from the parser thread itself, no locking needed). The offset is
+        // matched with the sequence it was saved for: an archive of the same thread that is not the one the
+        // position belongs to must not consume it (see ThreadPos::fileOffsetSequence).
+        FileOffset takeFileOffset(uint16_t thread, Seq expectedSequence);
+        void saveFileOffset(uint16_t thread, Seq sequence, FileOffset newFileOffset);
         [[nodiscard]] bool stateRead(const std::string& name, uint64_t maxSize, std::string& in) const;
         [[nodiscard]] bool stateDiskRead(const std::string& name, uint64_t maxSize, std::string& in) const;
         [[nodiscard]] bool stateWrite(const std::string& name, Scn scn, const std::ostringstream& out) const;

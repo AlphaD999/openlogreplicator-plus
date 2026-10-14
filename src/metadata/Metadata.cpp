@@ -189,9 +189,13 @@ namespace OpenLogReplicator {
         ThreadPos& pos = threadPosGet(thread);
         pos.sequence = newSequence;
         pos.fileOffset = newFileOffset;
+        // Saved as a matched pair: this is a position inside the archive "newSequence", so a parser of that
+        // archive may resume from it (a startup position from the checkpoint file does it the same way).
+        pos.fileOffsetSequence = newFileOffset > FileOffset::zero() ? newSequence : Seq::none();
         if (thread == 1) {
             sequence = newSequence;
             fileOffset = newFileOffset;
+            fileOffsetSequence = pos.fileOffsetSequence;
         }
     }
 
@@ -211,7 +215,7 @@ namespace OpenLogReplicator {
         return Seq::zero();
     }
 
-    FileOffset Metadata::takeFileOffset(uint16_t thread) {
+    FileOffset Metadata::takeFileOffset(uint16_t thread, Seq expectedSequence) {
         std::unique_lock const lck(mtxCheckpoint);
 
         auto it = threadPos.find(thread);
@@ -219,23 +223,42 @@ namespace OpenLogReplicator {
             if (thread != 1)
                 return FileOffset::zero();
             // Legacy single-instance view
+            if (!(fileOffsetSequence == expectedSequence))
+                return FileOffset::zero();
             const FileOffset result = fileOffset;
             fileOffset = FileOffset::zero();
+            fileOffsetSequence = Seq::none();
             return result;
         }
+
+        // Only the archive this position was saved for may consume it: another archive of the same thread that
+        // gets here first must start at its own beginning, and the saved position has to stay for its owner.
+        if (!(it->second.fileOffsetSequence == expectedSequence))
+            return FileOffset::zero();
+
         const FileOffset result = it->second.fileOffset;
         it->second.fileOffset = FileOffset::zero();
-        if (thread == 1)
+        it->second.fileOffsetSequence = Seq::none();
+        if (thread == 1) {
             fileOffset = FileOffset::zero();
+            fileOffsetSequence = Seq::none();
+        }
         return result;
     }
 
-    void Metadata::saveFileOffset(uint16_t thread, FileOffset newFileOffset) {
+    void Metadata::saveFileOffset(uint16_t thread, Seq sequence, FileOffset newFileOffset) {
         std::unique_lock const lck(mtxCheckpoint);
 
-        threadPosGet(thread).fileOffset = newFileOffset;
-        if (thread == 1)
+        ThreadPos& pos = threadPosGet(thread);
+        // A zero offset is "forget the position", not "resume at the beginning of some archive": saving it has
+        // to clear the sequence as well, otherwise a stale non zero offset of an older archive would stay valid
+        // for that sequence number forever.
+        pos.fileOffsetSequence = newFileOffset > FileOffset::zero() ? sequence : Seq::none();
+        pos.fileOffset = newFileOffset;
+        if (thread == 1) {
+            fileOffsetSequence = pos.fileOffsetSequence;
             fileOffset = newFileOffset;
+        }
     }
 
     bool Metadata::stateRead(const std::string& name, uint64_t maxSize, std::string& in) const {

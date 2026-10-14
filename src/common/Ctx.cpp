@@ -1026,19 +1026,21 @@ namespace OpenLogReplicator {
         const uint64_t waitUs = statDuplicateParseWaitUs.load(std::memory_order_relaxed);
         const uint64_t swapMissing = statSwapEntryMissing.load(std::memory_order_relaxed);
         const uint64_t committedDrops = statCommittedRereadDrops.load(std::memory_order_relaxed);
+        const uint64_t resumeFallbacks = statResumeFallbacks.load(std::memory_order_relaxed);
 
         // Silent while nothing happened: a run that never re-parsed redo, never waited on an undelivered
         // transaction and never lost a swap entry has nothing to report, and one line per checkpoint is enough
         // to notice when it has. The caller can ask for the line anyway (end of a run), then the zeros are the
         // answer.
         if (!always && passesEarly == 0 && bytesRepeated == 0 && waits == 0 && waitUs == 0 && swapMissing == 0 &&
-            committedDrops == 0)
+            committedDrops == 0 && resumeFallbacks == 0)
             return;
 
         info(0, "parse statistics: parse_passes_early=" + std::to_string(passesEarly) + ", bytes_parsed_repeated=" +
                 std::to_string(bytesRepeated) + ", duplicate_parse_waits=" + std::to_string(waits) +
                 ", duplicate_parse_wait_us=" + std::to_string(waitUs) + ", swap_entry_missing=" + std::to_string(swapMissing) +
                 ", committed_reread_drops=" + std::to_string(committedDrops) +
+                ", resume_fallbacks=" + std::to_string(resumeFallbacks) +
                 " (the same numbers as the metrics of the same name, which only exist in a build with Prometheus)");
     }
 

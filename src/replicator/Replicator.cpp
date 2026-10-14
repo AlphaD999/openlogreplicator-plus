@@ -969,7 +969,7 @@ namespace OpenLogReplicator {
                                    ", seq: " + parser->sequence.toString() + " - archive skipped (\"skip-unreadable-archive\"), "
                                    "its redo is NOT delivered; reading continues with the next archived redo log of this thread");
                         metadata->setNextSequence(parser->thread);
-                        metadata->saveFileOffset(parser->thread, FileOffset::zero());
+                        metadata->saveFileOffset(parser->thread, parser->sequence, FileOffset::zero());
                         delete parser;
                         archiveSkipped = true;
                         break;
@@ -1033,7 +1033,7 @@ namespace OpenLogReplicator {
                                    std::string(Reader::REDO_MSG[static_cast<uint>(ret)]) + " (\"skip-unreadable-archive\"), "
                                    "its redo is NOT delivered; reading continues with the next archived redo log of this thread");
                         metadata->setNextSequence(parser->thread);
-                        metadata->saveFileOffset(parser->thread, FileOffset::zero());
+                        metadata->saveFileOffset(parser->thread, parser->sequence, FileOffset::zero());
                         delete parser;
                         continue;
                     }

@@ -1382,7 +1382,10 @@ namespace OpenLogReplicator {
 
         // Continue started offset
         {
-            const FileOffset startOffset = metadata->takeFileOffset(thread);
+            // The position is matched with this archive: a pass of another archive of the same thread (the
+            // scheduler runs several of them) must not consume it, or this one restarts at the beginning of the
+            // file and the other starts inside its own file, skipping everything before that block.
+            const FileOffset startOffset = metadata->takeFileOffset(thread, sequence);
             if (startOffset > FileOffset::zero()) {
                 if (unlikely(!startOffset.matchesBlockSize(reader->getBlockSize())))
                     throw RedoLogException(50047, "incorrect offset start: " + startOffset.toString() +
@@ -1417,6 +1420,13 @@ namespace OpenLogReplicator {
             ctx->info(0, "new activation detected: " + std::to_string(reader->getActivation()));
             metadata->setActivation(reader->getActivation());
         }
+
+        // This pass started from a saved position (a sliced or interrupted pass before it). Such a position is
+        // computed from the last dispatched LWN boundary and is normally the head of the next LWN record, but it
+        // is not a guarantee: the first block of the pass is checked below and a position that turns out not to
+        // be a head is handled there instead of ending the run (error 50051 did exactly that).
+        const typeBlk passStartBlock = lwnConfirmedBlock;
+        const bool resumedFromOffset = lwnConfirmedBlock > 2;
 
         const time_ut cStart = ctx->clock->getTimeUt();
         reader->setStatusRead();
@@ -1482,6 +1492,35 @@ namespace OpenLogReplicator {
                             ctx->logTrace(Ctx::TRACE::LWN, "at: " + std::to_string(lwnStartBlock) + " size: " + std::to_string(lwnSize) +
                                           " chk: " + std::to_string(lwnNum) + " max: " + std::to_string(lwnNumMax));
                         }
+                    } else if (unlikely(resumedFromOffset && currentBlock == passStartBlock)) {
+                        // The position this pass resumed from is not the head of an LWN record. Ending the run
+                        // over it (50051, which is what this used to do) turns a position that is merely a hint
+                        // into an outage - measured: a slice resumed at the position it had saved and the run
+                        // died with "did not find lwn at offset: 2392576".
+                        //
+                        // The answer is to read this archive from its beginning: the records of the transactions
+                        // that were already delivered are dropped by the tombstone in TransactionBuffer (they
+                        // used to be delivered a second time instead), and a transaction that was still open
+                        // when the previous pass ended is picked up again - which is the case that a position
+                        // only slightly off would silently skip, losing its rows.
+                        //
+                        // The pass ends as STOPPED, which is the existing "not finished, come back later" path:
+                        // the position saved here is the beginning of the archive, so the next pass of this
+                        // archive starts there.
+                        ctx->statResumeFallbacks.fetch_add(1, std::memory_order_relaxed);
+                        ctx->warning(60058, "the saved position of this pass (block " + std::to_string(passStartBlock) +
+                                     ") is not the head of an lwn record in: " + reader->fileName +
+                                     " - the pass restarts at the beginning of this archive (the records of the "
+                                     "transactions that were already delivered are dropped, the open ones are read again)");
+                        lwnConfirmedBlock = 2;
+                        reader->setRet(Reader::REDO_CODE::STOPPED);
+                        // The pass has to *end* here, not continue: the position this pass started from is still
+                        // in the read buffer, so leaving the inner loop alone would re-enter it at the same block
+                        // (measured: 24.7 million warnings before the run was cut). The position that is
+                        // confirmed to the reader is moved to the end of what it has read - the pass is over and
+                        // the reader is repositioned by the next pass from the saved offset.
+                        confirmedBufferStart = reader->getBufferEnd();
+                        break;
                     } else
                         throw RedoLogException(50051, "did not find lwn at offset: " + confirmedBufferStart.toString());
                 }
@@ -1700,7 +1739,7 @@ namespace OpenLogReplicator {
                         // run with 50049 (measured in production: "invalid lwn scn: 11388144845283", right after
                         // "FINISHED (sliced), position: 7340032 / 13839360" and a resume at offset: 7350784).
                         // lwnEndBlock is exactly the head of the next record (currentBlock + lwnSize).
-                        metadata->saveFileOffset(thread, FileOffset(lwnEndBlock, reader->getBlockSize()));
+                        metadata->saveFileOffset(thread, sequence, FileOffset(lwnEndBlock, reader->getBlockSize()));
                         if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
                             ctx->logTrace(Ctx::TRACE::CHECKPOINT, "slicing archive at scn: " + lwnScn.toString() + " (block " +
                                           std::to_string(currentBlock) + "), pending commits: " +
@@ -1778,7 +1817,7 @@ namespace OpenLogReplicator {
                     if (reader->getRet() == Reader::REDO_CODE::FINISHED && nextScn == Scn::none() && reader->getNextScn() != Scn::none())
                         nextScn = reader->getNextScn();
                     if (reader->getRet() == Reader::REDO_CODE::STOPPED || reader->getRet() == Reader::REDO_CODE::OVERWRITTEN) {
-                        metadata->saveFileOffset(thread, FileOffset(lwnConfirmedBlock, reader->getBlockSize()));
+                        metadata->saveFileOffset(thread, sequence, FileOffset(lwnConfirmedBlock, reader->getBlockSize()));
                         // This pass ends here and the next one starts at the last confirmed LWN boundary, so the
                         // redo between that boundary and the position this pass reached is parsed a second time.
                         // Counted (bytes and frequency) so that the cost of the granularity is visible - as plain

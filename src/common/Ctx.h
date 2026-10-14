@@ -448,6 +448,10 @@ namespace OpenLogReplicator {
         // time (the tombstone in TransactionBuffer). Counted so that a run tells "the redo was never read
         // twice" from "it was, and the second read was dropped instead of delivering the rows again".
         std::atomic<uint64_t> statCommittedRereadDrops{0};
+        // Passes whose saved position turned out not to be the head of an LWN record: they restart the archive
+        // from its beginning instead of ending the run (warning 60058). Counted to see how often the saved
+        // position is not usable - it is a cost (the archive is read again), not a fault.
+        std::atomic<uint64_t> statResumeFallbacks{0};
         // "always" reports the line even when all four are zero (the end of a run: the zeros are the answer then).
         void reportParseStats(bool always = false);
         // One swap entry disappeared while the parser was still using it: counted and reported as warning 60057
