@@ -71,6 +71,7 @@ list(APPEND ListBuilder
 
 list(APPEND ListParser
         parser/CommitSorter.cpp
+        parser/DeliveryExecutor.cpp
         parser/Parser.cpp
         parser/Transaction.cpp
         parser/TransactionBuffer.cpp)

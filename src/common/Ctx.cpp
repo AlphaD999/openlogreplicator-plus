@@ -56,6 +56,10 @@ namespace OpenLogReplicator {
 
     IntX IntX::BASE10[DIGITS][10];
 
+    // Stage 1 of the accounting decoupling, thread local: a delivery books its memory and state to the thread
+    // that ran it, and only that thread can see it (see the member comment in Ctx.h).
+    thread_local Thread* Ctx::accountThread{nullptr};
+
     Ctx::Ctx():
             mainThread(pthread_self()),
             dumpStream(std::make_unique<std::ofstream>()) {
@@ -95,9 +99,19 @@ namespace OpenLogReplicator {
         if (watchdogUs == 0)
             return;
 
+        // The parser has nothing to read at all (the archive list returned no row for any redo thread): that is
+        // the expected state and warning 60056 reports it, so it does not get a "made no progress" report - a run
+        // that waits for the next archive of a quiet instance would otherwise look exactly like a stall (measured
+        // in production: 14:25:00 to 14:26:14, waiting for an archive to arrive).
+        if (parserWaitingForArchive.load(std::memory_order_relaxed))
+            return;
+
         const uint64_t now = clock->getTimeUt();
         const uint64_t progress = watchdogProgressUt.load(std::memory_order_relaxed);
-        if (progress == 0 || now - progress < watchdogUs)
+        // "progress" is written by the parser thread and this is a second read of the same clock, so it can be a
+        // moment newer than "now": without the "now <= progress" test the difference wraps around and the report
+        // says "no progress for: 18446744073709 s" (measured in production, 3 times in 7 minutes).
+        if (progress == 0 || now <= progress || now - progress < watchdogUs)
             return;
 
         // Back off like the archive wait does: the first report at the threshold, then every doubling interval
@@ -133,18 +147,27 @@ namespace OpenLogReplicator {
             swapMtx.unlock();
         busy += extraBusy;
         ss << ") - locks held right now:" << (busy.empty() ? " none of the probed ones" : busy);
+
+        // Since the delivery has a thread of its own (DeliveryExecutor) a held deliveryMtx does not mean that the
+        // parser is blocked by a lock: the delivery thread holds it for the whole delivery, which is normal. Say
+        // what the delivery is doing, and name the silent wait it can sit in - the chunk by chunk read back from
+        // the swap file (Ctx::swappedMemoryGet) has no trace line and no warning of its own.
+        const uint64_t deliverySince = deliveryActiveSinceUs.load(std::memory_order_relaxed);
+        if (deliverySince == 0 || now <= deliverySince)
+            ss << ", delivery: idle";
+        else
+            ss << ", delivery: in flight for " << ((now - deliverySince) / 1000000) << " s";
+        const uint64_t swapGetWaits = statSwapGetWaits.load(std::memory_order_relaxed);
+        if (swapGetWaits > 0)
+            ss << ", swap chunk waits: " << swapGetWaits << " (" << (statSwapGetWaitUs.load(std::memory_order_relaxed) / 1000) << " ms)";
+
         warning(60055, ss.str());
     }
 
     Ctx::~Ctx() {
-        // The sorter executor can be a Parser (Replicator::run hands one over, Ctx owns it on purpose), and a
-        // Parser gives its redo chunks back to the pool when it is destroyed. It has to go before the pool:
-        // the body of this destructor runs before the members are destroyed, so releasing the chunks afterwards
-        // would write into an array that is already gone. Measured with a malloc interposer in the
-        // reproduction rig: the fault was at 0x1fe0 = nullptr + 1020 * 8, a released and cleared array with
-        // the pool counters still reporting free chunks.
-        sorterExecutor.reset();
-
+        // The delivery thread object belongs to the replicator (Replicator::deliveryExecutor) and is joined well
+        // before this point: Ctx::mainFinish() waits for every thread it spawned, and ~OpenLogReplicator deletes
+        // the replicators after it. Nothing has to be released here for it.
         lobIdToXidMap.clear();
 
         while (memoryChunksAllocated > 0) {
@@ -581,8 +604,18 @@ namespace OpenLogReplicator {
                 if (module == MEMORY::PARSER || t == parserThread)
                     outOfMemoryParser = true;
 
-                if (hardShutdown)
-                    return nullptr;
+                // The pool is gone and the process is going down. Only the swap pump can do something useful
+                // with "no memory" (it stops unswapping and reports it - MemoryManager::unswap is the one caller
+                // that tests for nullptr), every other caller uses the chunk as it is: returning nothing here was
+                // a null dereference. Measured on 2026-10-15 in the reproduction rig, after the real error 10017
+                // had already been reported: the parser inside TransactionBuffer::addTransactionChunk ->
+                // Ctx::swappedMemoryGrow -> memset() on nullptr, SIGSEGV and a stacktrace instead of a clean
+                // shutdown. Fail with the error that describes the state instead.
+                if (hardShutdown) {
+                    if (swap)
+                        return nullptr;
+                    throw RuntimeException(10017, "out of memory");
+                }
 
                 if (unlikely(isTraceSet(TRACE::SLEEP)))
                     logTrace(TRACE::SLEEP, "Ctx:getMemoryChunk");
@@ -847,8 +880,22 @@ namespace OpenLogReplicator {
                     return sc->chunks.at(index);
                 }
 
+                // The chunk is on disk and the memory manager has to read it back (one chunk per iteration of its
+                // loop, stat + open + pread + close per chunk - see MemoryManager::unswap). That wait has no trace
+                // line, no counter and no warning of its own, which is why the production stall of 2026-10-15
+                // looked like a lock problem: counted here and named by warning 60055 (totals) and 60061 (a single
+                // wait that is long enough to be the reason for a stall).
+                const uint64_t swapWaitStart = clock->getTimeUt();
                 chunksMemoryManager.notify_all();
                 chunksTransaction.wait(lck);
+                const uint64_t swapWaited = clock->getTimeUt() - swapWaitStart;
+                statSwapGetWaits.fetch_add(1, std::memory_order_relaxed);
+                statSwapGetWaitUs.fetch_add(swapWaited, std::memory_order_relaxed);
+                if (swapWaited >= SWAP_WAIT_REPORT_US)
+                    warning(60061, "reading back the swapped out chunk <" + std::to_string(index) + "> of transaction: " +
+                            swapKey.toString() + " took " + std::to_string(swapWaited / 1000000) + " s - the delivery "
+                            "waits here for the memory manager, which brings one chunk back per iteration of its loop "
+                            "(\"swap-path\"), so a slow or full swap volume shows up as a stalled delivery");
             }
         }
 

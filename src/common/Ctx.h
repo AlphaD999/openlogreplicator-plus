@@ -393,32 +393,37 @@ namespace OpenLogReplicator {
         std::unordered_map<LobId, Xid> lobIdToXidMap;
         Thread* parserThread{nullptr};
         // Stage 1 of the accounting decoupling: the thread the parse and the delivery path books its memory and
-        // its state to. It is the parser (the replicator) - parserThread - unless a thread that runs a delivery
-        // for it says otherwise: the writer sets this to itself for the duration of a defect C tick, so that
-        // the two threads never write the state of the same Thread object (which is what the old, hard wired
-        // parserThread did: the takeover ran Transaction::flush on the writer thread while the blocked parser
-        // was writing the same fields). Relaxed on purpose: it is read on hot paths and only has to be visible
-        // to the thread that wrote it.
-        std::atomic<Thread*> accountThread{nullptr};
+        // its state to. It is the parser (the replicator) - parserThread - unless the thread that runs a delivery
+        // says otherwise: a delivery books everything it releases to itself.
+        // It is thread local, and that is the whole point of stage 4: since the delivery runs on its own thread
+        // while the parser keeps parsing, a single pointer would make the parser book its own memory and state to
+        // the delivery thread (which is what a global atomic here did - the parser read it while the delivery
+        // thread had it set). Every thread that delivers sets it for the duration of its delivery
+        // (CommitSorter::DeliveryScope), the delivery thread keeps it set for its whole life.
+        static thread_local Thread* accountThread;
 
         [[nodiscard]] Thread* thread() const {
-            Thread* const t = accountThread.load(std::memory_order_relaxed);
-            return t != nullptr ? t : parserThread;
+            return accountThread != nullptr ? accountThread : parserThread;
+        }
+
+        // Size of the transaction pool in chunks (0 while the pool is not initialized). Read by CommitSorter to
+        // derive the backpressure bound: every buffered commit owns at least one chunk of that pool, so a backlog
+        // larger than the pool can hold can not be relieved by the swap pump any more. Written once, by
+        // Ctx::initialize(), before any thread is spawned - hence the plain read.
+        [[nodiscard]] uint64_t getMemoryChunksMax() const {
+            return memoryChunksMax;
         }
         Thread* writerThread{nullptr};
-        // Defect C: while the parser is blocked in swappedMemoryInit() it can not drive the commit sorter, and
-        // the transaction it waits for is released by exactly that flush - the two wait on each other. The
-        // writer thread takes a sorter tick over while this flag is set (see Builder::sleepForWriterWork); in
-        // every other situation the parser keeps driving the sorter alone, so the normal path keeps the single
-        // threaded order and no lock is taken.
+        // Defect C: while the parser is blocked in swappedMemoryInit() it publishes no higher water-mark (it is
+        // the only thread that does), and the transaction it waits for is released by a delivery that only a
+        // higher water-mark would allow - the two wait on each other. The delivery thread watches this flag and
+        // delivers the lowest buffered event without waiting for the water-mark while it is set
+        // (CommitSorter::tick with flushLowest, see DeliveryExecutor::run).
         std::atomic<bool> parserInSwapWait{false};
-        // Set while the writer is driving the sorter tick because of the flag above. Only the transition is
-        // reported, so that a regression run can tell from the log whether a take-over happened at all.
-        std::atomic<bool> sorterTickTakenOver{false};
-        // One delivery at a time, over every path that delivers (stage 3: the writer drives the sorter as well
-        // as the parser). The callbacks of a flush run outside the sorter lock and write into the builder, so two
-        // deliveries in parallel would also step over the accounting thread below and over the deferred releases.
-        // Taken by CommitSorter::flushReady/flushAll/tick around the whole delivery.
+        // One delivery at a time, over every path that delivers (stage 4: the delivery thread, and the emergency
+        // tick of the writer). The callbacks of a flush run outside the sorter lock and write into the builder, so
+        // two deliveries in parallel would also step over the accounting thread below and over the deferred
+        // releases. Taken by CommitSorter::flushReady/flushAll/tick around the whole delivery.
         std::mutex deliveryMtx;
         // Stage 2 of the accounting decoupling: the delivery that runs on another thread than the parser (the
         // writer, defect C) must not be interrupted by the parser it releases. The release of a swap key is what
@@ -452,19 +457,32 @@ namespace OpenLogReplicator {
         // from its beginning instead of ending the run (warning 60058). Counted to see how often the saved
         // position is not usable - it is a cost (the archive is read again), not a fault.
         std::atomic<uint64_t> statResumeFallbacks{0};
+        // Counters of the silent wait of the delivery: a transaction that was swapped out is read back chunk by
+        // chunk (Ctx::swappedMemoryGet), and that wait has no trace line and no warning of its own - which is why
+        // the production stall of 2026-10-15 looked like a lock problem (60055 reported "deliveryMtx swapMtx" and
+        // nothing else). A single wait long enough to be the reason for a stall is reported by warning 60061, the
+        // totals are named by warning 60055.
+        std::atomic<uint64_t> statSwapGetWaits{0};
+        std::atomic<uint64_t> statSwapGetWaitUs{0};
+        // Set by the delivery thread while it is inside a sorter tick, so that a "no progress" report of the parser
+        // can tell "blocked by a running delivery" from "blocked by something else".
+        std::atomic<uint64_t> deliveryActiveSinceUs{0};
+        // Set by the replicator while the parser has no archive to read at all (the archive list returned nothing):
+        // no progress is the expected state then and warning 60056 is what reports it - the watchdog (60055) stays
+        // quiet, otherwise a run that simply waits for the next archive of a quiet instance looks like a stall.
+        std::atomic<bool> parserWaitingForArchive{false};
         // "always" reports the line even when all four are zero (the end of a run: the zeros are the answer then).
         void reportParseStats(bool always = false);
         // One swap entry disappeared while the parser was still using it: counted and reported as warning 60057
         void swappedEntryMissing(const char* stage, const SwapKey& swapKey);
 
         void releaseDeferredSwaps();
-        // Executor of the out-of-parser tick. Set by the replicator (which already owns one for its own idle
-        // tick): allocating a parser at the moment the pool is exhausted - exactly when the tick is needed -
-        // would block on memory.
-        // The executor of the commit sorter tick that runs outside the parser (defect C). Owned here on
-        // purpose: it is used from the replicator thread and from a writer thread, so it has to outlive both
-        // (Ctx does). Created once, at the start of Replicator::run(), before the writer can take a tick over.
-        std::unique_ptr<CommitSorter::Executor> sorterExecutor{nullptr};
+        // Stage 4 puts the delivery on a thread of its own (DeliveryExecutor). That thread is owned by the
+        // replicator that runs it (Replicator::deliveryExecutor) and not here: Ctx.h can not include
+        // DeliveryExecutor.h (it derives from Thread, and Thread.h includes Ctx.h), and a std::unique_ptr of an
+        // incomplete type as a member of Ctx does not compile in the translation units that only see Ctx.h
+        // (measured: "invalid application of sizeof to incomplete type" from every TU that instantiates the
+        // destructor of the member).
 
         // swappedMemoryInit() waits for the same transaction to be delivered. The wait stays unbounded (see the
         // comment there), but it reports itself with this interval: an unbounded silent wait is

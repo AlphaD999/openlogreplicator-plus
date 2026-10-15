@@ -48,6 +48,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include "../metadata/Metadata.h"
 #include "../metadata/Schema.h"
 #include "../reader/Reader.h"
+#include "DeliveryExecutor.h"
 #include "OpCode0501.h"
 #include "OpCode0502.h"
 #include "OpCode0504.h"
@@ -856,6 +857,14 @@ namespace OpenLogReplicator {
         // to be dropped instead of waiting for its delivery - see TransactionBuffer::addCommittedTombstone.
         transactionBuffer->addCommittedTombstone(transaction->xid, transaction->conId, transaction->thread);
 
+        // The transaction is handed over here: with a commit sorter it is delivered (and deleted) by the delivery
+        // thread, which may do so at any moment after the enqueue below. The cache of "the transaction of the
+        // record analyzed last" - read by the 5.13/5.14 attribute records - is therefore given up first, and only
+        // when it is this very transaction: a record of another session that follows the commit keeps its
+        // transaction as before. Without a sorter the parser delivers (and deletes) the transaction below itself.
+        if (transaction == lastTransaction)
+            lastTransaction = nullptr;
+
         if (metadata->commitSorter != nullptr) {
             // Defer the flush until the low-water-mark over all redo threads passes the commit SCN
             metadata->commitSorter->enqueueCommit(transaction, transaction->commitScn);
@@ -897,76 +906,19 @@ namespace OpenLogReplicator {
     }
 
     void Parser::executeCommit(Transaction* transaction) {
-        if ((transaction->commitScn > metadata->firstDataScn && !transaction->system) ||
-            (transaction->commitScn > metadata->firstSchemaScn && transaction->system)) {
-            if (transaction->begin) {
-                transaction->flush(metadata, builder);
-                ctx->thread()->contextSet(Thread::CONTEXT::CPU);
-                if (ctx->metrics != nullptr) {
-                    if (transaction->rollback)
-                        ctx->metrics->emitTransactionsRollbackOut(1);
-                    else
-                        ctx->metrics->emitTransactionsCommitOut(1);
-                }
-
-                if (ctx->stopTransactions > 0 && metadata->isNewData(lwnScn, builder->lwnIdx)) {
-                    --ctx->stopTransactions;
-                    if (ctx->stopTransactions == 0) {
-                        ctx->info(0, "shutdown started - exhausted number of transactions");
-                        ctx->stopSoft();
-                    }
-                }
-
-                if (transaction->shutdown && metadata->isNewData(lwnScn, builder->lwnIdx)) {
-                    ctx->info(0, "shutdown started - initiated by debug transaction " + transaction->xid.toString() +
-                              " at scn " + transaction->commitScn.toString());
-                    ctx->stopSoft();
-                }
-            } else {
-                if (ctx->metrics != nullptr) {
-                    if (transaction->rollback)
-                        ctx->metrics->emitTransactionsRollbackPartial(1);
-                    else
-                        ctx->metrics->emitTransactionsCommitPartial(1);
-                }
-                ctx->warning(60011, "skipping transaction with no beginning: " + transaction->toString(ctx));
-            }
-        } else {
-            if (ctx->metrics != nullptr) {
-                if (transaction->rollback)
-                    ctx->metrics->emitTransactionsRollbackSkip(1);
-                else
-                    ctx->metrics->emitTransactionsCommitSkip(1);
-            }
-            if (unlikely(ctx->isTraceSet(Ctx::TRACE::TRANSACTION)))
-                ctx->logTrace(Ctx::TRACE::TRANSACTION, "skipping transaction already committed: " + transaction->toString(ctx));
-        }
-
-        transactionBuffer->dropTransaction(transaction->xid, transaction->conId, transaction->thread, transaction);
-        transaction->purge(ctx);
+        // Single threaded path only (no commit sorter, see appendToTransactionCommit): the delivery itself is the
+        // same body the delivery thread runs, so the output is unchanged. With a sorter this parser never delivers
+        // - the delivery has its own thread (DeliveryExecutor) - and this instance of the callback is not used.
+        DeliveryExecutor::executeCommitCommon(ctx, builder, metadata, transactionBuffer, transaction);
+        // The parser delivered it here, so the reference it may still hold has to go. With a sorter the transaction
+        // is handed over before that (appendToTransactionCommit releases it before the enqueue), because the
+        // delivery thread may delete it at any moment after the enqueue.
         lastTransaction = nullptr;
-        delete transaction;
     }
 
     void Parser::executeCheckpoint(const CheckpointEvent& event) {
-        builder->processCheckpoint(event.sequence, event.scn, event.timestamp, event.fileOffset, event.switchRedo);
-
-        Seq minSequence = Seq::none();
-        FileOffset minFileOffset;
-        Xid minXid;
-        transactionBuffer->checkpoint(minSequence, minFileOffset, minXid);
-        metadata->checkpoint(ctx->thread(), event.thread, event.scn, event.timestamp, event.sequence, event.fileOffset, event.bytes,
-                             minSequence, minFileOffset, minXid);
-
-        if (ctx->stopCheckpoints > 0 && metadata->isNewData(event.scn, builder->lwnIdx)) {
-            --ctx->stopCheckpoints;
-            if (ctx->stopCheckpoints == 0) {
-                ctx->info(0, "shutdown started - exhausted number of checkpoints");
-                ctx->stopSoft();
-            }
-        }
-        if (ctx->metrics != nullptr)
-            ctx->metrics->emitCheckpointsOut(1);
+        // Same as executeCommit: the body is shared with the delivery thread, only the parser runs it here.
+        DeliveryExecutor::executeCheckpointCommon(ctx, builder, metadata, transactionBuffer, event);
     }
 
     void Parser::appendToTransaction(RedoLogRecord* redoLogRecord1, RedoLogRecord* redoLogRecord2) {
@@ -1734,7 +1686,11 @@ namespace OpenLogReplicator {
                             metadata->commitSorter->enqueueCheckpoint(event);
                             if (unlikely(ctx->isTraceSet(Ctx::TRACE::LWN)))
                                 ctx->logTrace(Ctx::TRACE::LWN, "* checkpoint: " + lwnScn.toString());
-                            metadata->commitSorter->flushReady(this);
+                            // The delivery runs on its own thread (DeliveryExecutor): this boundary only publishes
+                            // the water-mark of the thread and enqueues the checkpoint event, the flush is the
+                            // delivery thread's job. Until stage 4 the parser flushed here, which is why it stood
+                            // still for as long as a delivery took (warning 60055).
+                            metadata->commitSorter->notifyDelivery();
                         } else {
                             builder->processCheckpoint(sequence, lwnScn, lwnTimestamp, FileOffset(currentBlock, reader->getBlockSize()), switchRedo);
 
@@ -1765,13 +1721,15 @@ namespace OpenLogReplicator {
 
                         // Commits enqueued in the commit sorter before the first data SCN have to be released
                         // as well. The sorter holds a pointer to each finished transaction and the transaction
-                        // holds at least one memory chunk, so without this flush the whole part of the archive
+                        // holds at least one memory chunk, so without a flush the whole part of the archive
                         // before the start position (the reader always begins at the archive start, which can
                         // be hundreds of megabytes earlier) stays in memory: every committed transaction is
                         // reported as an open transaction, the pool is exhausted and the run stalls. The flush
-                        // itself is still gated by the low-water-mark, so the output order does not change.
+                        // itself is still gated by the low-water-mark, so the output order does not change - and
+                        // it is the delivery thread that runs it (the water-mark published above and this
+                        // notification are what wakes it up).
                         if (metadata->commitSorter != nullptr)
-                            metadata->commitSorter->flushReady(this);
+                            metadata->commitSorter->notifyDelivery();
                     }
 
                     lwnNumCnt = 0;
@@ -1841,7 +1799,7 @@ namespace OpenLogReplicator {
                         event.bytes = static_cast<uint64_t>(currentBlock - lwnConfirmedBlock) * reader->getBlockSize();
                         event.switchRedo = switchRedo;
                         metadata->commitSorter->enqueueCheckpoint(event);
-                        metadata->commitSorter->flushReady(this);
+                        metadata->commitSorter->notifyDelivery();
                     } else {
                         builder->processCheckpoint(sequence, lwnScn, lwnTimestamp, FileOffset(currentBlock, reader->getBlockSize()), switchRedo);
                     }
@@ -1867,8 +1825,10 @@ namespace OpenLogReplicator {
                     event.bytes = static_cast<uint64_t>(currentBlock - lwnConfirmedBlock) * reader->getBlockSize();
                     event.switchRedo = false;
                     metadata->commitSorter->enqueueCheckpoint(event);
-                    // Soft shutdown: flush everything ignoring the watermark
-                    metadata->commitSorter->flushAll(this);
+                    // Soft shutdown: the delivery thread flushes everything ignoring the water-mark (it drains
+                    // the sorter before it leaves, see DeliveryExecutor::run) - the parser does not deliver any
+                    // more, so it only wakes it up here.
+                    metadata->commitSorter->notifyDelivery();
                 } else {
                     builder->processCheckpoint(sequence, lwnScn, lwnTimestamp, FileOffset(currentBlock, reader->getBlockSize()), false);
                 }
@@ -1957,7 +1917,12 @@ namespace OpenLogReplicator {
             ctx->dumpStream->close();
         }
 
-        builder->flush();
+        // Without a commit sorter this thread builds and flushes itself (the single threaded path). With one, the
+        // builder has a single writer and it is the delivery thread (DeliveryExecutor): this thread must not touch
+        // the builder state any more - the messages it builds are made visible to the writer by the flush the
+        // delivery thread runs after a tick that delivered something.
+        if (metadata->commitSorter == nullptr)
+            builder->flush();
         freeLwn();
 
         // A pass that ended in none of the places above (a shutdown, or an archive read to its end)

@@ -296,7 +296,7 @@ current low-water-mark, the per thread watermarks (a thread released by `idle-th
 instance recovery is marked as such), how many archives are still in the list, how many were dropped as already
 parsed and how many are parked waiting for a missing predecessor.
 
-==== code 60055: "the parser made no progress for: <number> s (thread: <number>, file offset: <number>, pending commits: <number>) - locks held right now: <deliveryMtx|swapMtx|mtxTransaction|none of the probed ones>"
+==== code 60055: "the parser made no progress for: <number> s (thread: <number>, file offset: <number>, pending commits: <number>) - locks held right now: <deliveryMtx|swapMtx|mtxTransaction|none of the probed ones>, delivery: <idle|in flight for: <number> s>, swap chunk waits: <number> (<number> ms)"
 
 Only reported when the parser progress watchdog is enabled (`watchdog-us` in the `source` element, or the
 environment variable `OLR_WATCHDOG` in seconds - it wins). It is meant to be switched on when a run has to be
@@ -309,8 +309,16 @@ can hold it without a trace line of their own: `deliveryMtx` (a delivery is in f
 memory of the transactions). The probe is read only and released immediately; nothing about the call order
 changes.
 
+Since the delivery runs on a thread of its own (the `DeliveryExecutor` thread - the parser publishes its
+water-mark and enqueues, it does not deliver any more), a held `deliveryMtx` is *not* a sign of a stall: the gate
+covers a whole delivery and the delivery thread holds it while it builds. The two extra fields say what the
+delivery is doing (`delivery: in flight for: <number> s`, or `idle`) and how much of the time went into reading
+transactions back from the swap file (`swap chunk waits`, the silent wait of `Ctx::swappedMemoryGet`; a single one
+of them long enough to matter is reported by 60061).
+
 A parser waiting for the next archive of a thread is expected and is reported by 60056 instead - the watchdog
-stays quiet for it. The warning repeats with a doubling interval (capped at eight times the threshold).
+stays quiet for it (it is suppressed while the archive list has nothing to hand out). The warning repeats with a
+doubling interval (capped at eight times the threshold).
 
 ==== code 60056: "no archived redo log to read for: <number> s - the archive list source reports thread <number>: expected seq <number>, highest known seq <number>; ... (\"arch-wait-warn-us\")"
 
@@ -379,3 +387,41 @@ far more concurrently open transactions than the cap assumes. Raise the cap (it 
 At most one message per 30 seconds. A run that reports this has to be restarted (`pkill` +
 restart): the scheduler resumes from the checkpoint and the saved file offsets, so the data is not lost, it is
 only delayed.
+
+==== code 60061: "reading back the swapped out chunk <<number>> of transaction: <xid> (thread: <number>, conId: <number>) took <number> s - the delivery waits here for the memory manager, which brings one chunk back per iteration of its loop (\"swap-path\"), so a slow or full swap volume shows up as a stalled delivery"
+
+The delivery of a transaction that was swapped out reads its chunks back one by one
+(`Ctx::swappedMemoryGet`), and the memory manager brings back one chunk per iteration of its loop, each with a
+`stat`, an `open` (`O_DIRECT`), a `pread` and a `close` - plus one chunk written out per iteration
+(`MemoryManager::run`). The delivery therefore runs at the rate of that pump, and until this warning existed
+neither the wait nor the pump left any trace in the log: the production stall of 2026-10-15 (6 stalls in 7
+minutes, up to 70 s, delivered at about 150 transactions/s while the healthy rate was 500-1300/s) reported
+nothing but "locks held right now: deliveryMtx swapMtx" (60055), which reads like a lock problem.
+
+Reported when a single wait for one chunk exceeds 30 seconds (the same interval as 60050 uses for
+`Ctx::swappedMemoryInit`). The totals of these waits are named by 60055 (`swap chunk waits`). A run that reports
+this has "swap-path" on a volume that can not keep up with the transaction data rate: check that volume (a full
+file system reports its own error, a slow one does not), `swap-mb`, `memory-max-mb` and the transaction rate.
+
+==== code 60062: "the parser is waiting for the delivery for: <number> s - the commit sorter still holds <number> buffered commit(s) (limit: <number>, transaction pool: <number> chunk(s), thread watermarks: <...>); the parse of this thread is stopped on purpose: letting it go on would fill the pool with commits that are waiting for the low-water-mark (\"memory-max-mb\" / \"transaction-block-kb\")"
+
+The parser is stopped by the backpressure of the commit sorter (`CommitSorter::enqueueCommit`) for longer than
+30 seconds: the sorter holds more buffered commits than it is allowed to (its limit is half of the transaction
+pool in chunks), and the delivery can not free them because they are above the low-water-mark (the thread
+watermarks are named in the message).
+
+Why there is a bound at all: every buffered commit owns at least one chunk of the transaction pool, and a
+transaction that owns a single chunk can not be swapped out (the swap pump needs more than one), so a backlog
+larger than the pool can hold can not be relieved any more - the parser then blocks in `Ctx::getMemoryChunk`
+and the run ends with `ERROR 10017 out of memory`. Until the delivery got a thread of its own the parser also
+delivered inline, which bounded the backlog to one LWN window; with the delivery decoupled nothing paces the
+parser, so it is paced here. Measured in the reproduction rig before this bound existed: 4,500 buffered commits
+with a 4 GB pool and 1 MB blocks (4.5 GB) ended the run with 10017 while the same run on the previous code
+delivered 18,625 commits with a backlog of 650.
+
+A run that reports this keeps working - the wait ends as soon as the delivery drains the backlog (the lock is
+released while waiting, and the low-water-mark moves as soon as the other redo threads publish, or after
+`idle-thread-release-us`). It is reported once per wait, after 30 seconds. Seeing it regularly means the
+delivery is systematically slower than the parse: check 60061/60055 (swap read back), the writer's throughput
+(`60031`, `output queue is full`) and whether the pool is too small for the redo rate (`memory-max-mb`,
+`transaction-block-kb`).

@@ -35,6 +35,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include "../metadata/Metadata.h"
 #include "../metadata/RedoLog.h"
 #include "../metadata/Schema.h"
+#include "../parser/DeliveryExecutor.h"
 #include "../parser/Parser.h"
 #include "../parser/Transaction.h"
 #include "../reader/ReaderFilesystem.h"
@@ -48,7 +49,8 @@ namespace OpenLogReplicator {
             builder(newBuilder),
             metadata(newMetadata),
             transactionBuffer(newTransactionBuffer),
-            database(std::move(newDatabase)) {
+            database(std::move(newDatabase)),
+            deliveryExecutor(newCtx, newBuilder, newMetadata, newTransactionBuffer, newMetadata->commitSorter) {
         ctx->parserThread = this;
     }
 
@@ -66,9 +68,6 @@ namespace OpenLogReplicator {
         for (const Parser* parser: onlineRedoSet)
             delete parser;
         onlineRedoSet.clear();
-
-        delete flushParser;
-        flushParser = nullptr;
 
         pathMapping.clear();
         redoLogsBatch.clear();
@@ -199,11 +198,14 @@ namespace OpenLogReplicator {
             ctx->logTrace(Ctx::TRACE::THREADS, "replicator (" + ss.str() + ") start");
         }
 
-        // Defect C: the executor of the out-of-parser sorter tick has to be created here, before this thread can
-        // get stuck in Ctx::swappedMemoryInit. It can not be created at that moment: the memory pool is at its
-        // limit then, and the thread that would have to create it is exactly the one that is blocked.
-        if (metadata->commitSorter != nullptr && ctx->sorterExecutor == nullptr)
-            ctx->sorterExecutor = std::make_unique<Parser>(ctx, builder, metadata, transactionBuffer, 0, "");
+        // Stage 4: the delivery runs on a thread of its own, so this thread never delivers - it parses, publishes
+        // its water-mark and enqueues (see Parser::parse). The thread is spawned here and not when it is first
+        // needed: the moment it is needed (defect C: the parser blocked in Ctx::swappedMemoryInit) is exactly the
+        // moment the memory pool is at its limit and the replicator is the blocked thread.
+        if (metadata->commitSorter != nullptr && !deliveryStarted) {
+            deliveryStarted = true;
+            ctx->spawnThread(&deliveryExecutor);
+        }
 
         try {
             metadata->waitForWriter(ctx->parserThread);
@@ -936,6 +938,9 @@ namespace OpenLogReplicator {
 
                 logsProcessed = true;
                 processedThisPass = true;
+                // An archive is about to be parsed: the wait for one is over, so the progress watchdog (60055) is
+                // armed again (it is suppressed while the archive list has nothing to hand out).
+                ctx->parserWaitingForArchive.store(false, std::memory_order_relaxed);
                 if (metadata->commitSorter != nullptr)
                     metadata->commitSorter->threadReopened(parser->thread);
                 parser->reader = archReader;
@@ -1056,6 +1061,9 @@ namespace OpenLogReplicator {
             }
 
             if (processedThisPass) {
+                // Something was parsed in this pass, so the parser is not waiting for an archive: the progress
+                // watchdog (60055) is armed again.
+                ctx->parserWaitingForArchive.store(false, std::memory_order_relaxed);
                 idleSince = 0;
                 lastIdleReport = 0;
                 continue;
@@ -1069,12 +1077,12 @@ namespace OpenLogReplicator {
             if (!ctx->isFlagSet(Ctx::REDO_FLAGS::ARCH_ONLY))
                 break;
 
-            // Committed transactions that still wait for the low-water-mark can only be flushed by the parser
-            // (CommitSorter::flushReady is called from there), so once the parser stops reading they can not
-            // move at all: the run then looks exactly like an idle one and stays that way. Reported only when a
-            // buffered event is at or below the low-water-mark - that is an event the sorter would release
-            // right away, so it is the signature of a stall and not the normal wait for the next archive of
-            // the other redo thread. At most once per 30 s.
+            // A buffered event that is at or below the low-water-mark is one the delivery thread would release
+            // right away - so a run that holds one while nothing is read is a stall and not the normal wait for
+            // the next archive of another redo thread. (Until the delivery got its own thread this was the
+            // signature of a parser that stops reading: only the parser called the flush, so nothing could move
+            // once it stopped. The delivery is independent of that now, which is exactly why the event has to be
+            // reported: nothing else moves the water-mark while no redo is parsed.) At most once per 30 s.
             const uint64_t idleNow = ctx->clock->getTimeUt();
             if (idleSince == 0)
                 idleSince = idleNow;
@@ -1094,22 +1102,22 @@ namespace OpenLogReplicator {
                 lastIdleReport = idleNow;
             }
 
-            // Nothing was parsed in this pass, so nothing drove the commit sorter: both the release of an
-            // idle redo thread (CommitSorter::refreshIdle, called from setThreadWatermark) and the flush
-            // (CommitSorter::flushReady) only run from the parser. Without this tick a redo thread that
-            // produces no archive keeps holding back the low-water-mark and every committed transaction
-            // above it stays in memory - the run then looks exactly like an idle one (warning 60047 above
-            // only covers the case where the sorter would release something, not this one).
-            // Same thread as the parser, so no locking is needed.
+            // Nothing was parsed in this pass, so nothing published a water-mark: a redo thread that produces no
+            // archive would keep holding back the low-water-mark and every committed transaction above it stays
+            // in memory - the run then looks exactly like an idle one (warning 60047 above only covers the case
+            // where the sorter would release something, not this one). The release of such a thread
+            // (CommitSorter::refreshIdle) is time based, so it has to be driven from somewhere even when nothing
+            // is parsed; the delivery thread does the same thing in its own loop, this is the second driver that
+            // is awake exactly when the delivery thread has nothing to do.
             if (metadata->commitSorter != nullptr && metadata->commitSorter->getPendingEvents() > 0) {
                 metadata->commitSorter->refreshIdle(idleNow, ctx->idleThreadReleaseUs);
-                // The parser of the archive that was read last is gone by now (one is created and deleted
-                // per archive), so a dedicated one executes the released events here.
-                if (flushParser == nullptr)
-                    flushParser = new Parser(ctx, builder, metadata, transactionBuffer, 0, "");
-                metadata->commitSorter->flushReady(flushParser);
+                metadata->commitSorter->notifyDelivery();
             }
 
+            // From here the parser waits for the archive list to hand out a new archive: no progress is the
+            // expected state and warning 60056 is what reports it, so the parser progress watchdog (60055) stays
+            // quiet instead of reporting a stall for every quiet instance of the cluster.
+            ctx->parserWaitingForArchive.store(true, std::memory_order_relaxed);
             contextSet(CONTEXT::SLEEP);
             ctx->usleepInt(ctx->archReadSleepUs);
             contextSet(CONTEXT::CPU);

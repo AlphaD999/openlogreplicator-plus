@@ -32,6 +32,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include "../common/RedoLogRecord.h"
 #include "../common/Thread.h"
 #include "../common/exception/RedoLogException.h"
+#include "../parser/DeliveryExecutor.h"
 
 namespace OpenLogReplicator {
     class Parser;
@@ -50,6 +51,14 @@ namespace OpenLogReplicator {
         Metadata* metadata;
         TransactionBuffer* transactionBuffer;
         std::string database;
+        // Stage 4: the thread that runs every delivery (and with it the commit sorter tick, including the defect C
+        // flushLowestPending). Owned here and not by Ctx: Ctx.h can not include DeliveryExecutor.h (it derives
+        // from Thread, Thread.h includes Ctx.h) and a std::unique_ptr of an incomplete type as a member of Ctx
+        // does not compile in the translation units that only see Ctx.h. The thread is spawned in run() and is
+        // joined by Ctx::mainFinish() - which ~OpenLogReplicator calls before it deletes the replicators - so the
+        // life times agree.
+        DeliveryExecutor deliveryExecutor;
+        bool deliveryStarted{false};
         std::string redoCopyPath;
         // Redo log files
         Reader* archReader{nullptr};
@@ -65,10 +74,6 @@ namespace OpenLogReplicator {
         std::deque<Parser*> gapArchives;
         std::set<Parser*> onlineRedoSet;
         std::set<Reader*> readers;
-        // Parser used to execute the events that the commit sorter releases outside of parsing (see the idle
-        // tick in Replicator.cpp). It never parses anything: the transaction buffer and the builder are
-        // shared by all parsers, so it produces the same output as the parser that parsed the archive.
-        Parser* flushParser{nullptr};
         std::vector<std::string> pathMapping;
         std::vector<std::string> redoLogsBatch;
         // RAC thread activity, taken from the archived redo log list itself: the highest sequence seen for the

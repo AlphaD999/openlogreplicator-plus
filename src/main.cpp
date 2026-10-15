@@ -88,6 +88,18 @@ namespace {
         mainCtx->signalHandler(s);
     }
 
+    // SIGTERM is what an operator stop looks like: pkill, systemd "stop" (TimeoutStopSec), a container restart.
+    // Until this was registered the process was killed on the spot, which lost every transaction that was still
+    // in flight (and it is why two runs of the same archives can not be compared after a kill: both lose their
+    // tail). This is the same soft shutdown the debug counters use ("stop-transactions"/"stop-checkpoints"): the
+    // parse stops, the delivery drains the commit sorter, the writer flushes and the checkpoint is written.
+    // NOTE: like the SIGINT handler above this one takes Ctx::mtx from the signal stack, so it is not
+    // async-signal-safe - it is what every handled signal in this file does.
+    void signalSoftStop(int s) {
+        mainCtx->info(0, "caught signal: " + std::to_string(s) + " - soft shutdown requested, the sorter is drained first");
+        mainCtx->stopSoft();
+    }
+
     void signalCrash(int sig __attribute__((unused))) {
         printStacktrace();
         exit(1);
@@ -201,6 +213,7 @@ int main(int argc, char** argv) {
     OpenLogReplicator::Ctx ctx;
     mainCtx = &ctx;
     signal(SIGINT, signalHandler);
+    signal(SIGTERM, signalSoftStop);
     signal(SIGPIPE, signalHandler);
     signal(SIGSEGV, signalCrash);
     signal(SIGUSR1, signalDump);
@@ -220,6 +233,7 @@ int main(int argc, char** argv) {
     const int ret = mainFunction(argc, argv);
 
     signal(SIGINT, nullptr);
+    signal(SIGTERM, nullptr);
     signal(SIGPIPE, nullptr);
     signal(SIGSEGV, nullptr);
     signal(SIGUSR1, nullptr);

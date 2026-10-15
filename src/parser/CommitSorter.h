@@ -20,6 +20,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #ifndef COMMIT_SORTER_H_
 #define COMMIT_SORTER_H_
 
+#include <condition_variable>
 #include <map>
 #include <mutex>
 #include <set>
@@ -78,7 +79,10 @@ class Thread;
         }
 
         // Takes ownership of the flush decision; the transaction itself stays in the
-        // transaction buffer until the executor drops it
+        // transaction buffer until the executor drops it.
+        // Blocks while the sorter holds more than "pendingLimit" buffered events (backpressure, see
+        // pendingLimit): the parser is the only caller, so this is the point where it is stopped when it walks
+        // away from the delivery. The lock is released while it waits.
         void enqueueCommit(Transaction* transaction, Scn commitScn);
         void enqueueCheckpoint(const CheckpointEvent& event);
         // All records with scn <= parsedScn have been analyzed for the thread. "currentTime" is the
@@ -92,23 +96,40 @@ class Thread;
         // Flush all events with scn <= low-water-mark. Every path that delivers takes Ctx::deliveryMtx for the
         // whole delivery, the callbacks run outside the sorter lock. "deliveryThread" is the thread the delivery
         // is booked to (Ctx::accountThread, stage 1) and the thread whose swap key releases are held back until
-        // the delivery is over (Ctx::deferSwapReleases, stage 2). The parser passes nothing: its deliveries are
-        // booked to the parser (Ctx::thread() falls back to it) and there is nothing to hold back.
+        // the delivery is over (Ctx::deferSwapReleases, stage 2). The delivery thread passes itself (it is the one
+        // that delivers); the single threaded path without a sorter passes nothing, its delivery is booked to the
+        // parser (Ctx::thread() falls back to it) and there is nothing to hold back.
         void flushReady(Executor* executor, Thread* deliveryThread = nullptr);
         // Release the redo threads whose parsed SCN did not advance for "idleReleaseUs" (0 = disabled). Split
         // out of setThreadWatermark so that it can also run while nothing is being parsed.
         void refreshIdle(uint64_t currentTime, uint64_t idleReleaseUs);
         // Flush everything ignoring the watermark (soft shutdown)
         void flushAll(Executor* executor, Thread* deliveryThread = nullptr);
-        // Stage 3, the independent delivery driver: drive the sorter off the parser thread - release the idle
-        // threads and flush what the low-water-mark allows. The parser keeps its own flush points, this is what
-        // makes the delivery independent of them: it no longer waits for the parser to reach one, it runs while
-        // the writer has nothing to write. With "flushLowest" the delivery also bypasses the low-water-mark,
-        // which is the defect C emergency: the parser is blocked in Ctx::swappedMemoryInit() waiting for the
-        // delivery it can not run itself, and while it is blocked nothing publishes a higher water-mark, so
-        // waiting for the water-mark would be waiting forever.
+        // Body of the delivery loop of the delivery thread (DeliveryExecutor): release the idle threads and flush
+        // what the low-water-mark allows, in one call. With "flushLowest" the delivery also bypasses the
+        // low-water-mark, which is the defect C emergency: the parser is blocked in Ctx::swappedMemoryInit()
+        // waiting for the delivery it can not run itself, and while it is blocked nothing publishes a higher
+        // water-mark, so waiting for the water-mark would be waiting forever.
         void tick(Executor* executor, uint64_t currentTime, uint64_t idleReleaseUs, Thread* deliveryThread = nullptr,
                   bool flushLowest = false);
+
+        // Stage 4, the delivery driver: the delivery has a thread of its own (DeliveryExecutor) and is woken here
+        // instead of being run by whoever happens to call the sorter. Woken by every change that can make an event
+        // deliverable - an event was enqueued, a water-mark moved, a redo thread was closed or reopened - so the
+        // delivery no longer waits for the parser to reach one of its flush points and the parser no longer runs a
+        // delivery at all (see Parser::parse: it only publishes the water-mark and enqueues).
+        void notifyDelivery();
+        // Wait of the delivery thread. Returns false when the timeout expired without a notification: the timeout
+        // is not a poll loop, it only covers the two decisions nobody notifies about - the time based idle thread
+        // release (refreshIdle) and the shutdown.
+        bool waitForDelivery(uint64_t timeoutUs);
+
+        // Backpressure (stage 2): enqueueCommit() waits while the sorter holds more than pendingLimit buffered
+        // events. The wait is a bounded wait per round (the delivery notifies when the backlog is back under the
+        // limit), and a wait longer than BACKPRESSURE_REPORT_US is reported once (warning 60062): a bounded wait
+        // that nobody can see is the same blind spot the stalls of 2026-10-15 hid in.
+        static constexpr uint64_t BACKPRESSURE_WAIT_MS{100};
+        static constexpr uint64_t BACKPRESSURE_REPORT_US{30000000};
 
         // Deliver the lowest buffered event(s) even though the low-water-mark has not reached them. Only called
         // by tick() with flushLowest (the defect C emergency). It is safe there: the event is a *commit* (the
@@ -157,6 +178,28 @@ class Thread;
         // thread (see tick) the sorter is no longer driven by the parser thread alone.
         mutable std::mutex sorterMtx;
 
+        // Delivery wake up (stage 4): the sequence number counts every change that can make an event deliverable
+        // and the delivery thread waits for it to differ from the value it saw. A condition variable and not a
+        // flag, because the changes and the wait are on two threads.
+        uint64_t deliverySeq{0};
+        std::condition_variable deliveryCv;
+        // Like the other state changes: only called with sorterMtx held (the wait is race free then, because the
+        // waiter re-reads the sequence under the same lock).
+        void notifyDeliveryLocked();
+
+        // Backpressure, the second half of stage 2: how many buffered events the sorter may hold before the
+        // parser is stopped in enqueueCommit(). 0 = unlimited. Derived once from the transaction pool
+        // (initPendingLimitLocked): a buffered commit owns at least one chunk of it, and a transaction that owns
+        // a single chunk can not be swapped out, so a backlog beyond the pool can not be relieved any more - the
+        // parser then blocks in Ctx::getMemoryChunk and walks into "out of memory" (10017). Until the delivery
+        // got a thread of its own (stage 4) the parser delivered inline and the backlog was bounded by one LWN
+        // window; with the delivery decoupled nothing paces the parser, so it is paced here. Measured in the
+        // reproduction rig before this existed: 4,500 buffered commits with a 4 GB pool and 1 MB blocks
+        // (= 4.5 GB) ended the run with 10017.
+        uint64_t pendingLimit{0};
+        std::condition_variable backpressureCv;
+        // Called with sorterMtx held, only the first time it can derive a bound.
+        void initPendingLimitLocked();
         struct Event {
             Scn scn;
             bool commit;

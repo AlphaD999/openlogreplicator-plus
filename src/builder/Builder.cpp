@@ -2565,30 +2565,16 @@ namespace OpenLogReplicator {
         if (unlikely(ctx->watchdogUs > 0))
             ctx->watchdogCheck(metadata->probeTransactionMutex());
 
-        // Stage 3, the independent delivery driver: the writer is idle right here (no message to deliver) and is
-        // not part of the parse, so it drives the commit sorter whenever the sorter has something buffered. The
-        // delivery no longer waits for the parser to reach one of its flush points - only the low-water-mark
-        // decides what may be delivered (CommitSorter::flushReady), so the output order is unchanged and the
-        // parser keeps its own flush points. Both paths take one gate inside the sorter (Ctx::deliveryMtx).
-        //
-        // The emergency stays: while the parser is blocked in Ctx::swappedMemoryInit() (defect C, warning 60050)
-        // nothing publishes a higher water-mark, so the delivery it waits for has to bypass the water-mark.
-        // A hard shutdown (a fatal error) must not start another delivery: at that moment the replicator
-        // thread is already tearing its state down (transactionBuffer->purge()), and the two run without a
-        // common lock.
-        if (metadata->commitSorter != nullptr && ctx->sorterExecutor != nullptr && !ctx->hardShutdown &&
-            metadata->commitSorter->getPendingEvents() > 0) {
-            const bool parserBlocked = ctx->parserInSwapWait.load(std::memory_order_relaxed);
-            if (parserBlocked && !ctx->sorterTickTakenOver.exchange(true, std::memory_order_relaxed))
-                ctx->info(0, "the parser is blocked waiting for a swapped transaction to be delivered - the writer "
-                             "takes the commit sorter tick over to release it (defect C)");
-            // The delivery is booked to this thread and its swap key releases are held back until it is over:
-            // that is what the sorter does for a delivery that does not run on the parser (stage 1 + 2, see
-            // CommitSorter::flushReady and Ctx::accountThread / Ctx::deferSwapReleases).
-            metadata->commitSorter->tick(ctx->sorterExecutor.get(), ctx->clock->getTimeUt(), ctx->idleThreadReleaseUs,
-                                         t, parserBlocked);
-        } else
-            ctx->sorterTickTakenOver.store(false, std::memory_order_relaxed);
+        // Stage 4: the delivery has a thread of its own (DeliveryExecutor), so this thread does not deliver any
+        // more - it only nudges the delivery thread. Running a tick here would make the writer wait behind a
+        // delivery that is in flight (the gate Ctx::deliveryMtx covers a whole delivery, and a delivery reads the
+        // transactions back from the swap file chunk by chunk), while draining the messages a delivery produces is
+        // this thread's own work. The defect C emergency (a parser blocked in Ctx::swappedMemoryInit) is the
+        // delivery thread's job as well: it brings the lowest buffered event out without waiting for the
+        // water-mark while the parser is blocked (see DeliveryExecutor::run).
+        if (metadata->commitSorter != nullptr && !ctx->hardShutdown &&
+            metadata->commitSorter->getPendingEvents() > 0)
+            metadata->commitSorter->notifyDelivery();
 
         {
             t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::WRITER_DONE);
@@ -2596,16 +2582,9 @@ namespace OpenLogReplicator {
             t->contextSet(Thread::CONTEXT::WAIT, Thread::REASON::WRITER_NO_WORK);
             if (queueSize > 0)
                 condNoWriterWork.wait_for(lck, std::chrono::nanoseconds(nanoseconds));
-            else if (ctx->parserInSwapWait.load(std::memory_order_relaxed))
-                // Defect C: the parser is blocked in Ctx::swappedMemoryInit() waiting for the delivery of a
-                // transaction that holds the swap key it needs. The tick above (flushLowestPending) releases the
-                // buffered commits one group per call, so with the five second idle wait below the parser waits
-                // minutes for its key (measured in production: 1,020 s; in the rig: 318 pending commits and no
-                // progress for 8 minutes). While it is blocked, come back a hundred times a second instead: it is
-                // the same tick on the same path - only the rate the waiter can live with. The delivery itself
-                // stays serialized by Ctx::deliveryMtx, so nothing else changes.
-                condNoWriterWork.wait_for(lck, std::chrono::milliseconds(10));
             else
+                // Nothing is in flight, so a longer wait is fine: the delivery thread wakes this thread up
+                // (Builder::flush) as soon as it has built messages, and the five seconds are only the fallback.
                 condNoWriterWork.wait_for(lck, std::chrono::seconds(5));
         }
         t->contextSet(Thread::CONTEXT::CPU);

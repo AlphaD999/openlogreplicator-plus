@@ -17,6 +17,7 @@ You should have received a copy of the GNU Affero General Public License
 along with this program; see the file LICENSE;
 If not, see <http://www.gnu.org/licenses/>. */
 
+#include "../common/Clock.h"
 #include "../common/Ctx.h"
 #include "CommitSorter.h"
 #include "Transaction.h"
@@ -35,10 +36,51 @@ namespace OpenLogReplicator {
         event->scn = commitScn;
         event->commit = true;
         event->transaction = transaction;
-        std::lock_guard const lck(sorterMtx);
+        std::unique_lock lck(sorterMtx);
         events[commitScn].push_back(event);
         ++pendingEvents;
         syncPendingEvents();
+        notifyDeliveryLocked();
+
+        // Backpressure (stage 2): with the delivery on its own thread (stage 4) nothing else paces the parser -
+        // it can walk away from the delivery until the transaction pool is full, and a buffered commit that owns
+        // a single chunk can not be swapped out, so the pool can not be relieved any more (measured: 4,500
+        // buffered commits, 4 GB pool, 1 MB blocks -> "ERROR 10017 out of memory"). Stop it here instead: the
+        // delivery notifies when the backlog is back under the limit, and the lock is released while waiting, so
+        // this thread does not hold the delivery back (the sorter lock is what it needs to take the events out).
+        initPendingLimitLocked();
+        if (ctx == nullptr || pendingLimit == 0 || pendingEvents <= pendingLimit)
+            return;
+
+        bool reported = false;
+        const uint64_t waitingSince = ctx->clock->getTimeUt();
+        while (pendingEvents > pendingLimit && !ctx->hardShutdown && !ctx->softShutdown) {
+            backpressureCv.wait_for(lck, std::chrono::milliseconds(BACKPRESSURE_WAIT_MS));
+            const uint64_t now = ctx->clock->getTimeUt();
+            if (reported || now <= waitingSince || now - waitingSince < BACKPRESSURE_REPORT_US)
+                continue;
+            reported = true;
+            ctx->warning(60062, "the parser is waiting for the delivery for: " + std::to_string((now - waitingSince) / 1000000) +
+                         " s - the commit sorter still holds " + std::to_string(pendingEvents) + " buffered commit(s) "
+                         "(limit: " + std::to_string(pendingLimit) + ", transaction pool: " +
+                         std::to_string(ctx->getMemoryChunksMax()) + " chunk(s), thread watermarks: " +
+                         getThreadWatermarksText() + "); the parse of this thread is stopped on purpose: letting it go on "
+                         "would fill the pool with commits that are waiting for the low-water-mark (\"memory-max-mb\" / "
+                         "\"transaction-block-kb\")");
+        }
+    }
+
+    void CommitSorter::initPendingLimitLocked() {
+        if (pendingLimit != 0 || ctx == nullptr)
+            return;
+
+        const uint64_t chunks = ctx->getMemoryChunksMax();
+        if (chunks == 0)
+            return;
+        // Half of the pool: the other half has to take the open (not yet committed) transactions, the builder
+        // buffers and the reader. Every buffered commit owns at least one chunk, so with this bound the pool can
+        // never be exhausted by the backlog alone (which is the state that ended the run with 10017 before).
+        pendingLimit = chunks / 2;
     }
 
     void CommitSorter::enqueueCheckpoint(const CheckpointEvent& checkpoint) {
@@ -50,6 +92,7 @@ namespace OpenLogReplicator {
         events[checkpoint.scn].push_back(event);
         ++pendingEvents;
         syncPendingEvents();
+        notifyDeliveryLocked();
     }
 
     void CommitSorter::setThreadWatermark(uint16_t thread, Scn parsedScn, uint64_t currentTime, uint64_t idleReleaseUs) {
@@ -88,11 +131,37 @@ namespace OpenLogReplicator {
         }
 
         refreshIdleLocked(currentTime, idleReleaseUs);
+        // A water-mark that moved (or a redo thread that was released here) is what makes buffered events
+        // deliverable - the delivery thread has to be woken for every one of them.
+        notifyDeliveryLocked();
     }
 
     void CommitSorter::refreshIdle(uint64_t currentTime, uint64_t idleReleaseUs) {
         std::lock_guard const lck(sorterMtx);
         refreshIdleLocked(currentTime, idleReleaseUs);
+        notifyDeliveryLocked();
+    }
+
+    void CommitSorter::notifyDeliveryLocked() {
+        ++deliverySeq;
+        // Notified with the lock held on purpose: the waiter re-reads the sequence under the same lock, so the
+        // wake up can not be lost between the state change and the notification.
+        deliveryCv.notify_all();
+    }
+
+    void CommitSorter::notifyDelivery() {
+        {
+            std::lock_guard const lck(sorterMtx);
+            notifyDeliveryLocked();
+        }
+    }
+
+    bool CommitSorter::waitForDelivery(uint64_t timeoutUs) {
+        std::unique_lock lck(sorterMtx);
+        const uint64_t seq = deliverySeq;
+        return deliveryCv.wait_for(lck, std::chrono::microseconds(timeoutUs), [this, seq] {
+            return deliverySeq != seq || (ctx != nullptr && ctx->hardShutdown);
+        });
     }
 
     void CommitSorter::refreshIdleLocked(uint64_t currentTime, uint64_t idleReleaseUs) {
@@ -121,6 +190,8 @@ namespace OpenLogReplicator {
     void CommitSorter::threadClosed(uint16_t thread) {
         std::lock_guard const lck(sorterMtx);
         closedThreads.insert(thread);
+        // A closed thread stops holding back the low-water-mark: its buffered events may be deliverable now.
+        notifyDeliveryLocked();
     }
 
     void CommitSorter::threadReopened(uint16_t thread) {
@@ -136,6 +207,7 @@ namespace OpenLogReplicator {
                           it->second.toString() + " < " + watermark.toString() + ") - it does not hold it back until it "
                           "has caught up");
         }
+        notifyDeliveryLocked();
     }
 
     namespace {
@@ -148,19 +220,26 @@ namespace OpenLogReplicator {
         struct DeliveryScope {
             Ctx* ctx;
             bool active;
+            // The thread that had the delivery booked to it before this scope (Ctx::accountThread is thread local
+            // since stage 4, so this scope only ever changes the value of the thread it runs on: the delivery
+            // thread keeps itself booked for its whole life and this restores exactly that).
+            Thread* previousAccountThread{nullptr};
 
-            DeliveryScope(Ctx* ctx, Thread* deliveryThread) : ctx(ctx), active(deliveryThread != nullptr) {
+            // The parameter is not named "ctx" on purpose: that would shadow the member of the same name
+            // (-Wshadow, and a new warning in a file that has to stay clean).
+            DeliveryScope(Ctx* newCtx, Thread* deliveryThread) : ctx(newCtx), active(deliveryThread != nullptr) {
                 if (!active)
                     return;
                 ctx->deferSwapReleases = true;
-                ctx->accountThread.store(deliveryThread, std::memory_order_relaxed);
+                previousAccountThread = Ctx::accountThread;
+                Ctx::accountThread = deliveryThread;
             }
 
             ~DeliveryScope() {
                 if (!active)
                     return;
                 ctx->deferSwapReleases = false;
-                ctx->accountThread.store(nullptr, std::memory_order_relaxed);
+                Ctx::accountThread = previousAccountThread;
                 ctx->releaseDeferredSwaps();
             }
         };
@@ -189,29 +268,30 @@ namespace OpenLogReplicator {
         Scn limit;
         {
             std::lock_guard const lck(sorterMtx);
-        // Low-water-mark: minimum parsed SCN over all active (non-closed) threads
-        Scn lowWatermark = Scn::none();
-        for (const auto& [thread, parsedScn]: threadWatermark) {
-            if (closedThreads.find(thread) != closedThreads.end())
-                continue;
-            // Idle thread released by the timeout: it does not hold back the low-water-mark any more
-            if (idleThreads.find(thread) != idleThreads.end())
-                continue;
-            // Thread that came back from a release while still behind the water-mark: it must not hold back the
-            // other threads until it has caught up (see setThreadWatermark)
-            if (unalignedThreads.find(thread) != unalignedThreads.end())
-                continue;
-            if (lowWatermark == Scn::none() || parsedScn < lowWatermark)
-                lowWatermark = parsedScn;
-        }
-        if (lowWatermark == Scn::none())
-            return;
+            // Low-water-mark: minimum parsed SCN over all active (non-closed) threads
+            Scn lowWatermark = Scn::none();
+            for (const auto& [thread, parsedScn]: threadWatermark) {
+                if (closedThreads.find(thread) != closedThreads.end())
+                    continue;
+                // Idle thread released by the timeout: it does not hold back the low-water-mark any more
+                if (idleThreads.find(thread) != idleThreads.end())
+                    continue;
+                // Thread that came back from a release while still behind the water-mark: it must not hold back
+                // the other threads until it has caught up (see setThreadWatermark)
+                if (unalignedThreads.find(thread) != unalignedThreads.end())
+                    continue;
+                if (lowWatermark == Scn::none() || parsedScn < lowWatermark)
+                    lowWatermark = parsedScn;
+            }
+            if (lowWatermark == Scn::none())
+                return;
 
-        // The water-mark is a lower bound that was already acknowledged as safe, so it never moves back: a
-        // thread that comes back below it (see unalignedThreads) must not stall every other thread until it has
-        // caught up.
-        if (watermark == Scn::none() || lowWatermark > watermark)
-            watermark = lowWatermark;
+            // The water-mark is a lower bound that was already acknowledged as safe, so it never moves back: a
+            // thread that comes back below it (see unalignedThreads) must not stall every other thread until it
+            // has caught up.
+            if (watermark == Scn::none() || lowWatermark > watermark)
+                watermark = lowWatermark;
+            // What this flush may deliver is the water-mark (raised above, or the one of the last flush)
             limit = watermark;
         }
         flushUpTo(executor, limit);
@@ -273,6 +353,10 @@ namespace OpenLogReplicator {
             }
             pendingEvents -= ready.size();
             syncPendingEvents();
+            // Backpressure: the parser may be waiting in enqueueCommit() for exactly this drop. Notified with
+            // the lock held like the delivery wake up (the waiter re-reads the count under the same lock).
+            if (pendingLimit > 0 && pendingEvents <= pendingLimit)
+                backpressureCv.notify_all();
         }
 
         for (Event* event: ready) {
