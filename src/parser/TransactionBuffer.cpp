@@ -99,6 +99,24 @@ namespace OpenLogReplicator {
         auto xidTransactionMapIt = xidTransactionMap.find(xidMap);
         if (xidTransactionMapIt != xidTransactionMap.end()) {
             transaction = xidTransactionMapIt->second;
+
+            // The undo slot is taken over by the *same* Xid: the redo of a transaction that is still open is being
+            // read again - a slice boundary cut it into two passes, or a restarted archive (60058) began before
+            // its commit. The object already holds everything parsed before the cut; deleting it here loses those
+            // records (measured on a sliced run: 120 rows less than the same archives without slicing - exactly
+            // the heads of the transactions that straddled a boundary), and a second object for the same Xid
+            // delivers only what the second read gathered. Continue the existing object instead: its commit then
+            // delivers the whole transaction. On the restart path the records of open transactions are read a
+            // second time and land in this object again - at-least-once, which is the documented delivery
+            // contract (the consumer is required to be idempotent).
+            if (unlikely(!rollback && !old && transaction->xid == xid && transaction->commitScn == Scn::none())) {
+                if (likely(add))
+                    ctx->warning(60059, "transaction " + xid.toString() + " (thread: " + std::to_string(thread) +
+                                 ") is parsed again while it is still open - the records parsed before are kept and " +
+                                 "the transaction is continued (a slice boundary or a restarted archive cut it)");
+                return transaction;
+            }
+
             if (unlikely(!rollback && (!old || transaction->xid != xid))) {
                 // The undo slot is now used by a transaction we do not have in our state yet. There are two
                 // very different reasons for that:

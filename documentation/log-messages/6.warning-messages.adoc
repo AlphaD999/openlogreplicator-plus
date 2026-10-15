@@ -352,6 +352,21 @@ archive is read once more: a cost, not a fault.
 Counted in the `resume_fallbacks` counter of the `parse statistics` line. A delivery with slicing on should show
 zero here - anything above zero means the saved positions are not usable and the archive is being read again.
 
+==== code 60059: "transaction <xid> (thread: <number>) is parsed again while it is still open - the records parsed before are kept and the transaction is continued (a slice boundary or a restarted archive cut it)"
+
+The undo slot of a transaction that has no commit yet is taken over by the same Xid: the redo of that transaction is
+being read a second time. That happens when a slice boundary cut the transaction into two passes, or when a
+restarted archive (60058) began before its commit. The transaction object keeps the records parsed before the cut
+and the second read continues it, so the delivery of its commit sees the whole transaction - deleting the object
+instead (which is what the slot-takeover path did, and still does for a *different* Xid, warning 60041) loses the
+records parsed before the cut: measured on a sliced run, 120 rows less than the same archives without slicing,
+exactly the heads of the transactions that straddled a boundary.
+
+On the restart path the records of open transactions are read a second time and land in the same object again, so
+the delivery is at-least-once for them - which is the documented contract (the consumer has to be idempotent). A
+delivery with `slice-pending-commits: 0` should show zero of these: they only appear when archives are sliced or
+restarted.
+
 
 At most one message per 30 seconds. A run that reports this has to be restarted (`pkill` +
 restart): the scheduler resumes from the checkpoint and the saved file offsets, so the data is not lost, it is
