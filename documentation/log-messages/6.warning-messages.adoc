@@ -367,6 +367,14 @@ the delivery is at-least-once for them - which is the documented contract (the c
 delivery with `slice-pending-commits: 0` should show zero of these: they only appear when archives are sliced or
 restarted.
 
+==== code 60060: "the stash of taken-over unfinished transactions is full (<number>) - the oldest (<xid>) is dropped, its rows are lost if its commit arrives later"
+
+The side stash that keeps a transaction whose undo slot was taken over while it was open (see 60041/60059) has
+reached its cap (1000 transactions). The oldest one is purged, and if its commit arrives later in the stream its
+rows are lost - which is the behaviour the stash exists to prevent, so reaching the cap means the run is processing
+far more concurrently open transactions than the cap assumes. Raise the cap (it is a compile time constant,
+`TransactionBuffer::TAKEN_OVER_KEEP`) and report the run: a healthy delivery never comes near it.
+
 
 At most one message per 30 seconds. A run that reports this has to be restarted (`pkill` +
 restart): the scheduler resumes from the checkpoint and the saved file offsets, so the data is not lost, it is

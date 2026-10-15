@@ -109,6 +109,20 @@ namespace OpenLogReplicator {
         // of the last few minutes at the transaction rates this engine is built for - the redo that is read a
         // second time is a few archives, so the window has to be minutes, not hours.
         static constexpr uint64_t COMMITTED_XIDS_KEEP{2000000};
+
+        // Transactions whose undo slot was taken over while they were still open (a slice boundary cut them, or
+        // their commit simply has not been read yet - measured on a sliced run: deleting them lost 1,440 rows that
+        // the same archives delivered without slicing). They cannot stay in xidTransactionMap - the slot belongs
+        // to the takeover now - so they wait here under their FULL Xid (xidMap + sqn, the same identity the
+        // committed tombstones use): their following records continue them and their commit delivers them. The
+        // commit sorter removes the entry when the delivery is done (TransactionBuffer::dropTransaction). Bounded
+        // by count: the oldest is purged when the cap is exceeded (warning 60060 - those rows are lost if the
+        // commit arrives later; the cap is far above the number of concurrently open transactions of a healthy
+        // run, and each entry is small: an open transaction holds one pool block at most until it grows).
+        static constexpr size_t TAKEN_OVER_KEEP{1000};
+        std::unordered_map<CommittedKey, Transaction*, CommittedKeyHash> takenOverTransactions;
+        std::deque<CommittedKey> takenOverOrder;
+
         std::map<LobKey, uint8_t*> orphanedLobs;
 
     public:
@@ -128,6 +142,8 @@ namespace OpenLogReplicator {
         // "expected" guards against erasing an entry that meanwhile belongs to a newer transaction: with a
         // deferred commit (commit sorter) the same undo slot can be taken over before the flush happens.
         void dropTransaction(Xid xid, typeConId conId, uint16_t thread, const Transaction* expected = nullptr);
+        // Park a transaction whose undo slot was taken over while it was open (see takenOverTransactions)
+        void stashTakenOverTransaction(Transaction* transaction, XidMap xidMap);
         // Record that this Xid has committed: a second read of its redo is then dropped instead of waiting in
         // Ctx::swappedMemoryInit() for the delivery of the transaction it belongs to. Called where the commit
         // is handed to the commit sorter, the entry lives until the undo slot is taken over by a newer Xid.

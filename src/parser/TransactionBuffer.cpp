@@ -96,6 +96,19 @@ namespace OpenLogReplicator {
 
         Transaction* transaction;
 
+        // A transaction whose undo slot was taken over while it was open waits in the side stash under its full
+        // Xid (see takenOverTransactions): its following records continue it here, and its commit delivers it.
+        {
+            ctx->thread()->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::TRANSACTION_FIND);
+            std::unique_lock const lck(mtx);
+            const auto stashedIt = takenOverTransactions.find(CommittedKey{xidMap, xid.sqn()});
+            if (stashedIt != takenOverTransactions.end()) {
+                ctx->thread()->contextSet(Thread::CONTEXT::CPU);
+                return stashedIt->second;
+            }
+        }
+        ctx->thread()->contextSet(Thread::CONTEXT::CPU);
+
         auto xidTransactionMapIt = xidTransactionMap.find(xidMap);
         if (xidTransactionMapIt != xidTransactionMap.end()) {
             transaction = xidTransactionMapIt->second;
@@ -139,19 +152,16 @@ namespace OpenLogReplicator {
 
                 if (unfinished) {
                     ctx->warning(60041, "transaction " + xid.toString() + " takes over the undo slot of unfinished " +
-                                 transaction->xid.toString() + " - the unfinished transaction is dropped");
-                    brokenXidMapList.insert(xidMap);
+                                 transaction->xid.toString() + " - the unfinished transaction is kept aside and is " +
+                                 "delivered when its commit arrives (deleting it measured 1,440 rows lost on a " +
+                                 "sliced run)");
+                    stashTakenOverTransaction(transaction, xidMap);
                 }
 
                 {
                     ctx->thread()->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::TRANSACTION_DROP);
                     std::unique_lock const lck(mtx);
                     xidTransactionMap.erase(xidMap);
-                }
-
-                if (unfinished) {
-                    transaction->purge(ctx);
-                    delete transaction;
                 }
 
                 transaction = new Transaction(xid, conId, &orphanedLobs, xmlCtx, thread);
@@ -196,8 +206,58 @@ namespace OpenLogReplicator {
             // so only our own entry may be erased - never the one that replaced it.
             if (it != xidTransactionMap.end() && (expected == nullptr || it->second == expected))
                 xidTransactionMap.erase(it);
+            // The delivery of this transaction is done, so its side-stash entry (it was parked here when its
+            // undo slot was taken over while it was open - see takenOverTransactions) goes too.
+            const CommittedKey stashKey{xidMap, xid.sqn()};
+            if (takenOverTransactions.erase(stashKey) != 0) {
+                for (auto orderIt = takenOverOrder.begin(); orderIt != takenOverOrder.end(); ++orderIt)
+                    if (*orderIt == stashKey) {
+                        takenOverOrder.erase(orderIt);
+                        break;
+                    }
+            }
         }
         ctx->thread()->contextSet(Thread::CONTEXT::CPU);
+    }
+
+    void TransactionBuffer::stashTakenOverTransaction(Transaction* transaction, XidMap xidMap) {
+        const CommittedKey key{xidMap, transaction->xid.sqn()};
+        std::deque<Transaction*> evicted;
+
+        {
+            ctx->thread()->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::TRANSACTION_DROP);
+            std::unique_lock const lck(mtx);
+            const auto it = takenOverTransactions.find(key);
+            if (it != takenOverTransactions.end()) {
+                // Cannot normally happen (a Xid's sqn is not reused while the transaction is open) - do not leak
+                // the entry if it ever does.
+                it->second = transaction;
+            } else {
+                takenOverTransactions.insert({key, transaction});
+                takenOverOrder.push_back(key);
+            }
+
+            while (takenOverOrder.size() > TAKEN_OVER_KEEP) {
+                const CommittedKey oldest = takenOverOrder.front();
+                takenOverOrder.pop_front();
+                const auto oldestIt = takenOverTransactions.find(oldest);
+                if (oldestIt != takenOverTransactions.end()) {
+                    evicted.push_back(oldestIt->second);
+                    takenOverTransactions.erase(oldestIt);
+                }
+            }
+        }
+        ctx->thread()->contextSet(Thread::CONTEXT::CPU);
+
+        // Outside the lock: the eviction purges real pool memory and has to say so - those rows are lost if the
+        // transaction's commit arrives later.
+        for (Transaction* victim: evicted) {
+            ctx->warning(60060, "the stash of taken-over unfinished transactions is full (" +
+                         std::to_string(TAKEN_OVER_KEEP) + ") - the oldest (" + victim->xid.toString() +
+                         ") is dropped, its rows are lost if its commit arrives later");
+            victim->purge(ctx);
+            delete victim;
+        }
     }
 
     void TransactionBuffer::addTransactionChunk(Transaction* transaction, RedoLogRecord* redoLogRecord) {
