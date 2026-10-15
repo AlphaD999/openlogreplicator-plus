@@ -1428,6 +1428,19 @@ namespace OpenLogReplicator {
         const typeBlk passStartBlock = lwnConfirmedBlock;
         const bool resumedFromOffset = lwnConfirmedBlock > 2;
 
+        // Pass diagnosis (TRACE::CHECKPOINT only, reported by the pass summary below): how many records this pass
+        // read and how many of them are below the highest SCN this thread had already been parsed up to when the
+        // pass started. The second number is the re-read the saved slice positions are blamed for, and it is what
+        // tells a pass that merely repeats a few records (the position is right, the repeat is the LWN the slice
+        // boundary cut) apart from one that went back over a large part of the archive (the saved position sent
+        // the pass somewhere it had already been). Measured on a sliced run: 193,604 records dropped as already
+        // committed, all inside one archive - these two numbers decide which shape that was.
+        const bool passDiagnosis = ctx->isTraceSet(Ctx::TRACE::CHECKPOINT);
+        const Scn passEntryMaxScn = metadata->maxParsedScn(thread);
+        uint64_t passRecords = 0;
+        uint64_t passRecordsAlreadyParsed = 0;
+        Scn passMaxRecordScn = Scn::none();
+
         const time_ut cStart = ctx->clock->getTimeUt();
         reader->setStatusRead();
         LwnMember* lwnMember;
@@ -1458,6 +1471,9 @@ namespace OpenLogReplicator {
             if (likely(!ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
                 return;
             passReported = true;
+            // Remember how far this thread has been parsed: the next pass compares its records against it (see
+            // passRecordsAlreadyParsed above)
+            metadata->noteParsedScn(thread, passMaxRecordScn);
 
             const uint64_t rereadDrops = ctx->statCommittedRereadDrops.load(std::memory_order_relaxed);
             const uint64_t resumeFallbacks = ctx->statResumeFallbacks.load(std::memory_order_relaxed);
@@ -1470,7 +1486,10 @@ namespace OpenLogReplicator {
                           std::to_string(rereadDrops - passRereadDrops) + " (total: " + std::to_string(rereadDrops) +
                           "), resume fallbacks: " + std::to_string(resumeFallbacks - passResumeFallbacks) +
                           ", pending commits: " + std::to_string(metadata->commitSorter != nullptr
-                                                                 ? metadata->commitSorter->getPendingEvents() : 0));
+                                                                 ? metadata->commitSorter->getPendingEvents() : 0) +
+                          ", records: " + std::to_string(passRecords) + " (below the position this thread had " +
+                          "reached when the pass started: " + std::to_string(passRecordsAlreadyParsed) +
+                          ", entry scn: " + (passEntryMaxScn == Scn::none() ? std::string("none") : passEntryMaxScn.toString()) + ")");
         };
 
         while (!ctx->softShutdown) {
@@ -1590,6 +1609,16 @@ namespace OpenLogReplicator {
                             lwnMember->size = recordSize4;
                             lwnMember->block = currentBlock;
                             lwnMember->subScn = ctx->read16(redoBlock + blockOffset + 12U);
+
+                            // Pass diagnosis: count the record, and count how many of them are below where this
+                            // thread had been parsed before the pass started (see passRecordsAlreadyParsed)
+                            if (unlikely(passDiagnosis)) {
+                                ++passRecords;
+                                if (passEntryMaxScn != Scn::none() && lwnMember->scn <= passEntryMaxScn)
+                                    ++passRecordsAlreadyParsed;
+                                if (passMaxRecordScn == Scn::none() || lwnMember->scn > passMaxRecordScn)
+                                    passMaxRecordScn = lwnMember->scn;
+                            }
 
                             if (unlikely(ctx->isTraceSet(Ctx::TRACE::LWN)))
                                 ctx->logTrace(Ctx::TRACE::LWN, "size: " + std::to_string(recordSize4) + " scn: " +

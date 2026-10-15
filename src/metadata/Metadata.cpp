@@ -215,6 +215,19 @@ namespace OpenLogReplicator {
         return Seq::zero();
     }
 
+    Scn Metadata::maxParsedScn(uint16_t thread) const {
+        const auto it = threadMaxParsedScn.find(thread);
+        return it == threadMaxParsedScn.end() ? Scn::none() : it->second;
+    }
+
+    void Metadata::noteParsedScn(uint16_t thread, Scn scn) {
+        if (scn == Scn::none())
+            return;
+        Scn& max = threadMaxParsedScn[thread];
+        if (max == Scn::none() || scn > max)
+            max = scn;
+    }
+
     FileOffset Metadata::takeFileOffset(uint16_t thread, Seq expectedSequence) {
         std::unique_lock const lck(mtxCheckpoint);
 

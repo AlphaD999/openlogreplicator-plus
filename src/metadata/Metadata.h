@@ -171,6 +171,12 @@ namespace OpenLogReplicator {
         std::unordered_map<Scn, bool> checkpointSchemaMap;
         // Per-thread positions; legacy single-instance fields below are the thread 1 view
         std::map<uint16_t, ThreadPos> threadPos;
+        // Highest redo record SCN parsed so far, per thread. Written and read by the parser thread only (the
+        // parser is single threaded, no lock). Used by the pass diagnosis (TRACE::CHECKPOINT, see Parser::parse):
+        // a pass that resumes from a saved position can read records below this value a second time, and how many
+        // it re-reads is what tells "the saved position is right and only a few records repeat" from "this pass
+        // went back over a large part of the archive".
+        std::map<uint16_t, Scn> threadMaxParsedScn;
 
         std::vector<SchemaElement*> newSchemaElements;
 
@@ -192,6 +198,9 @@ namespace OpenLogReplicator {
         void setNextSequence(uint16_t thread = 1);
         ThreadPos& threadPosGet(uint16_t thread);
         [[nodiscard]] Seq threadSequence(uint16_t thread) const;
+        // Highest redo record SCN this thread has been parsed up to (diagnosis only, see threadMaxParsedScn)
+        [[nodiscard]] Scn maxParsedScn(uint16_t thread) const;
+        void noteParsedScn(uint16_t thread, Scn scn);
         // Parser thread accessors (called from the parser thread itself, no locking needed). The offset is
         // matched with the sequence it was saved for: an archive of the same thread that is not the one the
         // position belongs to must not consume it (see ThreadPos::fileOffsetSequence).
