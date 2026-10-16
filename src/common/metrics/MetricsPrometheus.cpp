@@ -302,13 +302,8 @@ namespace OpenLogReplicator {
                                                .Register(*registry);
         swapUsageMbGauge = &swapUsageMb->Add({});
 
-        memoryUsedTotalMb = &prometheus::BuildGauge().Name("memory_used_total_mb")
-                                                     .Help("Total used memory")
-                                                     .Register(*registry);
-        memoryUsedTotalMbGauge = &memoryUsedTotalMb->Add({});
-
         // transactions
-        transactions = &prometheus::BuildCounter().Name("dml_ops")
+        transactions = &prometheus::BuildCounter().Name("transactions")
                                                   .Help("Number of transactions")
                                                   .Register(*registry);
         transactionsCommitOutCounter = &transactions->Add({
