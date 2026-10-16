@@ -80,10 +80,15 @@ class Thread;
 
         // Takes ownership of the flush decision; the transaction itself stays in the
         // transaction buffer until the executor drops it.
-        // Blocks while the sorter holds more than "pendingLimit" buffered events (backpressure, see
-        // pendingLimit): the parser is the only caller, so this is the point where it is stopped when it walks
-        // away from the delivery. The lock is released while it waits.
+        // Buffers a finished transaction. Does not block: the backpressure is applied at the boundary of a record
+        // (waitForBacklog), see the comment there for why it is not applied here.
         void enqueueCommit(Transaction* transaction, Scn commitScn);
+
+        // Backpressure (stage 2): waits while the sorter holds more buffered events of "thread" than its share of
+        // the transaction pool allows (pendingLimitLocked). Called by the parser at the *head* of a record, right
+        // after it published its water-mark there - the wait is per redo thread and at a record boundary, both for
+        // reasons that were measured (see the implementation). The lock is released while waiting.
+        void waitForBacklog(uint16_t thread);
         void enqueueCheckpoint(const CheckpointEvent& event);
         // All records with scn <= parsedScn have been analyzed for the thread. "currentTime" is the
         // microsecond clock of the parser and is only used to measure how long a thread has been idle:
@@ -124,10 +129,11 @@ class Thread;
         // release (refreshIdle) and the shutdown.
         bool waitForDelivery(uint64_t timeoutUs);
 
-        // Backpressure (stage 2): enqueueCommit() waits while the sorter holds more than pendingLimit buffered
-        // events. The wait is a bounded wait per round (the delivery notifies when the backlog is back under the
-        // limit), and a wait longer than BACKPRESSURE_REPORT_US is reported once (warning 60062): a bounded wait
-        // that nobody can see is the same blind spot the stalls of 2026-10-15 hid in.
+        // Backpressure (stage 2): enqueueCommit() waits while the sorter holds more than the limit of the
+        // *enqueuing thread* (pendingLimitLocked - per redo thread, and not global: see the comment there). The
+        // wait is a bounded wait per round (the delivery notifies when a count drops), and a wait longer than
+        // BACKPRESSURE_REPORT_US is reported once (warning 60062): a bounded wait that nobody can see is the same
+        // blind spot the stalls of 2026-10-15 hid in.
         static constexpr uint64_t BACKPRESSURE_WAIT_MS{100};
         static constexpr uint64_t BACKPRESSURE_REPORT_US{30000000};
 
@@ -196,19 +202,32 @@ class Thread;
         // window; with the delivery decoupled nothing paces the parser, so it is paced here. Measured in the
         // reproduction rig before this existed: 4,500 buffered commits with a 4 GB pool and 1 MB blocks
         // (= 4.5 GB) ended the run with 10017.
-        uint64_t pendingLimit{0};
         std::condition_variable backpressureCv;
-        // Called with sorterMtx held, only the first time it can derive a bound.
-        void initPendingLimitLocked();
+        // The backpressure bound of one redo thread, with sorterMtx held: half of the pool, divided by the number
+        // of redo threads the sorter has seen (a thread that holds more than one chunk can be swapped out, and a
+        // transaction that holds exactly one can not - so the pool has to cover the backlog of every thread plus
+        // the open transactions). 0 = no bound (the pool is not initialized yet).
+        [[nodiscard]] uint64_t pendingLimitLocked() const;
         struct Event {
             Scn scn;
             bool commit;
             Transaction* transaction{nullptr};
             CheckpointEvent checkpoint;
+            // The redo thread this event belongs to: the backlog is accounted per thread (see pendingByThread)
+            // so that one thread can not stop the parser of another one.
+            uint16_t thread{0};
         };
 
         Scn watermark{Scn::none()};
         uint64_t pendingEvents{0};
+        // Buffered events per redo thread. The backpressure of enqueueCommit() uses the count of *its own*
+        // thread: a global count lets a thread that runs ahead hold back the parser of a thread that is behind -
+        // and that behind thread is the one whose water-mark has to move for anything to become deliverable.
+        // Measured in the reproduction rig on 2026-10-16 (slicing on): 8,193 events of thread 2 above thread 1's
+        // water-mark (23,227,363 against 23,242,448), the parser of thread 1 stopped by the global limit and the
+        // delivery with nothing it was allowed to take (60062, "deliverable now: 0") - a deadlock that no wait
+        // could resolve.
+        std::map<uint16_t, uint64_t> pendingByThread;
         std::map<Scn, std::vector<Event*>> events; // insertion order preserved within the same SCN
         std::map<uint16_t, Scn> threadWatermark;
         std::set<uint16_t> closedThreads;

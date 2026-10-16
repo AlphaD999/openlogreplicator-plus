@@ -21,6 +21,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #define PARSER_H_
 
 #include <cstddef>
+#include <vector>
 
 #include "../common/Ctx.h"
 #include "../common/RedoLogRecord.h"
@@ -77,7 +78,12 @@ namespace OpenLogReplicator {
         Transaction* lastTransaction{nullptr};
 
         uint8_t* lwnChunks[MAX_LWN_CHUNKS * (Ctx::MEMORY_CHUNK_KB_MAX / Ctx::MEMORY_CHUNK_KB_MIN)]{};
-        LwnMember* lwnMembers[MAX_RECORDS_IN_LWN + 1]{};
+        // One pointer per record of the record being assembled, used as a binary heap (indices from 1). Dynamic
+        // and not a fixed MAX_RECORDS_IN_LWN sized array: as a fixed array it made *every* Parser object 8 MB
+        // (1,048,577 pointers), and one Parser is built for every archive of the list before any of them is read,
+        // so the resident memory grew with the archive list and not with the configuration - measured 2026-10-16:
+        // 8,328 kB per Parser, ~1,700 queued archives, 13-14 GB of RSS, unchanged by "memory.max-mb".
+        std::vector<LwnMember*> lwnMembers;
         uint64_t lwnAllocated{0};
         uint64_t lwnAllocatedMax{0};
         Time lwnTimestamp{0};

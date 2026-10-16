@@ -405,10 +405,25 @@ file system reports its own error, a slow one does not), `swap-mb`, `memory-max-
 
 ==== code 60062: "the parser is waiting for the delivery for: <number> s - the commit sorter still holds <number> buffered commit(s) (limit: <number>, transaction pool: <number> chunk(s), thread watermarks: <...>); the parse of this thread is stopped on purpose: letting it go on would fill the pool with commits that are waiting for the low-water-mark (\"memory-max-mb\" / \"transaction-block-kb\")"
 
-The parser is stopped by the backpressure of the commit sorter (`CommitSorter::enqueueCommit`) for longer than
-30 seconds: the sorter holds more buffered commits than it is allowed to (its limit is half of the transaction
-pool in chunks), and the delivery can not free them because they are above the low-water-mark (the thread
-watermarks are named in the message).
+The parser is stopped by the backpressure of the commit sorter for longer than 30 seconds: the sorter holds more
+buffered commits of this redo thread than it is allowed to. The limit is that thread's share of the transaction
+pool (half of it, divided by the number of redo threads - `CommitSorter::pendingLimitLocked`) and the wait is
+applied at the *head* of a redo record (`CommitSorter::waitForBacklog`, called from the parser right after it
+published its water-mark there), not per commit: a record can carry more commits than the limit (measured: 4,097
+against a limit of 4,096) and inside a record the water-mark only moves at the next head, so the parser would
+wait for a water-mark only it could publish. The message names how much of the backlog the delivery may take
+right now (`deliverable now`) and how much of it waits for a higher water-mark (`above the low-water-mark`).
+
+The two numbers are what tells the two cases apart: a wait with a non-zero `deliverable now` is a delivery that
+is behind on work it may take (check its side: 60061/60055 for the swap read back, 60031 for a full writer
+queue, the pool size against the redo rate). A wait with `deliverable now: 0` would mean the water-mark is
+holding the backlog back - that state used to be a deadlock (the parser is the only thread that publishes a
+higher water-mark, so stopping it freezes the water-mark, the delivery stays idle and the backlog never drops:
+measured in the reproduction rig on 2026-10-16 with slicing on, 60062 once and then 60055 eight times, the
+delivery count frozen for 128 s). It is prevented at the source now: the parser publishes its water-mark at the
+*head* of every record and not only at its end, so a wait that happens inside a record does not hold the
+water-mark back at the previous one. A run that still reports `deliverable now: 0` here has a water-mark that is
+pinned by something else - the thread watermarks in the message say which thread.
 
 Why there is a bound at all: every buffered commit owns at least one chunk of the transaction pool, and a
 transaction that owns a single chunk can not be swapped out (the swap pump needs more than one), so a backlog

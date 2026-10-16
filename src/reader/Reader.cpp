@@ -122,15 +122,41 @@ namespace OpenLogReplicator {
         const typeBlk blockNumberHeader = ctx->read32(buffer + 4);
         const auto sequenceHeader = Seq(ctx->read32(buffer + 8));
 
-        if (sequence == Seq::zero() || status == STATUS::UPDATE) {
-            sequence = sequenceHeader;
+        if (group == 0) {
+            // An archive: the sequence is known *before* the first block of a pass is read and from two sources -
+            // the archive list this parser was queued from (Replicator::processArchivedRedoLogs hands it to the
+            // reader, Reader::setArchiveSequence) and the header block of the file itself (reloadHeaderRead). It
+            // is never taken over from a data block here: the adoption branch that used to exist for that let a
+            // reader starting at a saved offset accept bytes that are not its own - the buffers are shared and a
+            // file that is still being written has been read before, so a block can belong to another archive
+            // whose block number matches and whose CRC is a real redo block's. Measured 2026-10-16: "invalid
+            // header sequence, found: 11098, expected: 0" on thread 1 seq 15345 - the check was skipped, the
+            // parser parsed foreign record heads, saved a position that does not exist in its archive and the next
+            // pass ended the run with 50049 (60058 is the guarded variant of the same). Refusing the block ends
+            // the pass as STOPPED ("come back later") instead, which is the honest answer.
+            if (unlikely(sequence == Seq::zero() && archiveSequence != Seq::zero()))
+                // The identity the caller declared is the authority: opening the file resets "sequence"
+                // (checkRedoLog/updateRedoLog), and losing it there is precisely what made this reader take the
+                // sequence over from a block header again.
+                sequence = archiveSequence;
+
+            const Seq expectedSequence = archiveSequence != Seq::zero() ? archiveSequence : sequence;
+            if (unlikely(expectedSequence == Seq::zero())) {
+                ctx->warning(60024, "file: " + fileName + " - the sequence of this archive is not known (block: " +
+                             std::to_string(blockNumber) + ", block header says: " + sequenceHeader.toString() +
+                             ") - refusing to read a data block that can not be attributed to an archive");
+                return REDO_CODE::ERROR_SEQUENCE;
+            }
+            if (sequence != expectedSequence)
+                sequence = expectedSequence;
+            if (sequenceHeader != expectedSequence) {
+                ctx->warning(60024, "file: " + fileName + " - invalid header sequence, found: " + sequenceHeader.toString() +
+                             ", expected: " + expectedSequence.toString());
+                return REDO_CODE::ERROR_SEQUENCE;
+            }
         } else {
-            if (group == 0) {
-                if (sequence != sequenceHeader) {
-                    ctx->warning(60024, "file: " + fileName + " - invalid header sequence, found: " + sequenceHeader.toString() +
-                                 ", expected: " + sequence.toString());
-                    return REDO_CODE::ERROR_SEQUENCE;
-                }
+            if (status == STATUS::UPDATE || sequence == Seq::zero()) {
+                sequence = sequenceHeader;
             } else {
                 if (sequence > sequenceHeader)
                     return REDO_CODE::EMPTY;
@@ -222,6 +248,13 @@ namespace OpenLogReplicator {
             blockSize = 0;
             return REDO_CODE::ERROR_BAD_DATA;
         }
+
+        // The sequence of the file, taken from its own header. A reader that starts at a saved offset of an
+        // archive has to know which archive it is reading *before* it accepts a data block: taking the sequence
+        // from the first data block it happens to read means taking whatever the buffer holds at that offset -
+        // and the buffers are shared, so that can be another archive's redo (measured 2026-10-16: a reader for
+        // thread 1 seq 15345 read thread 2 seq 11098's block and adopted its sequence, see checkBlockHeader).
+        sequence = Seq(ctx->read32(headerBuffer + 8));
 
         if (actualRead < static_cast<int>(blockSize * 2)) {
             ctx->error(40003, "file: " + fileName + " - " + strerror(errno));
@@ -405,6 +438,18 @@ namespace OpenLogReplicator {
         }
 
         bufferAllocate(redoBufferNum);
+        // Buffer/read diagnosis (TRACE::CHECKPOINT). Which buffer this read fills, for which archive, from which
+        // offset, how much the file was supposed to hold - and, in the second line below, whether this read
+        // *adopted* the sequence from the block header instead of checking it against its own (see
+        // checkBlockHeader: with sequence == Seq::zero() it takes whatever the first block says, so a block that
+        // belongs to another archive passes every check). Measured need on 2026-10-16: a resumed pass of seq
+        // 15418 parsed a "record head" at block 6237 that does not exist anywhere in that archive.
+        const Seq sequenceBefore = sequence;
+        if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
+            ctx->logTrace(Ctx::TRACE::CHECKPOINT, "read1: thread " + std::to_string(thread) + " seq: " + sequence.toString() +
+                          " buf: " + std::to_string(redoBufferNum) + " scan: " + std::to_string(bufferScan) + " toRead: " +
+                          std::to_string(toRead) + " fileSize: " + std::to_string(fileSize) + " bufferStart/End: " +
+                          std::to_string(bufferStart) + "/" + std::to_string(bufferEnd));
         if (unlikely(ctx->isTraceSet(Ctx::TRACE::DISK)))
             ctx->logTrace(Ctx::TRACE::DISK, "reading#1 " + fileName + " at (" + std::to_string(bufferStart) + "/" +
                           std::to_string(bufferEnd) + "/" + std::to_string(bufferScan) + ") bytes: " + std::to_string(toRead));
@@ -494,6 +539,18 @@ namespace OpenLogReplicator {
             readBlocks = true;
             reachedZero = false;
         }
+
+        // Second half of the read diagnosis: how much actually came back, how many blocks passed, and whether
+        // the sequence was taken over from the block header (the adoption branch of checkBlockHeader). An
+        // "ADOPTED" on a resumed pass is the signature of a pass that is reading bytes which are not its own.
+        if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
+            ctx->logTrace(Ctx::TRACE::CHECKPOINT, "read1 done: thread " + std::to_string(thread) + " seq: " + sequence.toString() +
+                          (sequence != sequenceBefore ?
+                           (archiveSequence == Seq::zero() ? " ADOPTED-FROM-BLOCK-HEADER" : " RESTORED-FROM-ARCHIVE-IDENTITY") : "") +
+                          " buf: " + std::to_string(redoBufferNum) + " scan: " + std::to_string(bufferScan) + " actualRead: " +
+                          std::to_string(actualRead) + " goodBlocks: " + std::to_string(goodBlocks) + " bufferEnd: " +
+                          std::to_string(bufferEnd) + "->" + std::to_string(bufferEnd + goodBlocks * blockSize) + " ret: " +
+                          std::to_string(static_cast<uint>(ret.load())));
 
         lastRead = goodBlocks * blockSize;
         lastReadTime = ctx->clock->getTimeUt();
@@ -962,6 +1019,12 @@ namespace OpenLogReplicator {
             --ctx->bufferSizeFree;
         }
         contextSet(CONTEXT::CPU);
+        // Buffer ownership diagnosis (TRACE::CHECKPOINT): the buffers are shared by every reader of this
+        // instance, so "which buffer, for which archive" is what says whether a parser can be reading a buffer
+        // another pass has refilled.
+        if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
+            ctx->logTrace(Ctx::TRACE::CHECKPOINT, "bufferAllocate: thread " + std::to_string(thread) + " seq: " +
+                          sequence.toString() + " buf: " + std::to_string(num) + " free: " + std::to_string(ctx->bufferSizeFree));
     }
 
     void Reader::bufferFree(Thread* t, uint num) {
@@ -978,8 +1041,36 @@ namespace OpenLogReplicator {
             ++ctx->bufferSizeFree;
         }
         t->contextSet(CONTEXT::CPU);
+        if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
+            ctx->logTrace(Ctx::TRACE::CHECKPOINT, "bufferFree: thread " + std::to_string(thread) + " seq: " +
+                          sequence.toString() + " buf: " + std::to_string(num) + " free: " +
+                          std::to_string(ctx->bufferSizeFree));
 
         ctx->freeMemoryChunk(this, Ctx::MEMORY::READER, buffer);
+    }
+
+    void Reader::setArchiveSequence(Seq newSequence) {
+        // The archive this reader is about to open is known to the caller (the archive list it was queued from),
+        // so the sequence is set here - before the first block of the file is read. Everything the reader accepts
+        // is then checked against it (checkBlockHeader) instead of being adopted from a block header, which is
+        // what made a pass accept blocks of another archive (see the comment in checkBlockHeader).
+        sequence = newSequence;
+        archiveSequence = newSequence;
+        if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
+            ctx->logTrace(Ctx::TRACE::CHECKPOINT, "setArchiveSequence: thread " + std::to_string(thread) + " seq: " +
+                          sequence.toString() + " file: " + fileName);
+    }
+
+    void Reader::ensureArchiveSequence() {
+        if (group != 0 || sequence != Seq::zero())
+            return;
+        // The header block of the file is the only thing that says which archive this is. Called by the parser
+        // right before a pass that resumes from a saved offset - the case in which the reader used to take the
+        // sequence from the first data block it read (see checkBlockHeader).
+        const REDO_CODE retReload = reloadHeader();
+        if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
+            ctx->logTrace(Ctx::TRACE::CHECKPOINT, "ensureArchiveSequence: thread " + std::to_string(thread) + " seq: " +
+                          sequence.toString() + " ret: " + std::to_string(static_cast<uint>(retReload)));
     }
 
     bool Reader::bufferIsFree() {
@@ -1235,7 +1326,13 @@ namespace OpenLogReplicator {
         contextSet(CONTEXT::MUTEX, REASON::READER_CHECK_REDO);
         std::unique_lock lck(mtx);
         status = STATUS::CHECK;
-        sequence = Seq::zero();
+        // An archive keeps the identity the caller set on it (Reader::setArchiveSequence): it is opened per
+        // archive and the caller knows which one it is, so forgetting it here would make the reader take the
+        // sequence over from the first block header again - the state that accepted blocks of other archives. An
+        // online redo log, on the other hand, is re-read to find out which sequence it holds now, so there the
+        // sequence is reset and adopted from the file.
+        if (group != 0)
+            sequence = Seq::zero();
         firstScn = Scn::none();
         nextScn = Scn::none();
         condBufferFull.notify_all();

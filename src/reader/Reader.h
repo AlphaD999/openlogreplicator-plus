@@ -162,6 +162,25 @@ namespace OpenLogReplicator {
         void bufferAllocate(uint num);
         void bufferFree(Thread* t, uint num);
         bool bufferIsFree();
+        // Makes sure this reader knows which archive it is reading before it accepts data blocks (reads the
+        // header block of the file if that has not happened yet). A pass that starts at a saved offset of an
+        // archive needs it: the sequence is what every block is checked against, and the bytes at the saved
+        // offset are not necessarily this archive's (see checkBlockHeader).
+        void ensureArchiveSequence();
+        // Tells this reader which archive it is about to open, before the first block of it is read. The caller
+        // knows it from the archive list (Replicator::processArchivedRedoLogs). With it every block is checked
+        // against the archive it claims to belong to (checkBlockHeader) and the sequence is never taken over from
+        // a block header - see the comment there for what that used to cost.
+        void setArchiveSequence(Seq newSequence);
+
+    protected:
+        // The archive identity the caller declared (setArchiveSequence): it is what every block of an archive is
+        // checked against, and it is kept separately because "sequence" is reset while the file is opened
+        // (checkRedoLog/updateRedoLog) - losing it there is exactly what made a reader take the sequence over from
+        // a block header again. Seq::zero() = no archive has been declared.
+        Seq archiveSequence{Seq::zero()};
+
+    public:
         typeSum calcChSum(uint8_t* buffer, uint size) const;
         void printHeaderInfo(std::ostringstream& ss, const std::string& path) const;
         [[nodiscard]] uint getBlockSize() const;

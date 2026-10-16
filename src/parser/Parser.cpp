@@ -93,7 +93,7 @@ namespace OpenLogReplicator {
         *size = sizeof(uint64_t);
         lwnAllocated = 1;
         lwnAllocatedMax = 1;
-        lwnMembers[0] = nullptr;
+        lwnMembers.assign(2, nullptr);       // the heap starts at index 1
     }
 
     Parser::~Parser() {
@@ -1347,6 +1347,10 @@ namespace OpenLogReplicator {
                 if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
                     ctx->logTrace(Ctx::TRACE::CHECKPOINT, "setting reader start position to " + startOffset.toString() + " (block " +
                                   std::to_string(lwnConfirmedBlock) + ")");
+                // A pass that resumes here has to know which archive it is reading before it accepts a block: the
+                // bytes at this offset are not necessarily this archive's (see Reader::checkBlockHeader and
+                // Reader::ensureArchiveSequence).
+                reader->ensureArchiveSequence();
             }
         }
         reader->setBufferStartEnd(FileOffset(lwnConfirmedBlock, reader->getBlockSize()),
@@ -1379,6 +1383,19 @@ namespace OpenLogReplicator {
         // be a head is handled there instead of ending the run (error 50051 did exactly that).
         const typeBlk passStartBlock = lwnConfirmedBlock;
         const bool resumedFromOffset = lwnConfirmedBlock > 2;
+
+        // Pass diagnosis (TRACE::CHECKPOINT, one line per pass): what this pass resumes from and what it was
+        // given. Read together with the record head lines below and the slice save lines, this answers for one
+        // archive whether a pass started exactly where the previous one of it saved and then failed on a block
+        // that is not a head (50049/50050/50051), or whether it drifted inside its own run. Measured on
+        // 2026-10-16: a sliced run ended with 50050 "invalid lwn max: 0/1/2" and nothing in the log said which of
+        // the two shapes it was.
+        if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
+            ctx->logTrace(Ctx::TRACE::CHECKPOINT, "pass start: thread " + std::to_string(thread) + " seq: " + sequence.toString() +
+                          " resumed: " + (resumedFromOffset ? "yes" : "no") + " passStartBlock: " + std::to_string(passStartBlock) +
+                          " lwnConfirmedBlock: " + std::to_string(lwnConfirmedBlock) + " sliceStartBlock: " +
+                          std::to_string(sliceStartBlock) + " bufferStart: " + reader->getBufferStart().toString() +
+                          " bufferEnd: " + reader->getBufferEnd().toString());
 
         // Pass diagnosis (TRACE::CHECKPOINT only, reported by the pass summary below): how many records this pass
         // read and how many of them are below the highest SCN this thread had already been parsed up to when the
@@ -1482,13 +1499,127 @@ namespace OpenLogReplicator {
                             lwnNumMax = ctx->read16(redoBlock + blockOffset + 26U);
                             // Verify LWN header start
                             if (unlikely(lwnScn < reader->getFirstScn() || (lwnScn > reader->getNextScn() && reader->getNextScn() != Scn::none())))
-                                throw RedoLogException(50049, "invalid lwn scn: " + lwnScn.toString());
+                                throw RedoLogException(50049, "invalid lwn scn: " + lwnScn.toString() + " (block: " +
+                                                       std::to_string(currentBlock) + ", lwnEndBlock: " +
+                                                       std::to_string(lwnEndBlock) + ", passStartBlock: " +
+                                                       std::to_string(passStartBlock) + ", resumed: " +
+                                                       (resumedFromOffset ? "yes" : "no") + ")");
                         } else {
                             const typeLwn lwnNumCur = ctx->read16(redoBlock + blockOffset + 26U);
-                            if (unlikely(lwnNumCur != lwnNumMax))
-                                throw RedoLogException(50050, "invalid lwn max: " + std::to_string(lwnNum) + "/" +
-                                                       std::to_string(lwnNumCur) + "/" + std::to_string(lwnNumMax));
+                            if (unlikely(lwnNumCur != lwnNumMax)) {
+                                // The member walk of this pass left the record: the block the position walk arrived at
+                                // is not the member the record promises. Ending the run over it (50050 did) turns one
+                                // unexpected block into an outage, and the position is not where the next pass should
+                                // resume either. Measured 2026-10-16: a slice had saved a block whose member index was
+                                // 1 of 2 (a continuation block, which carries the LWN flag as well), the resumed pass
+                                // walked two blocks into the record and the run ended with 50050.
+                                // Same answer as 60058: the pass is over (STOPPED, the saved position is reset to the
+                                // beginning of this archive by the caller) and the archive is read again - the records
+                                // of the transactions that were already delivered are dropped by the tombstone, the
+                                // still open ones are read again.
+                                ctx->statResumeFallbacks.fetch_add(1, std::memory_order_relaxed);
+                                ctx->warning(60058, "the record walk of this pass left the record at block " +
+                                             std::to_string(currentBlock) + " (member " + std::to_string(lwnNumCur) + " of " +
+                                             std::to_string(lwnNumMax) + ", scn: " + lwnScn.toString() + ", lwnEndBlock: " +
+                                             std::to_string(lwnEndBlock) + ", passStartBlock: " + std::to_string(passStartBlock) +
+                                             ", resumed: " + (resumedFromOffset ? "yes" : "no") + ") in: " + reader->fileName +
+                                             " - the pass restarts at the beginning of this archive (the records of the "
+                                             "transactions that were already delivered are dropped, the open ones are read again)");
+                                lwnConfirmedBlock = 2;
+                                reader->setRet(Reader::REDO_CODE::STOPPED);
+                                confirmedBufferStart = reader->getBufferEnd();
+                                break;
+                            }
                         }
+
+                        // Record head (TRACE::CHECKPOINT, one line per record): where it starts, how far its own
+                        // header says it reaches and what its fields are. lwnEndBlock (head + lwnSize) is the only
+                        // definition of "the next head" the parser has, and the three error sites above and below
+                        // all react to a block that turned out not to be one - without this line there is nothing
+                        // to compare that block against.
+                        if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
+                            ctx->logTrace(Ctx::TRACE::CHECKPOINT, "lwn head: thread " + std::to_string(thread) + " seq: " +
+                                          sequence.toString() + " blk: " + std::to_string(currentBlock) + " size: " +
+                                          std::to_string(lwnSize) + " ends: " + std::to_string(lwnEndBlock) + " num: " +
+                                          std::to_string(lwnNum) + "/" + std::to_string(lwnNumMax) + " scn: " + lwnScn.toString() +
+                                          " passStart: " + std::to_string(passStartBlock));
+                        // Publish the water-mark here, at the *head* of the record, and not only at its end (see the
+                        // flush points below): the parser can be stopped inside a record by the backpressure of the
+                        // commit sorter (enqueueCommit waits while the sorter holds more than half of the pool), and
+                        // the water-mark it published last is then the one of the *previous* record. Every event
+                        // buffered in between is above it, so the delivery may take none of them - it can not free
+                        // the backlog the parser waits for and the two threads wait for each other. Measured in the
+                        // reproduction rig on 2026-10-16 with slicing on: warning 60062 once, then 60055 eight
+                        // times, the delivery count frozen for 128 s and the run ended by the harness.
+                        // This head is where the parser can vouch for it: nothing below this SCN is still to come.
+                        if (metadata->commitSorter != nullptr) {
+                            metadata->commitSorter->setThreadWatermark(thread, lwnScn, ctx->clock->getTimeUt(),
+                                                                       ctx->idleThreadReleaseUs);
+                            metadata->commitSorter->notifyDelivery();
+                        }
+
+                        // Slice boundary. The commit sorter keeps one memory chunk per finished transaction that
+                        // still waits for the low-water-mark - the minimum parsed SCN over the redo threads, so it
+                        // only moves once the other threads are parsed. Parsing one whole archive in one go
+                        // therefore keeps every committed transaction of that archive in memory (with thousands of
+                        // transactions in a window this is gigabytes of chunks that can not be swapped out - see
+                        // documentation/rac-asm-support-development-plan.md). Stop here, save the position and let
+                        // the scheduler continue with the redo thread that is behind.
+                        //
+                        // Here and not at the end of the previous record, which is where it used to be: there the
+                        // position to resume from had to be *assumed* (lwnEndBlock = the head of the record that
+                        // just ended plus its size) and the parser verifies that assumption only when it arrives at
+                        // that block (the "vld & 0x04" test above). A slice saved before that test can save a block
+                        // that is not a head at all. Measured: in production it ended the run (50051, "did not find
+                        // lwn at offset: 2392576", and 50049 "invalid lwn scn: 11388144845283" when it landed on a
+                        // continuation block of a record instead), in the reproduction rig it was repaired by
+                        // restarting the whole archive (60058: 193,568 records dropped and 614 rows lost to 60041),
+                        // and on 2026-10-16 the same rig with the backpressure in place ended a run with 50049 at a
+                        // resume that landed on a continuation block - with 229 slices and 606,024 records re-read.
+                        // This block, on the other hand, *is* a verified head (the flag was read just above) and
+                        // nothing of the record has been parsed yet: the position saved here is exactly "the first
+                        // record that has not been delivered", so resuming on it re-reads nothing.
+                        if (lwnNumCnt == 0 && !switchRedo && ctx->slicePendingCommits > 0 && metadata->commitSorter != nullptr &&
+                            metadata->commitSorter->getPendingEvents() >= ctx->slicePendingCommits &&
+                            metadata->commitSorter->isAheadOfWatermark(lwnScn) &&
+                            static_cast<uint64_t>(currentBlock - sliceStartBlock) * reader->getBlockSize() >= Ctx::SLICE_MIN_BYTES) {
+                            slicePending = true;
+                            sliceScn = lwnScn;
+                            freeLwn();
+                            lwnConfirmedBlock = currentBlock;
+                            metadata->saveFileOffset(thread, sequence, FileOffset(currentBlock, reader->getBlockSize()));
+                            if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT))) {
+                                // The bytes this position is taken from - block header (the first 16), record header and
+                                // the LWN fields (lwnSize at +28, lwnScn at +40 of the record, i.e. +44 and +56 of the
+                                // block). An offline decode of the file at this block number has to show the same
+                                // bytes; if it does not, the buffer the parser read from is not this file's data.
+                                std::string dump;
+                                const char* hexDigits = "0123456789abcdef";
+                                for (uint i = 0; i < 80U && i < reader->getBlockSize(); ++i) {
+                                    const uint8_t byte = redoBlock[i];
+                                    dump += hexDigits[(byte >> 4) & 0x0f];
+                                    dump += hexDigits[byte & 0x0f];
+                                }
+                                ctx->logTrace(Ctx::TRACE::CHECKPOINT, "slicing from bytes: thread " + std::to_string(thread) +
+                                              " seq: " + sequence.toString() + " blk: " + std::to_string(currentBlock) + " " + dump);
+                            }
+                            if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
+                                ctx->logTrace(Ctx::TRACE::CHECKPOINT, "slicing archive at scn: " + lwnScn.toString() + " (block " +
+                                              std::to_string(currentBlock) + "), saved block: " + std::to_string(currentBlock) +
+                                              ", passStart: " + std::to_string(passStartBlock) + ", pending commits: " +
+                                              std::to_string(metadata->commitSorter->getPendingEvents()));
+                            break;
+                        }
+
+                        // Backpressure: the parse of this thread is stopped here, at the head of a record, if the
+                        // commit sorter holds more buffered commits of it than its share of the pool allows. Not
+                        // per commit inside the record: the water-mark only moves at the next record head, so a
+                        // record carrying more commits than the limit (measured: 4,097 of a limit of 4,096) would
+                        // have the parser wait for a water-mark only it could publish. Here the water-mark of this
+                        // record was published just above, so everything of the previous records is deliverable.
+                        if (metadata->commitSorter != nullptr)
+                            metadata->commitSorter->waitForBacklog(thread);
+
                         ++lwnNumCnt;
 
                         if (unlikely(ctx->isTraceSet(Ctx::TRACE::LWN))) {
@@ -1526,7 +1657,10 @@ namespace OpenLogReplicator {
                         confirmedBufferStart = reader->getBufferEnd();
                         break;
                     } else
-                        throw RedoLogException(50051, "did not find lwn at offset: " + confirmedBufferStart.toString());
+                        throw RedoLogException(50051, "did not find lwn at offset: " + confirmedBufferStart.toString() + " (block: " +
+                                               std::to_string(currentBlock) + ", lwnEndBlock: " + std::to_string(lwnEndBlock) +
+                                               ", passStartBlock: " + std::to_string(passStartBlock) + ", resumed: " +
+                                               (resumedFromOffset ? "yes" : "no") + ")");
                 }
 
                 while (blockOffset < reader->getBlockSize()) {
@@ -1579,6 +1713,11 @@ namespace OpenLogReplicator {
                             uint64_t lwnPos = ++lwnRecords;
                             if (unlikely(lwnPos >= MAX_RECORDS_IN_LWN))
                                 throw RedoLogException(50054, "all " + std::to_string(lwnPos) + " records in lwn were used");
+
+                            // The heap grows with the record instead of being sized to the maximum up front (see the
+                            // comment on the member in Parser.h: the fixed array is what made every Parser 8 MB).
+                            if (unlikely(lwnPos + 1 > lwnMembers.size()))
+                                lwnMembers.resize(lwnPos + 1, nullptr);
 
                             while (lwnPos > 1 && *lwnMember < *lwnMembers[lwnPos / 2]) {
                                 lwnMembers[lwnPos] = lwnMembers[lwnPos / 2];
@@ -1739,33 +1878,11 @@ namespace OpenLogReplicator {
                         ctx->metrics->emitBytesParsed((currentBlock - lwnConfirmedBlock) * reader->getBlockSize());
                     lwnConfirmedBlock = currentBlock;
 
-                    // Slice boundary. The commit sorter keeps one memory chunk (1 MB) per finished transaction
-                    // that still waits for the low-water-mark - the minimum parsed SCN over the redo threads, so
-                    // it only moves once the other threads are parsed. Parsing one whole archive in one go
-                    // therefore keeps every committed transaction of that archive in memory (with thousands of
-                    // transactions in a window this is gigabytes of chunks that can not be swapped out - see
-                    // documentation/rac-asm-support-development-plan.md). Stop at a LWN boundary, save the
-                    // position and let the scheduler continue with the redo thread that is behind.
-                    if (!switchRedo && ctx->slicePendingCommits > 0 && metadata->commitSorter != nullptr &&
-                        metadata->commitSorter->getPendingEvents() >= ctx->slicePendingCommits &&
-                        metadata->commitSorter->isAheadOfWatermark(lwnScn) &&
-                        static_cast<uint64_t>(currentBlock - sliceStartBlock) * reader->getBlockSize() >= Ctx::SLICE_MIN_BYTES) {
-                        slicePending = true;
-                        sliceScn = lwnScn;
-                        // Save the NEXT LWN record's first block, not the one this record ended on: the resumed
-                        // pass treats its start block as the head of an LWN record (Parser::parse, "currentBlock
-                        // == lwnEndBlock") and reads the SCN out of it. A continuation block carries the LWN flag
-                        // as well but not the head's fields, so resuming on it read a garbage SCN and ended the
-                        // run with 50049 (measured in production: "invalid lwn scn: 11388144845283", right after
-                        // "FINISHED (sliced), position: 7340032 / 13839360" and a resume at offset: 7350784).
-                        // lwnEndBlock is exactly the head of the next record (currentBlock + lwnSize).
-                        metadata->saveFileOffset(thread, sequence, FileOffset(lwnEndBlock, reader->getBlockSize()));
-                        if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
-                            ctx->logTrace(Ctx::TRACE::CHECKPOINT, "slicing archive at scn: " + lwnScn.toString() + " (block " +
-                                          std::to_string(currentBlock) + "), pending commits: " +
-                                          std::to_string(metadata->commitSorter->getPendingEvents()));
-                        break;
-                    }
+                    // The slice boundary is taken at the *head* of the next record now (see the comment there,
+                    // where the block has been verified to be a head). Taken here it saved lwnEndBlock - a block
+                    // the parser only *assumes* to be the next head - and a resume on a block that turned out to
+                    // be a continuation block of a record (50049, "invalid lwn scn") or not written yet (50051)
+                    // either ended the run or restarted the whole archive (60058).
                 } else if (unlikely(lwnNumCnt > lwnNumMax))
                     throw RedoLogException(50055, "lwn overflow: " + std::to_string(lwnNumCnt) + "/" + std::to_string(lwnNumMax));
 

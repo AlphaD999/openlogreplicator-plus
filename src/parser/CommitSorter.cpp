@@ -36,33 +36,67 @@ namespace OpenLogReplicator {
         event->scn = commitScn;
         event->commit = true;
         event->transaction = transaction;
+        event->thread = transaction->thread;
         std::unique_lock lck(sorterMtx);
         events[commitScn].push_back(event);
         ++pendingEvents;
+        ++pendingByThread[event->thread];
         syncPendingEvents();
         notifyDeliveryLocked();
+        // No wait here: the backpressure is applied at the boundary of a record (waitForBacklog, called from
+        // Parser::parse) and not per commit - see the comment there.
+    }
 
+    void CommitSorter::waitForBacklog(uint16_t thread) {
         // Backpressure (stage 2): with the delivery on its own thread (stage 4) nothing else paces the parser -
         // it can walk away from the delivery until the transaction pool is full, and a buffered commit that owns
         // a single chunk can not be swapped out, so the pool can not be relieved any more (measured: 4,500
-        // buffered commits, 4 GB pool, 1 MB blocks -> "ERROR 10017 out of memory"). Stop it here instead: the
-        // delivery notifies when the backlog is back under the limit, and the lock is released while waiting, so
-        // this thread does not hold the delivery back (the sorter lock is what it needs to take the events out).
-        initPendingLimitLocked();
-        if (ctx == nullptr || pendingLimit == 0 || pendingEvents <= pendingLimit)
+        // buffered commits, 4 GB pool, 1 MB blocks -> "ERROR 10017 out of memory").
+        //
+        // Called at the *head* of a record, right after the parser published its water-mark there, and not per
+        // commit inside a record. Two reasons, both measured in the reproduction rig on 2026-10-16 with slicing
+        // on:
+        //  - the wait must be per redo thread (pendingLimitLocked): with a global bound a thread that runs ahead
+        //    holds back the parser of a thread that is behind, and that thread is exactly the one whose
+        //    water-mark has to move for anything to become deliverable (measured: 8,193 events of thread 2 above
+        //    thread 1's water-mark, the delivery reporting "deliverable now: 0" - a deadlock);
+        //  - the wait must not happen *inside* a record: the water-mark only moves at the next record head, so a
+        //    record carrying more commits than the limit (measured: 4,097 commits in one record against a limit
+        //    of 4,096) would have the parser wait for a water-mark only it could publish. At the boundary the
+        //    water-mark of this thread is already published, so everything of the *previous* record is
+        //    deliverable - the delivery drains and the wait ends. The price is that the overshoot is bounded by
+        //    one record and not by the limit exactly, which the free half of the pool covers.
+        std::unique_lock lck(sorterMtx);
+        if (ctx == nullptr)
+            return;
+        const uint64_t limit = pendingLimitLocked();
+        if (limit == 0 || pendingByThread[thread] <= limit)
             return;
 
         bool reported = false;
         const uint64_t waitingSince = ctx->clock->getTimeUt();
-        while (pendingEvents > pendingLimit && !ctx->hardShutdown && !ctx->softShutdown) {
+        while (pendingByThread[thread] > limit && !ctx->hardShutdown && !ctx->softShutdown) {
             backpressureCv.wait_for(lck, std::chrono::milliseconds(BACKPRESSURE_WAIT_MS));
             const uint64_t now = ctx->clock->getTimeUt();
             if (reported || now <= waitingSince || now - waitingSince < BACKPRESSURE_REPORT_US)
                 continue;
             reported = true;
+            // How much of the backlog the delivery may take right now and how much of it waits for a higher
+            // water-mark: a wait in which nothing is deliverable is not the delivery being slow, it is the
+            // water-mark being held back - and that has to be visible in the report.
+            uint64_t deliverable = 0;
+            uint64_t aboveWatermark = 0;
+            for (const auto& [scn, list]: events) {
+                if (watermark != Scn::none() && !(scn > watermark))
+                    deliverable += list.size();
+                else
+                    aboveWatermark += list.size();
+            }
             ctx->warning(60062, "the parser is waiting for the delivery for: " + std::to_string((now - waitingSince) / 1000000) +
-                         " s - the commit sorter still holds " + std::to_string(pendingEvents) + " buffered commit(s) "
-                         "(limit: " + std::to_string(pendingLimit) + ", transaction pool: " +
+                         " s - the commit sorter holds " + std::to_string(pendingByThread[thread]) + " buffered commit(s) of this "
+                         "thread and " + std::to_string(pendingEvents) + " in total (per thread limit: " +
+                         std::to_string(limit) + ", deliverable now: " + std::to_string(deliverable) +
+                         ", above the low-water-mark: " + std::to_string(aboveWatermark) + ", transaction pool: " +
                          std::to_string(ctx->getMemoryChunksMax()) + " chunk(s), thread watermarks: " +
                          getThreadWatermarksText() + "); the parse of this thread is stopped on purpose: letting it go on "
                          "would fill the pool with commits that are waiting for the low-water-mark (\"memory-max-mb\" / "
@@ -70,17 +104,18 @@ namespace OpenLogReplicator {
         }
     }
 
-    void CommitSorter::initPendingLimitLocked() {
-        if (pendingLimit != 0 || ctx == nullptr)
-            return;
-
+    uint64_t CommitSorter::pendingLimitLocked() const {
+        if (ctx == nullptr)
+            return 0;
         const uint64_t chunks = ctx->getMemoryChunksMax();
         if (chunks == 0)
-            return;
-        // Half of the pool: the other half has to take the open (not yet committed) transactions, the builder
-        // buffers and the reader. Every buffered commit owns at least one chunk, so with this bound the pool can
-        // never be exhausted by the backlog alone (which is the state that ended the run with 10017 before).
-        pendingLimit = chunks / 2;
+            return 0;
+        // Half of the pool for the buffered commits (the other half takes the open transactions, the builder
+        // buffers and the reader), divided by the number of redo threads the sorter has seen: every buffered
+        // commit owns at least one chunk and a transaction owning exactly one chunk can not be swapped out, so
+        // with this bound the backlog of all threads together can not exhaust the pool on its own.
+        const uint64_t threads = threadWatermark.empty() ? 1 : threadWatermark.size();
+        return chunks / 2 / threads;
     }
 
     void CommitSorter::enqueueCheckpoint(const CheckpointEvent& checkpoint) {
@@ -88,9 +123,11 @@ namespace OpenLogReplicator {
         event->scn = checkpoint.scn;
         event->commit = false;
         event->checkpoint = checkpoint;
+        event->thread = checkpoint.thread;
         std::lock_guard const lck(sorterMtx);
         events[checkpoint.scn].push_back(event);
         ++pendingEvents;
+        ++pendingByThread[event->thread];
         syncPendingEvents();
         notifyDeliveryLocked();
     }
@@ -352,11 +389,17 @@ namespace OpenLogReplicator {
                 events.erase(it);
             }
             pendingEvents -= ready.size();
+            for (const Event* event: ready) {
+                const auto it2 = pendingByThread.find(event->thread);
+                if (it2 != pendingByThread.end() && it2->second > 0)
+                    --it2->second;
+            }
             syncPendingEvents();
-            // Backpressure: the parser may be waiting in enqueueCommit() for exactly this drop. Notified with
-            // the lock held like the delivery wake up (the waiter re-reads the count under the same lock).
-            if (pendingLimit > 0 && pendingEvents <= pendingLimit)
-                backpressureCv.notify_all();
+            // Backpressure: a parser of one of the redo threads may be waiting in enqueueCommit() for exactly
+            // this drop - each waits on the count of its own thread, so any drop can bring one under its limit.
+            // Notified with the lock held like the delivery wake up (the waiter re-reads the count under the
+            // same lock).
+            backpressureCv.notify_all();
         }
 
         for (Event* event: ready) {

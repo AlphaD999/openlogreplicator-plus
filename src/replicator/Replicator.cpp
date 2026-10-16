@@ -945,6 +945,13 @@ namespace OpenLogReplicator {
                     metadata->commitSorter->threadReopened(parser->thread);
                 parser->reader = archReader;
 
+                // The archive's sequence is known from the list this parser came from: hand it to the reader
+                // before it opens the file, so that every block of it is checked against the archive it claims to
+                // belong to (Reader::checkBlockHeader) instead of being taken over from a block header - a block
+                // of another archive passes every other check (same block number, a real redo CRC, a SCN inside
+                // the range) and made a pass parse foreign bytes as its own records.
+                archReader->setArchiveSequence(parser->sequence);
+
                 archReader->fileName = parser->path;
                 uint retry = ctx->archReadTries;
                 // Set when the archive is dropped instead of read (see 10074): the retry loop below breaks
@@ -955,8 +962,13 @@ namespace OpenLogReplicator {
                 while (true) {
                     if (ctx->softShutdown)
                         break;
-                    if (archReader->checkRedoLog() && archReader->updateRedoLog())
+                    if (archReader->checkRedoLog() && archReader->updateRedoLog()) {
+                        // Opening the file re-reads the archive list (checkRedoLog/updateRedoLog): hand the
+                        // archive identity over once more, so the first block the parser reads is checked against
+                        // it and not adopted from a block header (see checkBlockHeader).
+                        archReader->setArchiveSequence(parser->sequence);
                         break;
+                    }
 
                     if (retry == 0) {
                         archReader->showHint(this, "", parser->path);

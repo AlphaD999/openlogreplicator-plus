@@ -674,9 +674,10 @@ namespace OpenLogReplicator {
             metadata->firstSchemaScn = metadata->firstDataScn;
             readSystemDictionariesMetadata(metadata->schema, metadata->firstDataScn);
 
-            for (const SchemaElement* element: metadata->schemaElements)
+            for (const SchemaElement* element: metadata->schemaElements) {
                 createSchemaForTable(metadata->firstDataScn, element->owner, element->table, element->keyList, element->key, element->tagType,
                                      element->tagList, element->tag, element->condition, element->options, tablesUpdated);
+            }
             metadata->schema->resetTouched();
 
             if (unlikely(metadata->ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))

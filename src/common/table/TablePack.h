@@ -23,6 +23,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include <map>
 #include <memory>
 #include <set>
+#include <string>
 #include <unordered_map>
 
 #include "../exception/RuntimeException.h"
