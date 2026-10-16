@@ -98,6 +98,33 @@ namespace OpenLogReplicator {
         [[nodiscard]] std::string archiveWaitState() const;
 
         void cleanArchList();
+        // True when this (thread, sequence) already has a Parser waiting in the queue: a sliced archive that
+        // waits for its resume, or one parked because its predecessor is missing. The archive list is read on
+        // every pass of the scheduler and appends what it returns, so without this check the same archive gets
+        // a second Parser object. Both are then parsed: the saved position is a single slot that is cleared
+        // when it is taken, so one of them resumes and the other starts at the beginning of the file. It
+        // re-reads the whole archive (measured on a sliced run: 190,091 records of already committed
+        // transactions dropped in one pass) and the two interleaved parsers take undo slots over from each
+        // other (measured: 60041, 614 rows of a transaction never delivered).
+        //
+        // Two things this relies on, and one that is deliberately not guarded:
+        //  - a skipped row has to come back later, and it does: the queue and the parked list are only ever
+        //    discarded by cleanArchList(), whose single caller (Replicator::processArchivedRedoLogs) follows it
+        //    with archGetLog() in the same thread - so after a clean the list is read again and the archive is
+        //    queued then. A parked archive has no other way back than that re-read (there is no un-park path).
+        //    If a future change discards the queues without re-reading the list, skipping here would starve the
+        //    archive.
+        //  - the re-queue of a sliced Parser in processArchivedRedoLogs is *not* checked against this predicate:
+        //    it puts back the Parser that was just taken out, not a newly listed archive - skipping it would drop
+        //    the saved resume.
+        //
+        // Honest status (2026-10-16, reproduction rig): with the sequence attribution of Reader::checkBlockHeader
+        // in place (commit 4d635e8) this predicate did not fire once in a full sliced run over the archives of the
+        // rig (skip count 0, and committed_reread_drops = 0 with the guard as well as without it), i.e. the
+        // re-reads it was written for were that adoption bug and not duplicate Parsers. It is kept as a cheap
+        // consistency guard for the paths that can hand an archive out again (the batch/directory list, which the
+        // rig does not exercise) - not as a measured optimisation.
+        [[nodiscard]] bool archiveQueued(uint16_t thread, Seq sequence) const;
         // Index of the archive with the lowest SCN still to be parsed in archiveRedoQueue
         [[nodiscard]] size_t bestArchiveIndex() const;
         void updateOnlineLogs() const;

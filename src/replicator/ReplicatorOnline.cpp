@@ -1884,6 +1884,15 @@ namespace OpenLogReplicator {
                     continue;
                 }
 
+                // The same archive can still be waiting in the queue: a sliced one for its resume, a parked
+                // one for a missing predecessor. A second Parser for it would be parsed as well, from the
+                // beginning of the file - the saved resume position is a single slot and one of the two
+                // consumes it (see Replicator::archiveQueued).
+                if (replicator->archiveQueued(static_cast<uint16_t>(thread), sequence)) {
+                    ret = stmt.next();
+                    continue;
+                }
+
                 std::string mappedPath(path.data());
                 replicator->applyMapping(mappedPath);
 

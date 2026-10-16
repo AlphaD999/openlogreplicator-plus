@@ -85,6 +85,34 @@ namespace OpenLogReplicator {
         gapArchives.clear();
     }
 
+    bool Replicator::archiveQueued(uint16_t thread, Seq sequence) const {
+        // Diagnosis (TRACE::CHECKPOINT): one line per skip, i.e. per archive the list handed out again while a
+        // Parser for it was still waiting here - exactly the case in which a second Parser would have been built
+        // and would have read the file from its beginning (the saved resume position is a single slot, see the
+        // comment on the declaration in Replicator.h). Counting these lines is what says whether this guard still
+        // has work to do in a given replication; the trace sits in this predicate and not at the call sites so
+        // that every caller is covered and no counter member is needed.
+        for (const Parser* parser: archiveRedoQueue)
+            if (parser->thread == thread && parser->sequence == sequence) {
+                if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
+                    ctx->logTrace(Ctx::TRACE::CHECKPOINT, "archiveQueued: skip thread " + std::to_string(thread) + " seq: " +
+                                  sequence.toString() + " - still queued: " + std::to_string(archiveRedoQueue.size()) +
+                                  ", parked: " + std::to_string(gapArchives.size()));
+                return true;
+            }
+
+        for (const Parser* parser: gapArchives)
+            if (parser->thread == thread && parser->sequence == sequence) {
+                if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
+                    ctx->logTrace(Ctx::TRACE::CHECKPOINT, "archiveQueued: skip thread " + std::to_string(thread) + " seq: " +
+                                  sequence.toString() + " - still parked: " + std::to_string(gapArchives.size()) +
+                                  ", queued: " + std::to_string(archiveRedoQueue.size()));
+                return true;
+            }
+
+        return false;
+    }
+
     size_t Replicator::bestArchiveIndex() const {
         size_t best = 0;
 
@@ -570,6 +598,11 @@ namespace OpenLogReplicator {
                 if (sequence == Seq::zero() || sequence < replicator->metadata->threadSequence(fileThread))
                     continue;
 
+                // Same archive still waiting in the queue (a sliced or parked one): do not build a second
+                // Parser for it, it would re-read the file from its beginning (see Replicator::archiveQueued)
+                if (replicator->archiveQueued(fileThread, sequence))
+                    continue;
+
                 auto* parser = new Parser(replicator->ctx, replicator->builder, replicator->metadata,
                                           replicator->transactionBuffer, 0, fileName);
 
@@ -628,6 +661,13 @@ namespace OpenLogReplicator {
                 if (sequence == Seq::zero() || sequence < replicator->metadata->threadSequence(fileThread))
                     continue;
 
+                // The same archive can still be waiting in the queue or in the parked list (a sliced one for its
+                // resume, one waiting for a missing predecessor): a second Parser for it would be parsed as well,
+                // from the beginning of the file - the saved resume position is a single slot and one of the two
+                // consumes it (see Replicator::archiveQueued).
+                if (replicator->archiveQueued(fileThread, sequence))
+                    continue;
+
                 auto* parser = new Parser(replicator->ctx, replicator->builder, replicator->metadata,
                                           replicator->transactionBuffer, 0, mappedPath);
                 parser->firstScn = Scn::none();
@@ -662,6 +702,11 @@ namespace OpenLogReplicator {
                                                   std::to_string(fileThread));
 
                     if (sequence == Seq::zero() || sequence < replicator->metadata->threadSequence(fileThread))
+                        continue;
+
+                    // Same as in the single file branch above: do not build a second Parser for an archive that is
+                    // still waiting in the queue or in the parked list (see Replicator::archiveQueued).
+                    if (replicator->archiveQueued(fileThread, sequence))
                         continue;
 
                     auto* parser = new Parser(replicator->ctx, replicator->builder, replicator->metadata,
@@ -1028,6 +1073,10 @@ namespace OpenLogReplicator {
                 // (and with it the transaction memory held by the commit sorter) small.
                 if (parser->slicePending) {
                     parser->slicePending = false;
+                    // No archiveQueued() check here, and none is wanted: this is the very Parser that was just taken
+                    // out of the queue (it was sliced and its position was saved), put back for its resume. The
+                    // check exists for an archive a *new* list read hands out again while it is still waiting -
+                    // skipping this one would drop the saved resume and lose whatever the slice left unparsed.
                     if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
                         ctx->logTrace(Ctx::TRACE::CHECKPOINT, "archive sliced, seq: " + parser->sequence.toString() + " thread: " +
                                       std::to_string(parser->thread) + ", scn: " + parser->sliceScn.toString());
