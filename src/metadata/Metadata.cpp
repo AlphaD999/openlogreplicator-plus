@@ -259,14 +259,16 @@ namespace OpenLogReplicator {
         return result;
     }
 
-    void Metadata::saveFileOffset(uint16_t thread, Seq sequence, FileOffset newFileOffset) {
+    void Metadata::saveFileOffset(uint16_t thread, Seq newSequence, FileOffset newFileOffset) {
         std::unique_lock const lck(mtxCheckpoint);
 
         ThreadPos& pos = threadPosGet(thread);
         // A zero offset is "forget the position", not "resume at the beginning of some archive": saving it has
         // to clear the sequence as well, otherwise a stale non zero offset of an older archive would stay valid
         // for that sequence number forever.
-        pos.fileOffsetSequence = newFileOffset > FileOffset::zero() ? sequence : Seq::none();
+        // The parameter is called newSequence and not sequence: "sequence" is a member of this class and a
+        // parameter of that name shadows it (-Wshadow on the delivery toolchain).
+        pos.fileOffsetSequence = newFileOffset > FileOffset::zero() ? newSequence : Seq::none();
         pos.fileOffset = newFileOffset;
         if (thread == 1) {
             fileOffsetSequence = pos.fileOffsetSequence;

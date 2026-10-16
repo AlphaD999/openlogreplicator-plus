@@ -25,6 +25,12 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include "BuilderJson.h"
 
 namespace OpenLogReplicator {
+    // An Oracle NUMBER can hold 38 digits, which does not fit a 64 bit integer: the magnitudes in appendNumber below
+    // are 128 bit on purpose. __int128 is a GCC extension and the delivery toolchain compiles with -Wpedantic, so the
+    // type is declared once here with __extension__ (it marks the type as intended and keeps the pedantic warning
+    // away from every use of it).
+    __extension__ typedef unsigned __int128 uint128Json;
+
     BuilderJson::BuilderJson(Ctx* newCtx, Locales* newLocales, Metadata* newMetadata, Format& newFormat, uint64_t newFlushBuffer,
                              bool newEnvelopeOutput, std::string newTopicPrefix, std::string newSchemaChangeTopic,
                              bool newDebeziumSchemaBlock):
@@ -137,9 +143,9 @@ namespace OpenLogReplicator {
         digits.erase(0, firstNonZero);
 
         // Accumulate into a 128 bit magnitude (NUMBER max precision is 38 digits)
-        unsigned __int128 magnitude = 0;
+        uint128Json magnitude = 0;
         for (const char c : digits)
-            magnitude = (magnitude * 10) + static_cast<unsigned __int128>(c - '0');
+            magnitude = (magnitude * 10) + static_cast<uint128Json>(c - '0');
 
         // Two's complement big endian, minimal length: java.math.BigInteger.toByteArray() semantics
         uint8_t bytes[17];
@@ -162,7 +168,7 @@ namespace OpenLogReplicator {
             for (uint64_t i = 0; i < size; ++i)
                 bytes[size - 1 - i] = (i < 16) ? static_cast<uint8_t>((magnitude >> (i * 8)) & 0xFF) : 0x00;
         } else {
-            const unsigned __int128 twosComplement = (~magnitude) + 1;
+            const uint128Json twosComplement = (~magnitude) + 1;
             uint64_t bits = 1;
             for (uint64_t i = 128; i > 0; --i) {
                 if (((twosComplement >> (i - 1)) & 1) != 0) {
