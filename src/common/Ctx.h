@@ -420,6 +420,11 @@ namespace OpenLogReplicator {
         // delivers the lowest buffered event without waiting for the water-mark while it is set
         // (CommitSorter::tick with flushLowest, see DeliveryExecutor::run).
         std::atomic<bool> parserInSwapWait{false};
+        // The same escape for the other way a parser can be blocked: stopped by the per-thread backpressure limit
+        // (CommitSorter::waitForBacklog) for longer than BACKPRESSURE_EMERGENCY_US while the delivery has nothing it
+        // may flush below the low-water-mark. Set by the waiting parser, cleared when it leaves the wait; the delivery
+        // thread treats it like parserInSwapWait and takes the lowest buffered event without the water-mark.
+        std::atomic<bool> parserInBacklogWait{false};
         // One delivery at a time, over every path that delivers (stage 4: the delivery thread, and the emergency
         // tick of the writer). The callbacks of a flush run outside the sorter lock and write into the builder, so
         // two deliveries in parallel would also step over the accounting thread below and over the deferred

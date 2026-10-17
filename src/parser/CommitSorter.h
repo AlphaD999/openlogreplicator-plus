@@ -136,6 +136,11 @@ class Thread;
         // blind spot the stalls of 2026-10-15 hid in.
         static constexpr uint64_t BACKPRESSURE_WAIT_MS{100};
         static constexpr uint64_t BACKPRESSURE_REPORT_US{30000000};
+        // Once a parser has been stopped by the limit for this long, the delivery thread is told to take the lowest
+        // buffered event without waiting for the water-mark (Ctx::parserInBacklogWait) - the escape of the same kind
+        // as the swapped-memory one. Five seconds: long enough not to cut in front of a delivery that is merely busy,
+        // short enough to break a real circle before the read buffer runs dry (60046).
+        static constexpr uint64_t BACKPRESSURE_EMERGENCY_US{5000000};
 
         // Deliver the lowest buffered event(s) even though the low-water-mark has not reached them. Only called
         // by tick() with flushLowest (the defect C emergency). It is safe there: the event is a *commit* (the
@@ -208,6 +213,14 @@ class Thread;
         // transaction that holds exactly one can not - so the pool has to cover the backlog of every thread plus
         // the open transactions). 0 = no bound (the pool is not initialized yet).
         [[nodiscard]] uint64_t pendingLimitLocked() const;
+        // The SCN a flush may deliver up to, with sorterMtx held: Scn::none() means "everything buffered" (no redo
+        // thread holds the low-water-mark any more). Both the flush (flushReady) and the backpressure report (60062)
+        // ask this - reporting "deliverable" against a different number than the flush delivers by made the field
+        // read "deliverable now: 24580" from a delivery that was idle (2026-10-16).
+        Scn deliveryLimitLocked();
+        // The minimum parsed SCN over the threads that take part in the low-water-mark (not closed, not
+        // idle-released, not unaligned); Scn::none() when no thread takes part.
+        [[nodiscard]] Scn lowWaterMarkLocked() const;
         struct Event {
             Scn scn;
             bool commit;

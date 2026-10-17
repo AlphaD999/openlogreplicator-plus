@@ -156,17 +156,26 @@ namespace OpenLogReplicator {
             // release (a time based decision) and the shutdown, neither of which notifies.
             sorter->waitForDelivery(DELIVERY_WAIT_US);
 
-            const bool parserBlocked = ctx->parserInSwapWait.load(std::memory_order_relaxed);
+            // Two ways the parser can be blocked on a delivery that only it could enable: waiting for a swapped
+            // transaction (defect C, Ctx::parserInSwapWait) and being stopped by the per-thread backpressure limit
+            // with nothing flushable below the low-water-mark (Ctx::parserInBacklogWait, 2026-10-16 field stall).
+            // Both arm the same emergency: the lowest buffered event is delivered without the water-mark.
+            const bool swapWait = ctx->parserInSwapWait.load(std::memory_order_relaxed);
+            const bool backlogWait = !swapWait && ctx->parserInBacklogWait.load(std::memory_order_relaxed);
+            const bool parserBlocked = swapWait || backlogWait;
             if (parserBlocked) {
                 if (!swapWaitReported) {
                     swapWaitReported = true;
-                    ctx->info(0, "the parser is blocked waiting for a swapped transaction to be delivered - the "
-                                 "delivery thread releases it (defect C)");
+                    ctx->info(0, swapWait ?
+                                 "the parser is blocked waiting for a swapped transaction to be delivered - the "
+                                 "delivery thread releases it (defect C)" :
+                                 "the parser is blocked on the backpressure limit and nothing is flushable below the "
+                                 "low-water-mark - the delivery thread delivers the lowest buffered commit to release it");
                 }
             } else if (swapWaitReported) {
                 swapWaitReported = false;
-                ctx->info(0, "the parser is not waiting for a swapped transaction any more - the delivery thread is "
-                             "back to the ordinary water-mark");
+                ctx->info(0, "the parser is not waiting for a swapped transaction or the backpressure limit any more - "
+                             "the delivery thread is back to the ordinary water-mark");
             }
 
             deliveredInTick = 0;

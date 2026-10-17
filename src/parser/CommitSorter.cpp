@@ -74,20 +74,36 @@ namespace OpenLogReplicator {
             return;
 
         bool reported = false;
+        // Emergency: a wait longer than BACKPRESSURE_EMERGENCY_US means this parser can not go on while the delivery
+        // has nothing it may flush below the low-water-mark - the same circle the swapped-memory wait has (see
+        // Ctx::parserInSwapWait): the parser is the only thread that publishes a position, and it is the blocked one.
+        // The flag makes the delivery thread take the lowest buffered event without waiting for the water-mark; it is
+        // cleared on every way out of this function, so the delivery is back to the ordinary water-mark afterwards.
+        bool emergency = false;
         const uint64_t waitingSince = ctx->clock->getTimeUt();
         while (pendingByThread[thread] > limit && !ctx->hardShutdown && !ctx->softShutdown) {
             backpressureCv.wait_for(lck, std::chrono::milliseconds(BACKPRESSURE_WAIT_MS));
             const uint64_t now = ctx->clock->getTimeUt();
+            if (!emergency && now > waitingSince && now - waitingSince >= BACKPRESSURE_EMERGENCY_US) {
+                emergency = true;
+                ctx->parserInBacklogWait.store(true, std::memory_order_relaxed);
+                // Wake the delivery thread: it is the one that acts on the flag (DeliveryExecutor::run).
+                notifyDeliveryLocked();
+            }
             if (reported || now <= waitingSince || now - waitingSince < BACKPRESSURE_REPORT_US)
                 continue;
             reported = true;
             // How much of the backlog the delivery may take right now and how much of it waits for a higher
             // water-mark: a wait in which nothing is deliverable is not the delivery being slow, it is the
             // water-mark being held back - and that has to be visible in the report.
+            // The limit is asked from the same place the flush asks it (deliveryLimitLocked): reporting "deliverable"
+            // against a different water-mark than the one flushReady() delivers by is what made the field read
+            // "deliverable now: 24580" while the delivery was idle (2026-10-16, the 890 s stall).
+            const Scn deliveryLimit = deliveryLimitLocked();
             uint64_t deliverable = 0;
             uint64_t aboveWatermark = 0;
             for (const auto& [scn, list]: events) {
-                if (watermark != Scn::none() && !(scn > watermark))
+                if (deliveryLimit == Scn::none() || !(scn > deliveryLimit))
                     deliverable += list.size();
                 else
                     aboveWatermark += list.size();
@@ -98,11 +114,16 @@ namespace OpenLogReplicator {
                          std::to_string(limit) + ", deliverable now: " + std::to_string(deliverable) +
                          ", above the low-water-mark: " + std::to_string(aboveWatermark) + ", transaction pool: " +
                          std::to_string(ctx->getMemoryChunksMax()) + " chunk(s), thread watermarks: " +
-                         getThreadWatermarksText() + "); the parse of this thread is stopped on purpose: letting it go on "
+                         getThreadWatermarksText() + ")" +
+                         (deliveryLimit == Scn::none() ?
+                          "; no thread holds the low-water-mark, so the delivery takes the lowest buffered event" : "") +
+                         "; the parse of this thread is stopped on purpose: letting it go on "
                          "would fill the pool with commits that are waiting for the low-water-mark (\"memory-max-mb\" / "
                          "\"transaction-block-kb\")");
-        }
-    }
+                         }
+                         if (emergency)
+                         ctx->parserInBacklogWait.store(false, std::memory_order_relaxed);
+                         }
 
     uint64_t CommitSorter::pendingLimitLocked() const {
         if (ctx == nullptr)
@@ -305,33 +326,60 @@ namespace OpenLogReplicator {
         Scn limit;
         {
             std::lock_guard const lck(sorterMtx);
-            // Low-water-mark: minimum parsed SCN over all active (non-closed) threads
-            Scn lowWatermark = Scn::none();
-            for (const auto& [thread, parsedScn]: threadWatermark) {
-                if (closedThreads.find(thread) != closedThreads.end())
-                    continue;
-                // Idle thread released by the timeout: it does not hold back the low-water-mark any more
-                if (idleThreads.find(thread) != idleThreads.end())
-                    continue;
-                // Thread that came back from a release while still behind the water-mark: it must not hold back
-                // the other threads until it has caught up (see setThreadWatermark)
-                if (unalignedThreads.find(thread) != unalignedThreads.end())
-                    continue;
-                if (lowWatermark == Scn::none() || parsedScn < lowWatermark)
-                    lowWatermark = parsedScn;
-            }
-            if (lowWatermark == Scn::none())
-                return;
-
-            // The water-mark is a lower bound that was already acknowledged as safe, so it never moves back: a
-            // thread that comes back below it (see unalignedThreads) must not stall every other thread until it
-            // has caught up.
-            if (watermark == Scn::none() || lowWatermark > watermark)
-                watermark = lowWatermark;
-            // What this flush may deliver is the water-mark (raised above, or the one of the last flush)
-            limit = watermark;
+            limit = deliveryLimitLocked();
         }
         flushUpTo(executor, limit);
+    }
+
+    Scn CommitSorter::lowWaterMarkLocked() const {
+        // Minimum parsed SCN over the threads that take part in the low-water-mark: a closed thread's position is
+        // final and holds nothing back, an idle-released one is explicitly released ("its transactions can now be
+        // delivered after transactions with a higher SCN", see setThreadWatermark) and an unaligned one came back
+        // from a release while still behind, so it must not hold the others back until it has caught up.
+        Scn lowWatermark = Scn::none();
+        for (const auto& [thread, parsedScn]: threadWatermark) {
+            if (closedThreads.find(thread) != closedThreads.end())
+                continue;
+            if (idleThreads.find(thread) != idleThreads.end())
+                continue;
+            if (unalignedThreads.find(thread) != unalignedThreads.end())
+                continue;
+            if (lowWatermark == Scn::none() || parsedScn < lowWatermark)
+                lowWatermark = parsedScn;
+        }
+        return lowWatermark;
+    }
+
+    Scn CommitSorter::deliveryLimitLocked() {
+        const Scn lowWatermark = lowWaterMarkLocked();
+        if (lowWatermark != Scn::none()) {
+            // The water-mark is a lower bound that was already acknowledged as safe, so it never moves back: a thread
+            // that comes back below it (see unalignedThreads) must not stall every other thread until it has caught up.
+            if (watermark == Scn::none() || lowWatermark > watermark)
+                watermark = lowWatermark;
+            // What a flush may deliver is the water-mark (raised above, or the one of the last flush)
+            return watermark;
+        }
+
+        // No redo thread takes part in the low-water-mark: every one of them is closed, idle-released or unaligned
+        // (or none has published a position yet, which is the startup case). The release is explicit about what it
+        // means - a released thread no longer holds the delivery back - so no thread holding the water-mark means no
+        // thread holds anything back: deliver what is buffered, the way flushAll() does at shutdown.
+        //
+        // Returning instead is what stalled the field for 890 s (measured 2026-10-16, production log): the events
+        // stayed buffered, the *old* water-mark kept reporting them as deliverable (warning 60062: "deliverable now:
+        // 24580" while the delivery was idle), the buffer only grew until the parser hit the per-thread backpressure
+        // limit and blocked in waitForBacklog(), and the parser that could have published a higher position was the
+        // blocked one - a circle nothing could break. Reproduced in the rig without any load: 74 flushes with events
+        // buffered while every redo thread was idle-released.
+        if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
+            ctx->logTrace(Ctx::TRACE::CHECKPOINT, "delivery limit: no thread holds the low-water-mark (threads: " +
+                          std::to_string(threadWatermark.size()) + ", closed: " + std::to_string(closedThreads.size()) +
+                          ", idle: " + std::to_string(idleThreads.size()) + ", unaligned: " +
+                          std::to_string(unalignedThreads.size()) + ") - watermark: " + watermark.toString() +
+                          ", buffered events: " + std::to_string(pendingEvents) + " - flushing them anyway");
+        // Nothing to wait for: Scn::none() makes flushUpTo() take everything buffered.
+        return Scn::none();
     }
 
     void CommitSorter::flushAll(Executor* executor, Thread* deliveryThread) {
