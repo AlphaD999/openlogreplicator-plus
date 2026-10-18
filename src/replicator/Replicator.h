@@ -155,6 +155,18 @@ namespace OpenLogReplicator {
         // Highest archived sequence seen for the thread, Seq::none() while the thread is unknown
         [[nodiscard]] Seq getThreadMaxSequence(uint16_t thread) const;
 
+        // What the last archive-list pass did, for diagnostics (60056). threadMaxSequence is only updated from
+        // rows the list returned, so a pass that returns nothing leaves it frozen while the source has newer
+        // archives listed - the log then says "no archived redo log to read" without telling why. These five
+        // numbers are what tells the three cases apart: the bind values were rejected (rows=0, err set), the
+        // resetlogs id does not match (rows=0, err empty), or the query itself failed (rows=0, err set).
+        Seq archListStart;
+        uint64_t archListResetlogs{0};
+        uint64_t archListRows{0};
+        Seq archListMinSeq;
+        Seq archListMaxSeq;
+        std::string archListError;
+
         virtual void initialize();
         virtual void positionReader();
         virtual void loadDatabaseMetadata();

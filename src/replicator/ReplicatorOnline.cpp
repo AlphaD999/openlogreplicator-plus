@@ -1850,6 +1850,15 @@ namespace OpenLogReplicator {
             // IS_RECOVERY_DEST_FILE DESC, so the first row of a group is the preferred copy. The queue is ordered
             // by (thread, sequence) only, so the remaining copies have to be dropped here - otherwise it would be
             // undefined which of them gets read first.
+            // Diagnostics of this pass (see Replicator.h): what was bound, what came back. A pass that returns
+            // nothing leaves threadMaxSequence frozen, and that is what 60056 has to be able to show.
+            replicator->archListStart = sequenceStart;
+            replicator->archListResetlogs = replicator->metadata->resetlogs;
+            replicator->archListRows = 0;
+            replicator->archListMinSeq = Seq::none();
+            replicator->archListMaxSeq = Seq::none();
+            replicator->archListError.clear();
+
             bool firstRow = true;
             uint32_t lastThread{};
             Seq lastSequence;
@@ -1862,6 +1871,12 @@ namespace OpenLogReplicator {
                 firstRow = false;
                 lastThread = thread;
                 lastSequence = sequence;
+
+                ++replicator->archListRows;
+                if (replicator->archListMinSeq == Seq::none() || sequence < replicator->archListMinSeq)
+                    replicator->archListMinSeq = sequence;
+                if (replicator->archListMaxSeq == Seq::none() || sequence > replicator->archListMaxSeq)
+                    replicator->archListMaxSeq = sequence;
 
                 // Thread activity is derived from the archive list itself: the highest sequence per thread and
                 // the moment it moved last. SYS.V_$THREAD is not usable for this - on a physical standby it
@@ -1905,6 +1920,14 @@ namespace OpenLogReplicator {
                 replicator->archiveRedoQueue.emplace_back(parser);
                 ret = stmt.next();
             }
+
+            // The one silent failure mode: the list returns nothing, no archive is read, nothing is logged and
+            // the source looks idle although it has newer archives. One line per such pass with the bind values
+            // is what tells a rejected bind (wrong sequence or resetlogs) from a source that really has nothing.
+            if (unlikely(replicator->archListRows == 0 && replicator->ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
+                replicator->ctx->logTrace(Ctx::TRACE::CHECKPOINT, "arch list: no row returned (start=" +
+                                          replicator->archListStart.toString() + ", resetlogs=" +
+                                          std::to_string(replicator->archListResetlogs) + ")");
         }
         replicator->goStandby();
     }

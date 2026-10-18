@@ -830,14 +830,22 @@ namespace OpenLogReplicator {
     }
 
     std::string Replicator::archiveWaitState() const {
-        if (threadMaxSequence.empty())
-            return "the archive list source does not know any redo thread yet";
-
         std::ostringstream ss;
-        ss << "the archive list source reports";
-        for (const auto& entry: threadMaxSequence)
-            ss << " thread " << entry.first << ": expected seq " << metadata->threadSequence(entry.first).toString() << ", highest known seq "
-               << entry.second.toString() << ";";
+        if (threadMaxSequence.empty())
+            ss << "the archive list source does not know any redo thread yet";
+        else {
+            ss << "the archive list source reports";
+            for (const auto& entry: threadMaxSequence)
+                ss << " thread " << entry.first << ": expected seq " << metadata->threadSequence(entry.first).toString() << ", highest known seq "
+                   << entry.second.toString() << ";";
+        }
+        // The last list pass: without these five numbers a frozen "highest known" can not be told apart from a
+        // list that keeps returning the same old rows (see Replicator.h).
+        ss << " last list pass: start=" << archListStart.toString() << ", resetlogs=" << archListResetlogs
+           << ", rows=" << archListRows << ", min=" << archListMinSeq.toString() << ", max=" << archListMaxSeq.toString();
+        if (!archListError.empty())
+            ss << ", error: " << archListError;
+        ss << "; queue=" << archiveRedoQueue.size() << ", parked=" << gapArchives.size();
         return ss.str();
     }
 
