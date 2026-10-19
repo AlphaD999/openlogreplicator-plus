@@ -660,9 +660,29 @@ namespace OpenLogReplicator {
                         thread1It->second.fileOffset = metadata->fileOffset;
                     }
                 } else {
-                    ThreadPos& pos = metadata->threadPosGet(1);
-                    pos.sequence = metadata->sequence;
-                    pos.fileOffset = metadata->fileOffset;
+                    // Legacy checkpoint (written before the per-thread "threads" array): the single "seq" in the
+                    // file is the last parsed sequence of *some* thread, not of thread 1. Binding it to thread 1
+                    // is wrong on RAC: thread 1 then waits for an archive with a sequence that belongs to
+                    // another thread (measured: "60027 thread: 1 seq: 13896, found: 18098" - and no delivery at
+                    // all, because that archive never exists). Drop the position instead of guessing: the
+                    // per-thread starting sequences are then derived from the checkpoint SCN by positionReader()
+                    // (Replicator.cpp: "sequence == none" triggers it), which is the authoritative source.
+                    if (metadata->ctx != nullptr)
+                        metadata->ctx->info(0, "checkpoint has no per-thread positions (legacy format): ignoring seq: " +
+                                            metadata->sequence.toString() + ", positioning every thread from scn: " +
+                                            metadata->firstDataScn.toString() + " instead");
+                    metadata->sequence = Seq::none();
+                    metadata->fileOffset = FileOffset::zero();
+                }
+
+                // What was restored, per thread, and by which path above: without this a wrong per-thread
+                // sequence shows up much later as a bare 60027 and cannot be traced back to the checkpoint.
+                if (metadata->ctx != nullptr && !metadata->threadPos.empty()) {
+                    for (const auto& [threadNumber, restored]: metadata->threadPos)
+                        metadata->ctx->info(0, "restored from checkpoint thread " + std::to_string(threadNumber) +
+                                            ": seq: " + restored.sequence.toString() + ", offset: " +
+                                            restored.fileOffset.toString() +
+                                            (document.HasMember("threads") ? "" : " (derived from scn)"));
                 }
 
                 if (unlikely(!metadata->fileOffset.matchesBlockSize(Ctx::MIN_BLOCK_SIZE)))

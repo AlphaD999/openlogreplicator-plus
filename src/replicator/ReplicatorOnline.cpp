@@ -466,7 +466,8 @@ namespace OpenLogReplicator {
             // Per-thread starting sequence (single instance returns a single row for thread 1)
             while (ret != 0) {
                 metadata->setSeqFileOffset(sequence, FileOffset::zero(), static_cast<uint16_t>(thread));
-                ctx->info(0, "starting sequence for thread: " + std::to_string(thread) + " is: " + sequence.toString());
+                ctx->info(0, "starting sequence for thread: " + std::to_string(thread) + " is: " + sequence.toString() +
+                          " (from scn: " + metadata->firstDataScn.toString() + ")");
                 ret = stmt.next();
             }
         }
