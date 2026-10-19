@@ -189,6 +189,15 @@ namespace OpenLogReplicator {
             sorter->tick(this, ctx->clock->getTimeUt(), ctx->idleThreadReleaseUs, this, parserBlocked);
             ctx->deliveryActiveSinceUs.store(0, std::memory_order_relaxed);
 
+            // Layered backlog report every 30 s: without it the backlog only becomes visible in 60055, i.e. after
+            // the parser has already stalled, and then only as one number that can not be attributed to a layer.
+            static thread_local uint64_t layersReportUs = 0;
+            const uint64_t layersNowUs = ctx->clock->getTimeUt();
+            if (layersReportUs == 0 || layersNowUs - layersReportUs >= 30000000) {
+                layersReportUs = layersNowUs;
+                ctx->info(0, "backlog layers:" + ctx->layersLine());
+            }
+
             if (deliveredInTick > 0)
                 // This thread is the builder's single writer, so waking the writer is its job as well: the parser
                 // used to call Builder::flush() at the end of every pass, and without it a writer that waits for its

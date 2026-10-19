@@ -161,7 +161,38 @@ namespace OpenLogReplicator {
         if (swapGetWaits > 0)
             ss << ", swap chunk waits: " << swapGetWaits << " (" << (statSwapGetWaitUs.load(std::memory_order_relaxed) / 1000) << " ms)";
 
+        // Where the undelivered work actually is. Appended after the existing fields so the prefix and every grep
+        // built on it ("did not advance", "delivery: idle") keeps working.
+        ss << ", layers:" << layersLine();
+
         warning(60055, ss.str());
+    }
+
+    std::string Ctx::layersLine() const {
+        std::ostringstream ss;
+        ss << " sorter_events=" << statSorterEvents.load(std::memory_order_relaxed)
+           << " sorter_scns=" << statSorterScns.load(std::memory_order_relaxed)
+           << " sorter_pending=" << statPendingDeliveries.load(std::memory_order_relaxed)
+           << " pending_by_thread=[";
+        bool first = true;
+        for (uint16_t thread = 0; thread < 16; ++thread) {
+            const uint64_t perThread = statPendingByThread[thread].load(std::memory_order_relaxed);
+            if (perThread == 0)
+                continue;
+            ss << (first ? "" : " ") << thread << ":" << perThread;
+            first = false;
+        }
+        if (first)
+            ss << "none";
+        ss << "]";
+        {
+            // swapMtx guards both containers: the sizes are read under it, nothing is held across the report.
+            std::unique_lock const lck(swapMtx);
+            ss << " swap_entries=" << swapChunks.size()
+               << " waiting_file_removal=" << commitedXids.size();
+        }
+        ss << " parser_in_swap_wait=" << (parserInSwapWait.load(std::memory_order_relaxed) ? 1 : 0);
+        return ss.str();
     }
 
     Ctx::~Ctx() {

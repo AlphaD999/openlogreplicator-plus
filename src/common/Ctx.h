@@ -20,6 +20,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #ifndef CTX_H_
 #define CTX_H_
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -499,6 +500,18 @@ namespace OpenLogReplicator {
         // waiting for delivery", which is a different thing (swap entries waiting for their file to be removed)
         // and sent the analysis of the production stalls in the wrong direction. Read in the 60050 message only.
         std::atomic<uint64_t> statPendingDeliveries{0};
+
+        // Layered view of where the undelivered work sits, mirrored from the sorter by
+        // CommitSorter::syncPendingEvents() so that Ctx.h does not have to know CommitSorter. A single "pending
+        // commits" number can not tell "parsed but not delivered" (sorter events) from "swapped out and not read
+        // back yet" (swapChunks) from "delivered, waiting for the swap file to be removed" (commitedXids).
+        std::atomic<uint64_t> statSorterEvents{0};
+        std::atomic<uint64_t> statSorterScns{0};
+        std::array<std::atomic<uint64_t>, 16> statPendingByThread{};
+
+        // One line with those layers plus the swap side (read under swapMtx). Written every 30 s by the delivery
+        // tick and appended to warning 60055.
+        [[nodiscard]] std::string layersLine() const;
 
         // Wall clock in milliseconds. Ctx.h only forward declares Clock, so the accessor is defined in Ctx.cpp
         // (same reason as the watchdog helpers below): the writer needs it for the per message delivery lag and

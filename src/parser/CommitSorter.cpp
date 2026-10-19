@@ -305,6 +305,18 @@ namespace OpenLogReplicator {
 
     void CommitSorter::syncPendingEvents() const {
         ctx->statPendingDeliveries.store(pendingEvents, std::memory_order_relaxed);
+        // Layered mirror for Ctx::layersLine(): how many events are buffered, in how many SCN groups, and how they
+        // sit per redo thread. Relaxed stores only, in the critical section that already holds sorterMtx.
+        uint64_t totalEvents = 0;
+        for (const auto& [scn, group]: events)
+            totalEvents += group.size();
+        ctx->statSorterEvents.store(totalEvents, std::memory_order_relaxed);
+        ctx->statSorterScns.store(events.size(), std::memory_order_relaxed);
+        for (uint16_t thread = 0; thread < 16; ++thread) {
+            const auto it = pendingByThread.find(thread);
+            ctx->statPendingByThread[thread].store(it == pendingByThread.end() ? 0 : it->second,
+                                                   std::memory_order_relaxed);
+        }
     }
 
     uint64_t CommitSorter::getPendingEvents() const {
