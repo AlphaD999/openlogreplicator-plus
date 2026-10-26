@@ -84,6 +84,12 @@ namespace OpenLogReplicator {
                     R"(,"thread":)" << std::dec << metadata->minThread <<
                     R"(,"xid":")" << metadata->minXid.toString() << R"("})";
         }
+        if (metadata->deliveredScn > 0) {
+            // Highest commit SCN that was handed to the writer. After a restart the rewind to "min-trans" reads that
+            // window of redo again; every commit at or below this SCN was already delivered and is dropped instead
+            // of being queued a second time (see DeliveryExecutor::commitCommon).
+            ss << R"(,"delivered-scn":)" << std::dec << metadata->deliveredScn;
+        }
         if (!metadata->minTrans.empty()) {
             // Every thread that has an unfinished transaction, not only the oldest one: after a restart each of them
             // has to be re-read from its own position, or the transaction commits with only the rows that were
@@ -599,6 +605,7 @@ namespace OpenLogReplicator {
                     "incarnations",
                     "log-archive-dest",
                     "log-archive-format",
+                    "delivered-scn",
                     "min-tran",
                     "min-trans",
                     "nls-character-set",
@@ -808,6 +815,17 @@ namespace OpenLogReplicator {
                 metadata->minXid = Xid::zero();
                 metadata->minThread = 0;
                 metadata->minTrans.clear();
+                metadata->deliveredScn = 0;
+                // The delivered watermark is what keeps a restart from delivering the rewind window twice: it is
+                // applied to the runtime as it is read, so DeliveryExecutor::commitCommon drops those commits.
+                if (document.HasMember("delivered-scn")) {
+                    metadata->deliveredScn = Ctx::getJsonFieldU64(fileName, document, "delivered-scn");
+                    if (metadata->ctx != nullptr) {
+                        metadata->ctx->deliveredUpToScn.store(metadata->deliveredScn, std::memory_order_relaxed);
+                        metadata->ctx->info(0, "checkpoint: delivered up to scn: " + std::to_string(metadata->deliveredScn) +
+                                            " (\"delivered-scn\") - the redo before it is not delivered again after the rewind");
+                    }
+                }
                 metadata->lastCheckpointScn = Scn::none();
                 metadata->lastSequence = Seq::none();
                 metadata->lastCheckpointFileOffset = FileOffset::zero();

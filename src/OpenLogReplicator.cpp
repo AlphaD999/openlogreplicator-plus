@@ -454,6 +454,7 @@ namespace OpenLogReplicator {
 
             if (!ctx->isDisableChecksSet(Ctx::DISABLE_CHECKS::JSON_TAGS)) {
                 static const std::vector<std::string> stateNames{
+                    "drop-delivered-on-restart",
                     "interval-mb",
                     "interval-s",
                     "keep-checkpoints",
@@ -483,7 +484,17 @@ namespace OpenLogReplicator {
             if (stateJson.HasMember("keep-checkpoints"))
                 ctx->checkpointKeep = Ctx::getJsonFieldU64(configFileName, stateJson, "keep-checkpoints");
 
-            // (g3 removed)
+            // Default on: after a restart the rewind window (min-trans) is read again, and without this the whole
+            // window is delivered a second time (2026-10-23: 37,000 duplicate commits, 20 minutes of
+            // delivery_lag_ms). Off restores the previous behaviour: duplicates instead of "the commits that were
+            // handed to the writer but not yet confirmed before the stop are not repeated".
+            if (stateJson.HasMember("drop-delivered-on-restart")) {
+                ctx->dropDeliveredOnRestart = Ctx::getJsonFieldU64(configFileName, stateJson, "drop-delivered-on-restart") != 0;
+                ctx->info(0, "checkpoint: commits delivered before a restart are " +
+                          std::string(ctx->dropDeliveredOnRestart ? "dropped" : "delivered again") +
+                          " when the rewind window is read (\"" + "drop-delivered-on-restart" + "\": " +
+                          std::to_string(ctx->dropDeliveredOnRestart ? 1 : 0) + ")");
+            }
 
             if (stateJson.HasMember("schema-force-interval"))
                 ctx->schemaForceInterval = Ctx::getJsonFieldU64(configFileName, stateJson, "schema-force-interval");

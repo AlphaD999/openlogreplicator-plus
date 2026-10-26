@@ -183,6 +183,10 @@ namespace OpenLogReplicator {
         // that were parsed after the restart (silently incomplete, and on a RAC database the oldest transaction is
         // usually not the only one: production 2026-10-21 had 38 open transactions at shutdown).
         std::map<uint16_t, ThreadPos> minTrans;
+        // Highest commit SCN handed to the writer, written to the checkpoint file as "delivered-scn": after a
+        // restart the rewind window (min-trans) is read again, and every commit at or below this SCN is dropped
+        // instead of being delivered a second time (see DeliveryExecutor::commitCommon).
+        uint64_t deliveredScn{0};
         uint64_t schemaInterval{0};
         std::set<Scn> checkpointScnList;
         std::unordered_map<Scn, bool> checkpointSchemaMap;

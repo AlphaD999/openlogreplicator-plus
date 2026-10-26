@@ -557,6 +557,10 @@ namespace OpenLogReplicator {
                 ctx->statCheckpointWalkUs.store(ctx->clock->getTimeUt() - walkStartUs, std::memory_order_relaxed);
             }
 
+            // The delivered watermark travels in the same file as the positions: a restart needs both, the rewind
+            // target (min-trans) and the SCN below which the redo must not be delivered a second time.
+            deliveredScn = ctx->deliveredUpToScn.load(std::memory_order_relaxed);
+
             serializer->serialize(this, ss, storeSchema);
 
             lastCheckpointScn = checkpointScn;

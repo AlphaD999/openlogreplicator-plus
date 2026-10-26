@@ -523,7 +523,25 @@ namespace OpenLogReplicator {
         std::atomic<uint64_t> statCheckpointWalkTx{0};
         std::atomic<uint64_t> statCheckpointWalkUs{0};
 
-        // (g3 removed)
+        // Highest commit SCN whose message has been handed to the writer ("delivered"). Written by the delivery
+        // thread, persisted in the checkpoint as "delivered-scn" and restored at startup: the restart rewinds a
+        // redo thread to the begin of the transaction that was open (see min-trans), which re-reads and otherwise
+        // re-delivers everything already delivered in that window. Production 2026-10-23: 37,000 commits queued
+        // again, 20 minutes of delivery_lag_ms that never came down.
+        std::atomic<uint64_t> deliveredUpToScn{0};
+        // Commits dropped because they were delivered before the restart (the rewind window), commits handed to
+        // the writer, the delivery rate over the report interval, and the time the delivery spent waiting for a
+        // swapped chunk to come back - the four numbers that tell "the queue is deep" from "the disk is slow".
+        std::atomic<uint64_t> statRestartRereadDrops{0};
+        std::atomic<uint64_t> statDeliveredCommits{0};
+        std::atomic<uint64_t> statDeliveredPerS{0};
+        std::atomic<uint64_t> statSwapGetWaitMs{0};
+
+        // "state"."drop-delivered-on-restart": drop the commits of the rewind window that were already handed to
+        // the writer before the restart (default on) instead of delivering them a second time. Off = the previous
+        // behaviour, which trades the duplicates for nothing: the commits in the writer queue at the stop are lost
+        // either way, the checkpoint position is ahead of them.
+        bool dropDeliveredOnRestart{true};
         std::array<std::atomic<uint64_t>, 16> statPendingByThread{};
         // Chunks of the transaction pool held by the buffered (committed, not delivered yet) transactions of each
         // thread, mirrored from the sorter by CommitSorter::syncPendingEvents(). This - and not the event count -

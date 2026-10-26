@@ -35,11 +35,35 @@ namespace OpenLogReplicator {
         // below compared against "nothing". The commit SCN of the transaction *is* the SCN of the event.
         void commitCommon(Ctx* ctx, Builder* builder, Metadata* metadata, TransactionBuffer* transactionBuffer,
                           Transaction* transaction) {
+            // Delivered before the restart: after a restart the redo of the transaction that was open at shutdown is
+            // read again (the rewind to min-trans, see Metadata::minTrans), and that window is otherwise delivered a
+            // second time - production 2026-10-23 queued 37,000 commits again and delivery_lag_ms never came down.
+            // The checkpoint carries the highest commit SCN that was handed to the writer ("delivered-scn"); every
+            // commit at or below it is a duplicate and is dropped here. Commits are flushed in SCN order, so one
+            // watermark covers all redo threads, and the Xid/sq_n of the tombstone set are not needed.
+            if (ctx->dropDeliveredOnRestart && transaction->commitScn != Scn::none() &&
+                transaction->commitScn.getData() <= ctx->deliveredUpToScn.load(std::memory_order_relaxed)) {
+                ctx->statRestartRereadDrops.fetch_add(1, std::memory_order_relaxed);
+                if (unlikely(ctx->isTraceSet(Ctx::TRACE::TRANSACTION)))
+                    ctx->logTrace(Ctx::TRACE::TRANSACTION, "dropping a commit delivered before the restart: " +
+                                  transaction->xid.toString() + " at scn: " + transaction->commitScn.toString());
+                transactionBuffer->dropTransaction(transaction->xid, transaction->conId, transaction->thread, transaction);
+                transaction->purge(ctx);
+                delete transaction;
+                return;
+            }
+
             if ((transaction->commitScn > metadata->firstDataScn && !transaction->system) ||
                 (transaction->commitScn > metadata->firstSchemaScn && transaction->system)) {
                 if (transaction->begin) {
                     transaction->flush(metadata, builder);
                     ctx->thread()->contextSet(Thread::CONTEXT::CPU);
+                    // Handed to the writer: this is the delivered watermark that survives the restart (see the drop
+                    // at the head of this function). Only the delivery thread writes it.
+                    ctx->statDeliveredCommits.fetch_add(1, std::memory_order_relaxed);
+                    const uint64_t commitScnData = transaction->commitScn.getData();
+                    if (commitScnData > ctx->deliveredUpToScn.load(std::memory_order_relaxed))
+                        ctx->deliveredUpToScn.store(commitScnData, std::memory_order_relaxed);
                     if (ctx->metrics != nullptr) {
                         if (transaction->rollback)
                             ctx->metrics->emitTransactionsRollbackOut(1);
@@ -195,9 +219,25 @@ namespace OpenLogReplicator {
             // Layered backlog report every 30 s: without it the backlog only becomes visible in 60055, i.e. after
             // the parser has already stalled, and then only as one number that can not be attributed to a layer.
             static thread_local uint64_t layersReportUs = 0;
+            // Delivery rate over the same interval: "the queue is 20,000 deep" says nothing without it, and next
+            // to swap_get_wait_ms it separates "drained slowly because every commit waits for the swap file" from
+            // "drained slowly because the low-water-mark does not advance".
+            static thread_local uint64_t lastDelivered = 0;
+            static thread_local uint64_t lastDeliveredUs = 0;
+            static thread_local uint64_t lastSwapWaitUs = 0;
             const uint64_t layersNowUs = ctx->clock->getTimeUt();
             if (layersReportUs == 0 || layersNowUs - layersReportUs >= 30000000) {
                 layersReportUs = layersNowUs;
+                const uint64_t deliveredNow = ctx->statDeliveredCommits.load(std::memory_order_relaxed);
+                const uint64_t swapWaitUsNow = ctx->statSwapGetWaitUs.load(std::memory_order_relaxed);
+                if (lastDeliveredUs != 0 && layersNowUs > lastDeliveredUs) {
+                    ctx->statDeliveredPerS.store((deliveredNow - lastDelivered) * 1000000 / (layersNowUs - lastDeliveredUs),
+                                                 std::memory_order_relaxed);
+                    ctx->statSwapGetWaitMs.store((swapWaitUsNow - lastSwapWaitUs) / 1000, std::memory_order_relaxed);
+                }
+                lastDeliveredUs = layersNowUs;
+                lastDelivered = deliveredNow;
+                lastSwapWaitUs = swapWaitUsNow;
                 ctx->info(0, "backlog layers:" + ctx->layersLine());
             }
 

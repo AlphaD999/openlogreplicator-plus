@@ -214,7 +214,11 @@ namespace OpenLogReplicator {
         // Min-tran walk of the last checkpoint file write: the one heavy step left in the checkpoint path.
         ss << " checkpoint_walk_tx=" << statCheckpointWalkTx.load(std::memory_order_relaxed)
            << " checkpoint_walk_us=" << statCheckpointWalkUs.load(std::memory_order_relaxed);
-        // (g3 removed)
+        // Delivery side: rate over the report interval, the commits dropped as duplicates of a rewind window, and
+        // the time spent waiting for swapped chunks (the two answers next to "the queue is 20,000 deep").
+        ss << " delivered_per_s=" << statDeliveredPerS.load(std::memory_order_relaxed)
+           << " restart_reread_drops=" << statRestartRereadDrops.load(std::memory_order_relaxed)
+           << " swap_get_wait_ms=" << statSwapGetWaitMs.load(std::memory_order_relaxed);
         return ss.str();
     }
 
