@@ -92,7 +92,7 @@
 | `pending_max` | 进程启动以来**单线程**缓冲提交数的峰值（应 ≈ credit + 一条记录；更大说明还有路径在绕开） |
 | `in_delivery` | `sorter_pending` 之中已经交给 writer、但 `executeCommit()` 还没返回的事件数（g5）。writer 一堵这里就顶到 `sorter_pending`，用来区分"等水位"和"等 writer" |
 | `writer_queue` / `writer_queue_hwm` | writer 还没被客户端确认的消息数与其峰值（g5）。它和 librdkafka 的 `queue.buffering.max.messages` 一起构成**排序器之外**的在途量：客户端不跟上时这里涨、而 `sorter_pending` 可能仍然很低——credit 管不到这一段，只能靠这两个数看见 |
-| `builder_out` | builder 输出环里的 chunk 数（已构包、等客户端确认，上限 = `memory.max-mb` 的 1/8）。到限后交付线程在这里等、排序器被填满、credit 随即停解析，并报 **60068**（g5）。这是排序器之外最大的一段缓冲 |
+| `builder_out` | builder 输出环里的 chunk 数（已构包、等客户端确认，上限 = `memory.max-mb` 的 1/8，可用 `memory."builder-out-chunks"` 显式指定）。到限后交付线程在这里等，并报 **60068**（g5）。这是排序器之外最大的一段缓冲 |
 | `swap_chunks` / `swap_chunks_max` | 当前在盘 chunk 数与上限（池的 1/4） |
 | `swap_cap_hit` | 是否正卡在换出上限 |
 | `stall_yields` | 累计"停滞让出"次数 |

@@ -549,6 +549,8 @@ namespace OpenLogReplicator {
         // The ring is held at this many chunks (a quarter of the pool): the delivery thread waits there, the sorter
         // fills, and the credit of the parser stops the parse. 0 = not initialized yet, no bound.
         std::atomic<uint64_t> builderOutLimit{0};
+        // Configured override of builderOutLimit ("memory.builder-out-chunks"): 0 = derive it from the pool.
+        uint64_t builderOutChunks{0};
         // Reminder timestamp (milliseconds) of warning 60068 (the ring bound was reached).
         std::atomic<uint64_t> builderOutWarnMs{0};
 

@@ -530,7 +530,8 @@ namespace OpenLogReplicator {
             // g5: the builder output ring (messages built, waiting for the client to confirm) is held at an eighth
             // of the pool. It is the largest buffer past the commit sorter and the one that used to eat the pool
             // when the client stopped reading - see Ctx::statBuilderOut.
-            builderOutLimit.store(memoryChunksMax / 8, std::memory_order_relaxed);
+            builderOutLimit.store(builderOutChunks > 0 ? builderOutChunks : memoryChunksMax / 8,
+                                  std::memory_order_relaxed);
 
             memoryChunksReadBufferMax = mbsToChunks(memoryReadBufferMaxMb);
             memoryChunksReadBufferMin = mbsToChunks(memoryReadBufferMinMb);

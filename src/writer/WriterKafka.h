@@ -43,6 +43,13 @@ namespace OpenLogReplicator {
         std::map<std::string, std::string> properties;
         rd_kafka_t* rk{nullptr};
         rd_kafka_topic_t* rkt{nullptr};
+        // g5: warning 60031 used to be written on every retry, i.e. twice per "poll-interval-us" (1 ms) = ~1,200
+        // lines a second. A client that goes away for a few minutes filled megabytes of log - on a host that has
+        // just lost its consumer. The failures are counted and reported once a minute, with the count and the last
+        // error string.
+        uint64_t produceWarnMs{0};
+        uint64_t produceErrors{0};
+        std::string lastProduceError;
         rd_kafka_conf_t* conf{nullptr};
         static void dr_msg_cb(rd_kafka_t* rkCb, const rd_kafka_message_t* rkMessage, void* opaque);
         static void error_cb(rd_kafka_t* rkCb, int err, const char* reason, void* opaque);

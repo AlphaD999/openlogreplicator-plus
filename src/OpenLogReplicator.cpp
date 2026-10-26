@@ -249,12 +249,18 @@ namespace OpenLogReplicator {
         uint64_t memoryUnswapBufferMinMb = 4;
         uint64_t memoryWriteBufferMaxMb = memoryMaxMb;
         uint64_t memoryWriteBufferMinMb = 4;
+        // g5: override for the bound of the builder output ring. 0 = derived from the pool (a quarter of "max-mb",
+        // in chunks of "transaction-block-kb"); a positive value is the bound itself, in chunks. The bound is what
+        // stops the delivery when the client does not confirm; making it explicit is what makes the
+        // "ring full -> sorter full -> credit" path testable with a healthy target (a few chunks fill immediately).
+        uint64_t memoryBuilderOutChunks = 0;
 
         if (document.HasMember("memory")) {
             const rapidjson::Value& memoryJson = Ctx::getJsonFieldO(configFileName, document, "memory");
 
             if (!ctx->isDisableChecksSet(Ctx::DISABLE_CHECKS::JSON_TAGS)) {
                 static const std::vector<std::string> memoryNames{
+                    "builder-out-chunks",
                     "max-mb",
                     "min-mb",
                     "read-buffer-max-mb",
@@ -366,6 +372,17 @@ namespace OpenLogReplicator {
             if (memoryJson.HasMember("swap-path") && memorySwapMb > 0)
                 memorySwapPath = Ctx::getJsonFieldS(configFileName, Ctx::JSON_PARAMETER_LENGTH, memoryJson, "swap-path");
 
+            // g5: the bound of the builder output ring, in chunks of "transaction-block-kb". 0 keeps the derived
+            // value (a quarter of "max-mb"). A test or an operator who wants the ring held tighter than the pool
+            // allows can set it explicitly.
+            if (memoryJson.HasMember("builder-out-chunks")) {
+                memoryBuilderOutChunks = Ctx::getJsonFieldU64(configFileName, memoryJson, "builder-out-chunks");
+                if (memoryBuilderOutChunks > 1000000)
+                    throw ConfigurationException(30001, "bad JSON, invalid \"builder-out-chunks\" value: " +
+                                                 std::to_string(memoryBuilderOutChunks) +
+                                                 ", expected: 0 (derived from \"max-mb\") or 1 .. 1000000 chunk(s)");
+            }
+
             if (memoryUnswapBufferMinMb + memoryReadBufferMinMb + memoryWriteBufferMinMb + 4 > memoryMaxMb)
                 throw ConfigurationException(30001, R"(bad JSON, invalid "unswap-buffer-min-mb" + "read-buffer-min-mb" + "write-buffer-min-mb" + 4 ()" +
                                              std::to_string(memoryUnswapBufferMinMb) + " + " + std::to_string(memoryReadBufferMinMb) +
@@ -385,6 +402,8 @@ namespace OpenLogReplicator {
         }
 
         // MEMORY MANAGER
+        // The ring bound is derived inside initialize() from the pool, so the override has to be known first.
+        ctx->builderOutChunks = memoryBuilderOutChunks;
         ctx->initialize(memoryChunkKb, memoryMinMb, memoryMaxMb, memoryReadBufferMaxMb, memoryReadBufferMinMb, memorySwapMb, memoryUnswapBufferMinMb,
                         memoryWriteBufferMaxMb, memoryWriteBufferMinMb);
         // The size of one transaction data block decides what an open transaction costs, so it belongs into
@@ -392,6 +411,10 @@ namespace OpenLogReplicator {
         ctx->info(0, "memory: transaction block: " + std::to_string(memoryChunkKb) + " KB (\"transaction-block-kb\"), pool: " +
                      std::to_string(memoryMinMb) + " MB - " + std::to_string(memoryMaxMb) + " MB, read buffer: " +
                      std::to_string(memoryReadBufferMinMb) + " MB - " + std::to_string(memoryReadBufferMaxMb) + " MB");
+        ctx->info(0, "memory: builder output ring: " + std::to_string(ctx->builderOutLimit.load(std::memory_order_relaxed)) +
+                  " chunk(s) of " + std::to_string(memoryChunkKb) + " KB" +
+                  (memoryBuilderOutChunks > 0 ? " (\"builder-out-chunks\")"
+                                              : " (a quarter of \"max-mb\"; \"builder-out-chunks\" = 0)"));
 
         // METRICS
         if (document.HasMember("metrics")) {

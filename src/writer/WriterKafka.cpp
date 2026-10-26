@@ -232,10 +232,23 @@ namespace OpenLogReplicator {
                                         RD_KAFKA_VTYPE_END);
 
             if (err != 0) {
-                ctx->warning(60031, "failed to produce to topic " + topic + ", message: " + rd_kafka_err2str(err));
+                // g5: counted, reported once a minute (see the fields): the retry loop runs every "poll-interval-us",
+                // so an unconditional warning is ~1,200 lines per second while the client is gone.
+                ++produceErrors;
+                lastProduceError = rd_kafka_err2str(err);
+                const uint64_t nowMs = ctx->getTimeMs();
+                if (produceWarnMs == 0 || (nowMs > produceWarnMs && nowMs - produceWarnMs >= 60000)) {
+                    ctx->warning(60031, "failed to produce to topic " + topic + ": " + std::to_string(produceErrors) +
+                                 " attempt(s) failed since the last report, last error: " + lastProduceError +
+                                 (err == RD_KAFKA_RESP_ERR__QUEUE_FULL ?
+                                  " - the producer queue is full, the writer waits (the builder output ring fills "
+                                  "and the parser is stopped by its credit)" :
+                                  " - the message is dropped: only a full producer queue is retried"));
+                    produceWarnMs = nowMs;
+                    produceErrors = 0;
+                }
 
                 if (err == RD_KAFKA_RESP_ERR__QUEUE_FULL) {
-                    ctx->warning(60031, "queue, full, sleeping " + std::to_string(ctx->pollIntervalUs / 1000) + " ms, then retrying");
                     rd_kafka_poll(rk, static_cast<int>((ctx->pollIntervalUs / 1000)));
                     continue;
                 }
