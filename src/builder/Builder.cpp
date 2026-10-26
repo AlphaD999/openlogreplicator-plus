@@ -2501,6 +2501,8 @@ namespace OpenLogReplicator {
                 firstBuilderQueue = firstBuilderQueue->next;
                 --buffersAllocated;
             }
+            // g5: the ring shrank, publish it for the layers line and for the wait in builderRotate().
+            ctx->statBuilderOut.store(buffersAllocated, std::memory_order_relaxed);
         }
         t->contextSet(Thread::CONTEXT::CPU);
 

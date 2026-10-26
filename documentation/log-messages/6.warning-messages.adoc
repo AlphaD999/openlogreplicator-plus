@@ -567,3 +567,23 @@ threshold) and only happens when another archive is waiting to be parsed.
 _IMPORTANT:_ repeated 60067 is a storage/archive-supply symptom, not a parser symptom: check whether that thread's
 archives are complete when they are picked up (`thread_<n>_seq_<seq>` in the mount), and whether the mount is slow at
 that moment. The yield keeps the other threads moving, it does not make this archive faster.
+
+==== code 60068: "the builder output ring is full: <number> of <number> chunk(s) hold messages that the client has not confirmed - the delivery waits here, the commit sorter fills up and the parser is stopped by its credit (the bound is an eighth of \"memory.max-mb\"); confirming the messages releases it"
+
+Reported at most once every 30 s while the builder output ring is at its bound. The ring holds the messages that have
+been built (JSON) and handed to the writer but that the client has not confirmed yet; it grows by one pool chunk
+(`transaction-block-kb`) per block of output and is now held at **an eighth of the pool**, i.e. of `memory.max-mb`.
+
+Before this bound existed the ring was limited only by the pool itself, so a client that stopped reading let it eat
+the whole pool while the commit sorter - the only place the parser's credit looks at - stayed empty. Measured on the
+rig with a black-holed broker: 50,000 commits delivered, `sorter_pending=0`, `in_delivery=0`, `writer_queue` pinned at
+21, and every message sitting in this ring. The state looked like "nothing is buffered" while 50 MB (in production:
+up to 12 GB) were held.
+
+What happens now: the delivery thread waits in `Builder::builderRotate()`, the events it had taken from the sorter stay
+counted (`in_delivery`), the sorter fills up, and the credit stops the parser at a record head (`60064`). Memory is
+bounded by the ring, the sorter and the swap bound together instead of by the pool alone.
+
+What to do: this is a client-side stall, not a parser problem. Look at the writer (`60031` "failed to produce" /
+`queue.full`), at the broker and at the consumer group. `builder_out` in `backlog layers` shows the occupancy, and
+`60064` says whether the parser is waiting for the watermark, for the writer or for the client.

@@ -540,6 +540,23 @@ namespace OpenLogReplicator {
         // wait here). Published by Writer::createMessage / confirmMessage, read by layersLine only.
         std::atomic<uint64_t> statWriterQueue{0};
         std::atomic<uint64_t> statWriterQueueHwm{0};
+        // g5: chunks of the builder output ring, i.e. messages that are built and waiting for the writer/client to
+        // confirm them. This is the largest of the buffers past the sorter: the ring grows by a pool chunk per 64 KB
+        // of output and used to be bounded only by "memory.max-mb" - a client that stopped reading let it eat the
+        // whole pool while sorter_pending stayed at 0 (measured on the rig with a black-holed broker: 50,000 commits
+        // delivered, writer_queue pinned at 21, every message sitting in the ring).
+        std::atomic<uint64_t> statBuilderOut{0};
+        // The ring is held at this many chunks (a quarter of the pool): the delivery thread waits there, the sorter
+        // fills, and the credit of the parser stops the parse. 0 = not initialized yet, no bound.
+        std::atomic<uint64_t> builderOutLimit{0};
+        // Reminder timestamp (milliseconds) of warning 60068 (the ring bound was reached).
+        std::atomic<uint64_t> builderOutWarnMs{0};
+
+        // True once the builder output ring holds as many chunks as the pool allows for it.
+        [[nodiscard]] bool builderOutReached(uint64_t allocated) const {
+            const uint64_t limit = builderOutLimit.load(std::memory_order_relaxed);
+            return limit != 0 && allocated >= limit;
+        }
 
         // Cost of the last min-tran walk (TransactionBuffer::checkpoint), reported in the "backlog layers" line:
         // transactions walked and microseconds spent. It only runs when a checkpoint file is written (every

@@ -202,6 +202,18 @@ namespace OpenLogReplicator {
         static double decodeFloat(const uint8_t* data);
         static long double decodeDouble(const uint8_t* data);
 
+        // Occupancy of the output ring, published for "backlog layers", and whether the bound (Ctx::builderOutLimit)
+        // is reached. Taken under the same mutex releaseBuffers() holds while it trims the ring.
+        [[nodiscard]] bool outputRingFull() {
+            const uint64_t limit = ctx->builderOutLimit.load(std::memory_order_relaxed);
+            if (limit == 0)
+                return false;
+            std::unique_lock const lck(mtx);
+            const uint64_t allocated = buffersAllocated;
+            ctx->statBuilderOut.store(allocated, std::memory_order_relaxed);
+            return ctx->builderOutReached(allocated);
+        }
+
         template<bool copy>
         void builderRotate() {
             if (messageSize > ctx->memoryChunksWriteBufferMax * Ctx::MEMORY_CHUNK_SIZE_MB * 1024 * 1024)
@@ -209,6 +221,31 @@ namespace OpenLogReplicator {
                                        std::to_string(ctx->memoryChunksWriteBufferMax * Ctx::MEMORY_CHUNK_SIZE_MB) +
                                        ") is too small to fit a message with size: " +
                                        std::to_string(messageSize));
+            // g5: the output ring is a real bound. It grows by one pool chunk per block of messages and is trimmed
+            // by Writer::confirmMessage() -> releaseBuffers() when the client confirms. Before this bound a client
+            // that stopped reading made the ring eat the whole pool while the commit sorter - and with it the
+            // credit of the parser - stayed empty (rig, black-holed broker: 50,000 commits, sorter_pending=0,
+            // writer_queue pinned at 21). Waiting here stops the delivery, which fills the sorter and lets the
+            // credit stop the parse; the memory that was reported as "no backlog" is gone with it.
+            while (!ctx->hardShutdown && !ctx->softShutdown && outputRingFull()) {
+                constexpr uint64_t RING_REPORT_MS{30000};
+                const uint64_t nowMs = ctx->getTimeMs();
+                const uint64_t lastMs = ctx->builderOutWarnMs.load(std::memory_order_relaxed);
+                if (lastMs == 0 || (nowMs > lastMs && nowMs - lastMs >= RING_REPORT_MS)) {
+                    uint64_t expected = lastMs;
+                    if (ctx->builderOutWarnMs.compare_exchange_strong(expected, nowMs))
+                        ctx->warning(60068, "the builder output ring is full: " +
+                                     std::to_string(ctx->statBuilderOut.load(std::memory_order_relaxed)) + " of " +
+                                     std::to_string(ctx->builderOutLimit.load(std::memory_order_relaxed)) +
+                                     " chunk(s) hold messages that the client has not confirmed - the delivery "
+                                     "waits here, the commit sorter fills up and the parser is stopped by its "
+                                     "credit (the bound is an eighth of \"memory.max-mb\"); confirming the messages "
+                                     "releases it");
+                }
+                ctx->thread()->contextSet(Thread::CONTEXT::SLEEP);
+                ctx->usleepInt(ctx->pollIntervalUs);
+                ctx->thread()->contextSet(Thread::CONTEXT::CPU);
+            }
             auto* nextBuffer = reinterpret_cast<BuilderQueue*>(ctx->getMemoryChunk(ctx->thread(), Ctx::MEMORY::BUILDER));
             ctx->thread()->contextSet(Thread::CONTEXT::TRAN, Thread::REASON::TRAN);
             nextBuffer->next = nullptr;
@@ -235,6 +272,7 @@ namespace OpenLogReplicator {
                 std::unique_lock const lck(mtx);
                 lastBuilderQueue->next = nextBuffer;
                 ++buffersAllocated;
+                ctx->statBuilderOut.store(buffersAllocated, std::memory_order_relaxed);
                 lastBuilderQueue = nextBuffer;
             }
             ctx->thread()->contextSet(Thread::CONTEXT::TRAN, Thread::REASON::TRAN);

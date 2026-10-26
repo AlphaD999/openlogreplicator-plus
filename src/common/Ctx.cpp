@@ -184,6 +184,7 @@ namespace OpenLogReplicator {
            << " in_delivery=" << statInDelivery.load(std::memory_order_relaxed)
            << " writer_queue=" << statWriterQueue.load(std::memory_order_relaxed)
            << " writer_queue_hwm=" << statWriterQueueHwm.load(std::memory_order_relaxed)
+           << " builder_out=" << statBuilderOut.load(std::memory_order_relaxed)
            << " pending_by_thread=[";
         bool first = true;
         for (uint16_t thread = 0; thread < 16; ++thread) {
@@ -526,6 +527,10 @@ namespace OpenLogReplicator {
             // run crawls: production 2026-10-23 had 18,245 entries and 0.3 MB/s. Derived from the pool so that no
             // per-machine tuning is needed; 0 (pool not initialized) disables the bound.
             swapChunksLimit.store(memoryChunksMax / 4, std::memory_order_relaxed);
+            // g5: the builder output ring (messages built, waiting for the client to confirm) is held at an eighth
+            // of the pool. It is the largest buffer past the commit sorter and the one that used to eat the pool
+            // when the client stopped reading - see Ctx::statBuilderOut.
+            builderOutLimit.store(memoryChunksMax / 8, std::memory_order_relaxed);
 
             memoryChunksReadBufferMax = mbsToChunks(memoryReadBufferMaxMb);
             memoryChunksReadBufferMin = mbsToChunks(memoryReadBufferMinMb);

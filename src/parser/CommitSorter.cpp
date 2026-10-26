@@ -249,9 +249,14 @@ namespace OpenLogReplicator {
                              (inDelivery >= static_cast<uint64_t>(pendingEvents) ? "the writer is the one that does not "
                                                                                   "take them, not the water-mark"
                                                                                 : "the rest waits for the water-mark") +
-                             "), thread watermarks: " + getThreadWatermarksText() + " - this is not a memory "
+                             "), builder ring: " +
+                             std::to_string(ctx->statBuilderOut.load(std::memory_order_relaxed)) + " of " +
+                             std::to_string(ctx->builderOutLimit.load(std::memory_order_relaxed)) + " chunk(s)" +
+                             (ctx->builderOutReached(ctx->statBuilderOut.load(std::memory_order_relaxed)) ?
+                              " - full, so the delivery is waiting for the client to confirm" : "") +
+                             ", thread watermarks: " + getThreadWatermarksText() + " - this is not a memory "
                              "problem: the commits wait for the delivery, so either the thread that holds the "
-                             "low-water-mark (or its archive) or the writer is the one to look at");
+                             "low-water-mark (or its archive), the writer or the client is the one to look at");
             }
             if (reported || now <= waitingSince || now - waitingSince < BACKPRESSURE_REPORT_US)
                 continue;
