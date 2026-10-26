@@ -176,7 +176,6 @@ namespace OpenLogReplicator {
             return; // the pool is not initialized (yet): nothing to bound against
 
         bool reported = false;
-        bool creditReported = false;
         // Emergency: a wait longer than BACKPRESSURE_EMERGENCY_US means this parser can not go on while the delivery
         // has nothing it may flush below the low-water-mark - the same circle the swapped-memory wait has (see
         // Ctx::parserInSwapWait): the parser is the only thread that publishes a position, and it is the blocked one.
@@ -228,9 +227,15 @@ namespace OpenLogReplicator {
             // g4: the credit has its own report. 60062 talks about the pool (chunks); a thread stopped by the
             // credit is not waiting for memory, it is waiting for the delivery to catch up - mixing the two in one
             // message made the analysis read a memory problem where there was an ordering one.
-            if (!creditReported && creditBlockedSince != 0 && now > creditBlockedSince &&
-                now - creditBlockedSince >= BACKPRESSURE_REPORT_US) {
-                creditReported = true;
+            // Reported per wait and not per report interval, but with a threshold below the emergency release
+            // (CREDIT_REPORT_US < BACKPRESSURE_EMERGENCY_US): a wait longer than the emergency one is broken by the
+            // delivery flushing without the water-mark, so measuring "how long this call waited" against 30 s could
+            // never fire. At most one line per thread per minute.
+            const uint64_t lastCreditWarn = creditWarnUs[thread < 16 ? thread : 0];
+            if (creditBlockedSince != 0 && now > creditBlockedSince &&
+                now - creditBlockedSince >= CREDIT_REPORT_US &&
+                (lastCreditWarn == 0 || (now > lastCreditWarn && now - lastCreditWarn >= CREDIT_REPORT_GAP_US))) {
+                creditWarnUs[thread < 16 ? thread : 0] = now;
                 const Scn creditDeliveryLimit = deliveryLimitLocked();
                 uint64_t creditDeliverable = 0;
                 for (const auto& [scn, list]: events) {
@@ -638,6 +643,13 @@ namespace OpenLogReplicator {
                 continue;
             if (lowWatermark == Scn::none() || parsedScn < lowWatermark)
                 lowWatermark = parsedScn;
+        }
+        // TEST HOOK: pins the minimum at a fixed SCN (see Ctx::debugHoldScn). Everything above it waits in the
+        // sorter, which is exactly the state the credit exists for.
+        if (ctx != nullptr && ctx->debugHoldScn != 0) {
+            const Scn hold(ctx->debugHoldScn);
+            if (lowWatermark == Scn::none() || hold < lowWatermark)
+                lowWatermark = hold;
         }
         return lowWatermark;
     }

@@ -153,6 +153,14 @@ class Thread;
         // as the swapped-memory one. Five seconds: long enough not to cut in front of a delivery that is merely busy,
         // short enough to break a real circle before the read buffer runs dry (60046).
         static constexpr uint64_t BACKPRESSURE_EMERGENCY_US{5000000};
+        // g4: warning 60064 (the parser is stopped by its commit credit) has its own threshold, and it has to be
+        // *below* BACKPRESSURE_EMERGENCY_US: every wait longer than the emergency threshold ends with the delivery
+        // flushing without the water-mark, so a single wait can never reach the 30 s of 60062 - with the old threshold
+        // the warning could not fire at all (measured on the rig: the parser was held for 5 s at a time, the counter
+        // reset every time, 60064 stayed at zero). At most one report per thread per minute while the stall lasts.
+        static constexpr uint64_t CREDIT_REPORT_US{3000000};
+        static constexpr uint64_t CREDIT_REPORT_GAP_US{60000000};
+        std::array<uint64_t, 16> creditWarnUs{};
         // Lowest guaranteed backlog of one redo thread, in chunks (see minShareLocked): 64 chunks is 4 MB with the
         // default 64 KB transaction block. Small on purpose - it only has to keep a thread that is behind able to
         // enqueue, i.e. able to publish a water-mark; everything above it comes from the pool as it becomes free.

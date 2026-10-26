@@ -547,6 +547,7 @@ namespace OpenLogReplicator {
                     "format",
                     "idle-thread-release-us",
                     "min-trans-rewind-max-archives",
+                    "debug-hold-scn",
                     "memory",
                     "pending-commits-per-thread",
                     "stall-yield-us",
@@ -1231,6 +1232,19 @@ namespace OpenLogReplicator {
                 ctx->info(0, "parser: an archive that delivers no data for: " + std::to_string(ctx->stallYieldUs / 1000) +
                           " ms is yielded at its last confirmed LWN boundary so the other redo threads are parsed "
                           "first (\"stall-yield-us\")");
+
+            // TEST HOOK - not a production option: it pins the low-water-mark of the commit sorter at a fixed SCN, so
+            // that every commit above it waits in the sorter. That is the state the credit (60064) is for, and it is
+            // the one state a rig can not produce on demand (it needs a redo thread that crawls, see 2026-10-23).
+            // Loud on purpose: a configuration that carries this line buffers everything the database produces.
+            if (sourceJson.HasMember("debug-hold-scn")) {
+                ctx->debugHoldScn = Ctx::getJsonFieldU64(configFileName, sourceJson, "debug-hold-scn");
+                if (ctx->debugHoldScn > 0)
+                    ctx->warning(0, "TEST HOOK: the low-water-mark of the commit sorter is pinned at scn: " +
+                                 std::to_string(ctx->debugHoldScn) + " (\"debug-hold-scn\") - every commit above it is "
+                                 "buffered until the credit stops the parser; this is for reproducing a stalled redo "
+                                 "thread, NEVER set it in a production configuration");
+            }
 
             // How a redo thread that can not advance is left out of the low-water-mark of the commit sorter.
             // The decision itself is taken from the archive list ("no archived redo log left to read" - see

@@ -366,6 +366,12 @@ namespace OpenLogReplicator {
         // through the mount - otherwise stops *all* parsing, because the parse loop is a single thread.
         // 0 disables it (every archive is parsed to its end, or to its next backpressure stop, in one pass).
         uint64_t stallYieldUs{5000000};
+        // TEST HOOK (\"source.debug-hold-scn\", 0 = off): pins the low-water-mark of the commit sorter at a fixed SCN, so
+        // that every commit above it waits in the sorter - the shape of 2026-10-23 (one redo thread crawling while the
+        // others produce) without needing an artificially slow archive, which no rig can produce. It is the only way
+        // to exercise the credit (warning 60064) on purpose; the startup line says so in capitals and it must never
+        // be set in a production configuration.
+        uint64_t debugHoldScn{0};
         // A redo thread that does not advance its parsed SCN for this many microseconds stops holding back
         // the low-water-mark, so the transaction memory kept by the other threads stays bounded while one
         // instance is idle (no log switches for hours). 0 = disabled (default): the strict global SCN order
