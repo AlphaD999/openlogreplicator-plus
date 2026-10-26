@@ -242,7 +242,7 @@ namespace OpenLogReplicator {
                                      "credit (the bound is an eighth of \"memory.max-mb\"); confirming the messages "
                                      "releases it");
                 }
-                ctx->thread()->contextSet(Thread::CONTEXT::SLEEP);
+                ctx->thread()->contextSet(Thread::CONTEXT::SLEEP, Thread::REASON::BUILDER_RING_FULL);
                 ctx->usleepInt(ctx->pollIntervalUs);
                 ctx->thread()->contextSet(Thread::CONTEXT::CPU);
             }

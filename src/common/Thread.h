@@ -131,6 +131,9 @@ namespace OpenLogReplicator {
             // 60
             WRITER_NO_WORK,
             MEMORY_BLOCKED,
+            // The delivery waits for the client to confirm messages: the builder output ring is at its bound
+            // (Ctx::builderOutLimit, warning 60068).
+            BUILDER_RING_FULL,
             // 65
             // OTHER
             OS,
@@ -180,15 +183,76 @@ namespace OpenLogReplicator {
             }
         }
 
+        // Name of a CONTEXT, for the thread dump (Ctx::signalDump) and the reports.
+        [[nodiscard]] static const char* contextName(CONTEXT context) {
+            switch (context) {
+                case CONTEXT::NONE: return "none";
+                case CONTEXT::CPU: return "cpu";
+                case CONTEXT::OS: return "os";
+                case CONTEXT::MUTEX: return "mutex";
+                case CONTEXT::WAIT: return "wait";
+                case CONTEXT::SLEEP: return "sleep";
+                case CONTEXT::MEM: return "mem";
+                case CONTEXT::TRAN: return "tran";
+                case CONTEXT::CHKPT: return "chkpt";
+                default: return "?";
+            }
+        }
+
+        // Name of the REASON of a wait. Only the ones that matter for a stall are named; anything else prints its
+        // number, which is still enough to look it up in this header.
+        [[nodiscard]] static std::string reasonName(REASON reason) {
+            switch (reason) {
+                case REASON::NONE: return "none";
+                case REASON::READER_MAIN1: return "READER_MAIN1";
+                case REASON::READER_MAIN2: return "READER_MAIN2";
+                case REASON::READER_READ1: return "READER_READ1";
+                case REASON::READER_READ2: return "READER_READ2";
+                case REASON::READER_SET_READ: return "READER_SET_READ";
+                case REASON::READER_SLEEP1: return "READER_SLEEP1";
+                case REASON::READER_SLEEP2: return "READER_SLEEP2";
+                case REASON::READER_UPDATE_REDO1: return "READER_UPDATE_REDO1";
+                case REASON::READER_UPDATE_REDO2: return "READER_UPDATE_REDO2";
+                case REASON::READER_UPDATE_REDO3: return "READER_UPDATE_REDO3";
+                case REASON::READER_WAKE_UP: return "READER_WAKE_UP";
+                case REASON::READER_CHECK: return "READER_CHECK";
+                case REASON::READER_EMPTY: return "READER_EMPTY";
+                case REASON::READER_BUFFER_FULL: return "READER_BUFFER_FULL";
+                case REASON::READER_FINISHED: return "READER_FINISHED";
+                case REASON::READER_NO_WORK: return "READER_NO_WORK";
+                case REASON::REPLICATOR_ARCH: return "REPLICATOR_ARCH";
+                case REASON::REPLICATOR_SCHEMA: return "REPLICATOR_SCHEMA";
+                case REASON::REPLICATOR_UPDATE: return "REPLICATOR_UPDATE";
+                case REASON::WRITER_CONFIRM: return "WRITER_CONFIRM";
+                case REASON::WRITER_DONE: return "WRITER_DONE";
+                case REASON::WRITER_NO_WORK: return "WRITER_NO_WORK";
+                case REASON::MEMORY_BLOCKED: return "MEMORY_BLOCKED";
+                case REASON::BUILDER_RING_FULL: return "BUILDER_RING_FULL";
+                case REASON::MEMORY_EXHAUSTED: return "MEMORY_EXHAUSTED";
+                case REASON::MEMORY_NO_WORK: return "MEMORY_NO_WORK";
+                case REASON::METADATA_WAIT_WRITER: return "METADATA_WAIT_WRITER";
+                case REASON::METADATA_WAIT_FOR_REPLICATOR: return "METADATA_WAIT_FOR_REPLICATOR";
+                case REASON::TRANSACTION_DROP: return "TRANSACTION_DROP";
+                case REASON::TRANSACTION_FIND: return "TRANSACTION_FIND";
+                case REASON::TRANSACTION_SYSTEM: return "TRANSACTION_SYSTEM";
+                case REASON::CHECKPOINT_NO_WORK: return "CHECKPOINT_NO_WORK";
+                default: return std::to_string(static_cast<uint>(reason));
+            }
+        }
+
         void contextSet(CONTEXT context, REASON reason = REASON::NONE) {
+            // The state is recorded in every build: the thread dump (SIGUSR1) and the stall warnings read it, and a
+            // release build used to print "context: 0 reason: 0" for every thread - useless exactly when a stall has
+            // to be localised (2026-10-26: the parser stopped at an archive boundary and the dump said nothing).
+            // Only the timing accounting stays behind the instrumented build, because that is what costs.
+            curContext = context;
+            curReason = reason;
             if constexpr (contextCompiled) {
                 ++contextSwitches;
                 const time_ut contextTimeNow = ctx->clock->getTimeUt();
                 contextTime[static_cast<uint>(curContext)] += contextTimeNow - contextTimeLast;
                 ++contextCnt[static_cast<uint>(curContext)];
                 ++reasonCnt[static_cast<uint>(reason)];
-                curReason = reason;
-                curContext = context;
                 contextTimeLast = contextTimeNow;
             }
         }

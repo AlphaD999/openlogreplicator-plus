@@ -1500,9 +1500,11 @@ namespace OpenLogReplicator {
         std::unique_lock const lck(mtx);
         printMemoryUsageCurrent();
         for (Thread* thread: threads) {
+            // Names instead of numbers: the dump is read under pressure, and "wait/READER_FINISHED" says more than
+            // "4/57" (see Thread::contextName / reasonName).
             error(10014, "Dump: " + thread->getName() + " " + std::to_string(reinterpret_cast<uint64_t>(thread->pthread)) +
-                  " context: " + std::to_string(static_cast<uint>(thread->curContext)) +
-                  " reason: " + std::to_string(static_cast<uint>(thread->curReason)) +
+                  " context: " + Thread::contextName(thread->curContext) +
+                  " reason: " + Thread::reasonName(thread->curReason) +
                   " switches: " + std::to_string(thread->contextSwitches));
             pthread_kill(thread->pthread, SIGUSR1);
         }
