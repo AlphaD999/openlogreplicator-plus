@@ -199,6 +199,21 @@ namespace OpenLogReplicator {
             ISOSTRING = 2  // io.debezium.time.IsoTimestamp (ISO-8601 string)
         };
 
+        // How a DATE / TIMESTAMP value (which carries no time zone) becomes the epoch number that the Debezium
+        // schema declares for it. Oracle stores a wall clock; the epoch has to name an instant:
+        //   DB  = the wall clock is a value in the database's time zone => epoch = wall clock - database offset
+        //   UTC = upstream Debezium: the wall clock is *taken as* UTC => epoch = wall clock
+        // "utc" is what io.debezium.time.Timestamp documents ("does not include timezone information"), and it is
+        // only correct for a consumer that renders the epoch in UTC. A consumer that renders it in local time (Flink
+        // with table.local-time-zone, the Doris Kafka connector, ...) shows every value shifted by the offset:
+        // measured in production on 2026-10-21, TEST_TIME 2026-10-20 17:30:27 landed in the sink as 2026-10-21
+        // 01:30:27 for a database at +08:00. "db" also matches source.ts_ms / ts_us, which have always been real
+        // epoch values, and TIMESTAMP WITH (LOCAL) TIME ZONE, which has always been emitted with the offset.
+        enum class TIMESTAMP_ZONE : unsigned char {
+            DB  = 0, // Default
+            UTC = 1
+        };
+
         enum class BINARY_HANDLING_MODE : unsigned char {
             BYTES           = 0, // Default: BYTES schema (JsonConverter encodes it as base64)
             BASE64          = 1, // STRING schema holding the base64 text
@@ -253,6 +268,7 @@ namespace OpenLogReplicator {
         TIME_PRECISION_MODE timePrecisionMode{TIME_PRECISION_MODE::ADAPTIVE};
         BINARY_HANDLING_MODE binaryHandlingMode{BINARY_HANDLING_MODE::BYTES};
         INTERVAL_HANDLING_MODE intervalHandlingMode{INTERVAL_HANDLING_MODE::NUMERIC};
+        TIMESTAMP_ZONE timestampZone{TIMESTAMP_ZONE::DB};
 
         Format(DB_FORMAT newDbFormat, ATTRIBUTES_FORMAT newAttributesFormat, INTERVAL_DTS_FORMAT newIntervalDtsFormat,
                INTERVAL_YTM_FORMAT newIntervalYtmFormat, MESSAGE_FORMAT newMessageFormat, RID_FORMAT newRidFormat, REDO_THREAD_FORMAT newRedoThreadFormat,

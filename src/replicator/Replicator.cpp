@@ -251,6 +251,19 @@ namespace OpenLogReplicator {
             ctx->info(0, "timezone: " + Data::timezoneToString(-timezone) + ", db-timezone: " + Data::timezoneToString(metadata->dbTimezone) +
                       ", log-timezone: " + Data::timezoneToString(ctx->logTimezone) + ", host-timezone: " + Data::timezoneToString(ctx->hostTimezone));
 
+            // Which zone a DATE / TIMESTAMP (no zone information) is read in when it becomes the epoch number the
+            // Debezium schema declares: "db" subtracts the database offset (a real epoch), "utc" is the upstream
+            // Debezium convention (the wall clock taken as UTC), which leaves every such value shifted by the
+            // database offset for a consumer that renders the epoch in local time - measured in production on
+            // 2026-10-21: 2026-10-20 17:30:27 arrived in the sink as 2026-10-21 01:30:27. Printed here because this
+            // is the first line that knows the database offset, and because the mode decides what the values of
+            // those columns mean in every message after this point.
+            {
+                const bool utc = builder != nullptr && builder->getTimestampZone() == Format::TIMESTAMP_ZONE::UTC;
+                ctx->info(0, utc ? "timestamp-zone: utc (DATE/TIMESTAMP 按 UTC 解释)" :
+                          "timestamp-zone: db (DATE/TIMESTAMP 按数据库时区 " + Data::timezoneToString(metadata->dbTimezone) + " 解释)");
+            }
+
             do {
                 if (ctx->softShutdown)
                     break;
@@ -829,6 +842,47 @@ namespace OpenLogReplicator {
         return it->second;
     }
 
+    void Replicator::updateThreadWork() {
+        if (metadata->commitSorter == nullptr)
+            return;
+        // The low-water-mark over several redo threads only exists on the RAC archives path, and "0" keeps the
+        // strict global SCN order: without a positive timeout the sorter never releases a thread except when the
+        // instance behind it is gone (60038).
+        if (!metadata->rac || ctx->idleThreadReleaseUs == 0)
+            return;
+
+        // What is left to read for each thread, from the state this pass built. A parked archive is work and not a
+        // reason to release: its predecessor is missing, i.e. the thread is exactly the one that must not be left
+        // out (60027/60038 report that case and have their own release).
+        std::set<uint16_t> busy;
+        for (const Parser* parser: archiveRedoQueue)
+            busy.insert(parser->thread);
+        for (const Parser* parser: gapArchives)
+            busy.insert(parser->thread);
+
+        std::set<uint16_t> threads = busy;
+        for (const auto& [thread, sequence]: threadMaxSequence)
+            threads.insert(thread);
+
+        // A pass that told us nothing is not evidence about any thread: a failed query keeps threadMaxSequence
+        // frozen, and a rejected bind or a resetlogs mismatch returns no row at all - both look exactly like a
+        // source with nothing left to read. Such a pass may keep a thread in the water-mark, it may never release
+        // one.
+        const bool listed = archListError.empty() && archListRows > 0;
+
+        for (const uint16_t thread: threads) {
+            const Seq expected = metadata->threadSequence(thread);
+            const Seq highest = getThreadMaxSequence(thread);
+            // Released only on positive evidence - nothing of this thread is queued or parked, the list pass was a
+            // successful one and the sequence still to be read is beyond the highest one it reports. Everything
+            // unknown (a thread the list never reported, no position yet, a pass without rows) keeps the thread in
+            // the water-mark: the direction a wrong answer must never take is "released too early".
+            const bool hasWork = busy.find(thread) != busy.end() || !listed || highest == Seq::none() ||
+                                 expected == Seq::none() || expected == Seq::zero() || expected <= highest;
+            metadata->commitSorter->setThreadWork(thread, hasWork, expected, highest);
+        }
+    }
+
     std::string Replicator::archiveWaitState() const {
         std::ostringstream ss;
         if (threadMaxSequence.empty())
@@ -865,6 +919,11 @@ namespace OpenLogReplicator {
                 ctx->logTrace(Ctx::TRACE::REDO, "checking archived redo logs, seq: " + metadata->sequence.toString());
             updateResetlogs();
             archGetLog(this);
+            // The archive list is as fresh as it gets: tell the sorter which redo threads have nothing left to
+            // read (drained release, see CommitSorter::setThreadWork). Done here and at the end of the pass below,
+            // so that a thread whose last archive was just parsed is released without waiting for the next list
+            // refresh.
+            updateThreadWork();
 
             if (archiveRedoQueue.empty()) {
                 if (ctx->isFlagSet(Ctx::REDO_FLAGS::ARCH_ONLY)) {
@@ -1119,6 +1178,12 @@ namespace OpenLogReplicator {
 
                 metadata->setNextSequence(parser->thread);
                 delete parser;
+                // This thread has reached the end of its archive: if the list has nothing more for it, it stops
+                // holding the low-water-mark now and not when the pass ends. That is the difference between the
+                // other redo threads delivering while the big archive of a busy instance is parsed and them
+                // waiting for the whole pass - measured 2026-10-19 in production: the three quiet threads were
+                // done at 13:36:11, the busy one ran until 13:37:00 and nothing could be delivered in between.
+                updateThreadWork();
 
                 if (ctx->stopLogSwitches > 0) {
                     --ctx->stopLogSwitches;
@@ -1128,6 +1193,12 @@ namespace OpenLogReplicator {
                     }
                 }
             }
+
+            // The queue is empty now: a thread whose last archive was just finished has nothing left to read and
+            // must stop holding the low-water-mark here and not at the next list refresh (which is up to
+            // "arch-read-sleep-us" away - 10 s by default, and the stall this release exists for is measured in
+            // the same order of magnitude).
+            updateThreadWork();
 
             if (processedThisPass) {
                 // Something was parsed in this pass, so the parser is not waiting for an archive: the progress

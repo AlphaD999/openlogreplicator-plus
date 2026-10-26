@@ -125,6 +125,16 @@ namespace OpenLogReplicator {
         // consistency guard for the paths that can hand an archive out again (the batch/directory list, which the
         // rig does not exercise) - not as a measured optimisation.
         [[nodiscard]] bool archiveQueued(uint16_t thread, Seq sequence) const;
+        // Publishes, per redo thread, whether it still has an archived redo log to read (CommitSorter::setThreadWork).
+        // The answer is taken from the state the pass just built and nothing else: the archives waiting in
+        // archiveRedoQueue, the ones parked in gapArchives (their predecessor is missing - they are work, not a
+        // reason to release) and the highest sequence the archive list reported for the thread. A thread whose
+        // sequence still to be read is beyond that highest one has nothing left to read, so its parsed position
+        // can not move by waiting - it stops holding back the low-water-mark instead of being waited for. The
+        // release is only done on positive evidence (a pass that returned rows and no error); the safe direction
+        // - a thread that has work - is always taken, so a failing source can keep a thread in the water-mark but
+        // can never release one.
+        void updateThreadWork();
         // Index of the archive with the lowest SCN still to be parsed in archiveRedoQueue
         [[nodiscard]] size_t bestArchiveIndex() const;
         void updateOnlineLogs() const;

@@ -37,10 +37,25 @@ namespace OpenLogReplicator {
         event->commit = true;
         event->transaction = transaction;
         event->thread = transaction->thread;
+        // How much of the transaction pool this buffered commit keeps, in chunks: the amount the backpressure is
+        // measured in (allowanceLocked). Taken here, once, while the transaction is still untouched by a delivery;
+        // at least one chunk, because a transaction that is swapped out reports none (the swap file holds it) and
+        // would otherwise be invisible to the bound.
+        event->chunks = 1;
+        if (ctx != nullptr) {
+            Thread* const parserThread = ctx->thread();
+            if (parserThread != nullptr) {
+                const uint64_t transactionChunks = ctx->swappedMemorySize(parserThread, transaction->swapKey());
+                if (transactionChunks > 0)
+                    event->chunks = transactionChunks;
+            }
+        }
         std::unique_lock lck(sorterMtx);
         events[commitScn].push_back(event);
         ++pendingEvents;
         ++pendingByThread[event->thread];
+        chunksByThread[event->thread] += event->chunks;
+        pendingChunks += event->chunks;
         syncPendingEvents();
         notifyDeliveryLocked();
         // No wait here: the backpressure is applied at the boundary of a record (waitForBacklog, called from
@@ -56,7 +71,7 @@ namespace OpenLogReplicator {
         // Called at the *head* of a record, right after the parser published its water-mark there, and not per
         // commit inside a record. Two reasons, both measured in the reproduction rig on 2026-10-16 with slicing
         // on:
-        //  - the wait must be per redo thread (pendingLimitLocked): with a global bound a thread that runs ahead
+        //  - the wait must be per redo thread (allowanceLocked): with a global bound a thread that runs ahead
         //    holds back the parser of a thread that is behind, and that thread is exactly the one whose
         //    water-mark has to move for anything to become deliverable (measured: 8,193 events of thread 2 above
         //    thread 1's water-mark, the delivery reporting "deliverable now: 0" - a deadlock);
@@ -69,19 +84,29 @@ namespace OpenLogReplicator {
         std::unique_lock lck(sorterMtx);
         if (ctx == nullptr)
             return;
-        const uint64_t limit = pendingLimitLocked();
-        if (limit == 0 || pendingByThread[thread] <= limit)
-            return;
+        if (allowanceLocked(thread) == 0)
+            return; // the pool is not initialized (yet): nothing to bound against
 
         bool reported = false;
         // Emergency: a wait longer than BACKPRESSURE_EMERGENCY_US means this parser can not go on while the delivery
         // has nothing it may flush below the low-water-mark - the same circle the swapped-memory wait has (see
         // Ctx::parserInSwapWait): the parser is the only thread that publishes a position, and it is the blocked one.
-        // The flag makes the delivery thread take the lowest buffered event without waiting for the water-mark; it is
+        // The flag makes the delivery thread deliver the whole buffer without waiting for the water-mark; it is
         // cleared on every way out of this function, so the delivery is back to the ordinary water-mark afterwards.
         bool emergency = false;
         const uint64_t waitingSince = ctx->clock->getTimeUt();
-        while (pendingByThread[thread] > limit && !ctx->hardShutdown && !ctx->softShutdown) {
+        while (!ctx->hardShutdown && !ctx->softShutdown) {
+            // Both numbers are re-read on every round: the allowance is what is left of the pool once the other
+            // threads have their guaranteed share, so a delivery of another thread (or a thread that stopped
+            // parsing) changes it while this one waits.
+            const uint64_t allowance = allowanceLocked(thread);
+            if (allowance == 0)
+                break;
+            const auto usedIt = chunksByThread.find(thread);
+            const uint64_t used = usedIt == chunksByThread.end() ? 0 : usedIt->second;
+            if (used <= allowance)
+                break;
+
             backpressureCv.wait_for(lck, std::chrono::milliseconds(BACKPRESSURE_WAIT_MS));
             const uint64_t now = ctx->clock->getTimeUt();
             if (!emergency && now > waitingSince && now - waitingSince >= BACKPRESSURE_EMERGENCY_US) {
@@ -108,15 +133,18 @@ namespace OpenLogReplicator {
                 else
                     aboveWatermark += list.size();
             }
+            const uint64_t globalCap = ctx->getMemoryChunksMax() / 2;
             ctx->warning(60062, "the parser is waiting for the delivery for: " + std::to_string((now - waitingSince) / 1000000) +
-                         " s - the commit sorter holds " + std::to_string(pendingByThread[thread]) + " buffered commit(s) of this "
-                         "thread and " + std::to_string(pendingEvents) + " in total (per thread limit: " +
-                         std::to_string(limit) + ", deliverable now: " + std::to_string(deliverable) +
-                         ", above the low-water-mark: " + std::to_string(aboveWatermark) + ", transaction pool: " +
-                         std::to_string(ctx->getMemoryChunksMax()) + " chunk(s), thread watermarks: " +
-                         getThreadWatermarksText() + ")" +
+                         " s - the commit sorter holds " + std::to_string(used) + " chunk(s) of this thread against an "
+                         "allowance of " + std::to_string(allowance) + " (of the " + std::to_string(pendingChunks) +
+                         " chunk(s) / " + std::to_string(pendingEvents) + " event(s) buffered in total, global cap: " +
+                         std::to_string(globalCap) + " chunk(s) of " + std::to_string(ctx->getMemoryChunksMax()) +
+                         ", events of this thread: " + std::to_string(pendingByThread[thread]) +
+                         ", min share: " + std::to_string(minShareLocked(globalCap)) + ", deliverable now: " +
+                         std::to_string(deliverable) + ", above the low-water-mark: " + std::to_string(aboveWatermark) +
+                         ", thread watermarks: " + getThreadWatermarksText() + ")" +
                          (deliveryLimit == Scn::none() ?
-                          "; no thread holds the low-water-mark, so the delivery takes the lowest buffered event" : "") +
+                          "; no thread holds the low-water-mark, so the delivery takes what is buffered" : "") +
                          "; the parse of this thread is stopped on purpose: letting it go on "
                          "would fill the pool with commits that are waiting for the low-water-mark (\"memory-max-mb\" / "
                          "\"transaction-block-kb\")");
@@ -125,18 +153,47 @@ namespace OpenLogReplicator {
                          ctx->parserInBacklogWait.store(false, std::memory_order_relaxed);
                          }
 
-    uint64_t CommitSorter::pendingLimitLocked() const {
+    uint64_t CommitSorter::minShareLocked(uint64_t globalCap) const {
+        // One quarter of the even split of the cap: with four redo threads that is 1/16 of the cap each. It is the
+        // share a thread is guaranteed against a thread that would otherwise take the whole backlog - enough to
+        // parse an archive of a quiet instance without waiting for a delivery (a thread that can not enqueue can
+        // not publish a water-mark either, which would freeze the very delivery its allowance waits for).
+        const uint64_t threads = threadWatermark.empty() ? 1 : threadWatermark.size();
+        uint64_t share = globalCap / (4 * threads);
+        if (share < MIN_THREAD_CHUNKS)
+            share = MIN_THREAD_CHUNKS;
+        const uint64_t shareMax = globalCap / threads;
+        if (shareMax > 0 && share > shareMax)
+            share = shareMax;
+        return share;
+    }
+
+    uint64_t CommitSorter::allowanceLocked(uint16_t thread) const {
         if (ctx == nullptr)
             return 0;
         const uint64_t chunks = ctx->getMemoryChunksMax();
         if (chunks == 0)
             return 0;
         // Half of the pool for the buffered commits (the other half takes the open transactions, the builder
-        // buffers and the reader), divided by the number of redo threads the sorter has seen: every buffered
-        // commit owns at least one chunk and a transaction owning exactly one chunk can not be swapped out, so
-        // with this bound the backlog of all threads together can not exhaust the pool on its own.
+        // buffers and the reader). It is the boundary the constant this replaces was derived from and it stays:
+        // every buffered commit owns at least one chunk and a transaction owning exactly one chunk can not be
+        // swapped out, so the backlog of all threads together must not be able to exhaust the pool on its own.
+        const uint64_t globalCap = chunks / 2;
         const uint64_t threads = threadWatermark.empty() ? 1 : threadWatermark.size();
-        return chunks / 2 / threads;
+        const uint64_t minShare = minShareLocked(globalCap);
+        // What the *other* threads are guaranteed is held back from this one, so that the sum over all threads
+        // stays below the cap and every thread can always make progress - the pool is not first-come-first-served,
+        // but it is also never taken away from a thread that has data (that is what the constant this replaces did:
+        // it handed 1/(2N) to every thread and left the rest of the pool unused when a thread had nothing to parse).
+        uint64_t usedByOthers = 0;
+        for (const auto& [otherThread, used]: chunksByThread) {
+            if (otherThread != thread && used > 0)
+                usedByOthers += used;
+        }
+        const uint64_t reservedForOthers = (threads > 0 ? threads - 1 : 0) * minShare;
+        if (usedByOthers + reservedForOthers >= globalCap)
+            return minShare;
+        return globalCap - usedByOthers - reservedForOthers;
     }
 
     void CommitSorter::enqueueCheckpoint(const CheckpointEvent& checkpoint) {
@@ -234,13 +291,19 @@ namespace OpenLogReplicator {
         for (const auto& [idleThread, lastAdvance]: threadWatermarkTime) {
             if (idleThreads.find(idleThread) != idleThreads.end())
                 continue;
+            // Already released because the archive list says it has nothing left to read: the timer would only
+            // repeat the same statement with a different reason, and reading "did not advance for: 30 s" for a
+            // thread that was released on positive evidence sends the analysis in the wrong direction (measured in
+            // the rig on 2026-10-20: reason: no-work at 06:58:34, reason: timeout for the same thread at 06:59:04).
+            if (noWorkThreads.find(idleThread) != noWorkThreads.end())
+                continue;
             if (currentTime > lastAdvance && currentTime - lastAdvance > idleReleaseUs) {
                 idleThreads.insert(idleThread);
                 if (ctx != nullptr)
                     ctx->warning(60045, "redo thread: " + std::to_string(idleThread) + " did not advance for: " +
                                  std::to_string((currentTime - lastAdvance) / 1000000) + " s - it stops holding back the "
-                                 "low-water-mark (\"idle-thread-release-us\"); its transactions can now be delivered "
-                                 "after transactions with a higher SCN");
+                                 "low-water-mark (reason: timeout, \"idle-thread-release-us\"); its transactions can now "
+                                 "be delivered after transactions with a higher SCN");
             }
         }
     }
@@ -265,6 +328,56 @@ namespace OpenLogReplicator {
                           it->second.toString() + " < " + watermark.toString() + ") - it does not hold it back until it "
                           "has caught up");
         }
+        notifyDeliveryLocked();
+    }
+
+    void CommitSorter::setThreadWork(uint16_t thread, bool hasWork, Seq expectedSeq, Seq highestSeq) {
+        std::lock_guard const lck(sorterMtx);
+
+        if (!hasWork) {
+            // A thread that has never published a position does not take part in the minimum anyway: releasing it
+            // would only put a name into the set that nothing reads.
+            if (threadWatermark.find(thread) == threadWatermark.end())
+                return;
+            // Reported once per release and not once per archive list pass (the replicator publishes the same
+            // state every pass, several times a minute).
+            if (!noWorkThreads.insert(thread).second)
+                return;
+            if (ctx != nullptr)
+                ctx->warning(60045, "redo thread: " + std::to_string(thread) + " has no archived redo log left to read "
+                             "(expected seq: " + expectedSeq.toString() + ", highest known seq: " + highestSeq.toString() +
+                             ") - it stops holding back the low-water-mark (reason: no-work); its transactions can now be "
+                             "delivered after transactions with a higher SCN");
+        } else {
+            if (noWorkThreads.erase(thread) == 0)
+                return;
+            // The idle timer is the fallback for "the position did not move and nothing tells us why". A thread that
+            // just got work back has the answer: it was waiting for an archive. Counting from the last advance would
+            // fire the release on the very next tick, because that gap is one archive interval (4-5 minutes for a
+            // quiet instance) against a threshold of 180 s - measured in production on 2026-10-20: 33
+            // "reason: timeout" warnings in 56 minutes, i.e. one per archive of every quiet thread, each of them
+            // 8-10 s *before* that thread finished the archive it was already parsing. Restart the timer here and
+            // the fallback only speaks when a thread has work and does not advance for the whole threshold.
+            if (ctx != nullptr)
+                threadWatermarkTime[thread] = ctx->clock->getTimeUt();
+            // The same rule a thread released by the timeout (or by a closed instance) follows: one that is behind
+            // the water-mark takes part in the minimum again only once it has caught up. Without it the first
+            // archive read after the release - which starts exactly where the thread stopped, i.e. below the
+            // water-mark the other threads have already reached - would push the water-mark back and stop every
+            // other thread until that archive is parsed, which is the stall the release exists to avoid.
+            const auto it = threadWatermark.find(thread);
+            if (it != threadWatermark.end() && watermark != Scn::none() && it->second < watermark) {
+                unalignedThreads.insert(thread);
+                if (ctx != nullptr)
+                    ctx->info(0, "redo thread: " + std::to_string(thread) + " has work again and is behind the low-water-mark "
+                              "(scn: " + it->second.toString() + " < " + watermark.toString() + ") - it does not hold it back "
+                              "until it has caught up");
+            } else {
+                unalignedThreads.erase(thread);
+            }
+        }
+        // Both directions change what may be delivered: the delivery has to re-read the limit now and not at its
+        // next timeout.
         notifyDeliveryLocked();
     }
 
@@ -316,7 +429,13 @@ namespace OpenLogReplicator {
             const auto it = pendingByThread.find(thread);
             ctx->statPendingByThread[thread].store(it == pendingByThread.end() ? 0 : it->second,
                                                    std::memory_order_relaxed);
+            // Same mirror for the chunk side: the number the backpressure is really about (warning 60062 and
+            // Ctx::layersLine read it without taking the sorter lock).
+            const auto itChunks = chunksByThread.find(thread);
+            ctx->statChunksByThread[thread].store(itChunks == chunksByThread.end() ? 0 : itChunks->second,
+                                                  std::memory_order_relaxed);
         }
+        ctx->statSorterChunks.store(pendingChunks, std::memory_order_relaxed);
     }
 
     uint64_t CommitSorter::getPendingEvents() const {
@@ -345,12 +464,15 @@ namespace OpenLogReplicator {
 
     Scn CommitSorter::lowWaterMarkLocked() const {
         // Minimum parsed SCN over the threads that take part in the low-water-mark: a closed thread's position is
-        // final and holds nothing back, an idle-released one is explicitly released ("its transactions can now be
-        // delivered after transactions with a higher SCN", see setThreadWatermark) and an unaligned one came back
-        // from a release while still behind, so it must not hold the others back until it has caught up.
+        // final and holds nothing back, a thread with no archived redo log left to read is in the same position
+        // (it can not advance, see setThreadWork), an idle-released one is explicitly released ("its transactions
+        // can now be delivered after transactions with a higher SCN", see setThreadWatermark) and an unaligned one
+        // came back from a release while still behind, so it must not hold the others back until it has caught up.
         Scn lowWatermark = Scn::none();
         for (const auto& [thread, parsedScn]: threadWatermark) {
             if (closedThreads.find(thread) != closedThreads.end())
+                continue;
+            if (noWorkThreads.find(thread) != noWorkThreads.end())
                 continue;
             if (idleThreads.find(thread) != idleThreads.end())
                 continue;
@@ -373,10 +495,11 @@ namespace OpenLogReplicator {
             return watermark;
         }
 
-        // No redo thread takes part in the low-water-mark: every one of them is closed, idle-released or unaligned
-        // (or none has published a position yet, which is the startup case). The release is explicit about what it
-        // means - a released thread no longer holds the delivery back - so no thread holding the water-mark means no
-        // thread holds anything back: deliver what is buffered, the way flushAll() does at shutdown.
+        // No redo thread takes part in the low-water-mark: every one of them is closed, has no work left, is
+        // idle-released or unaligned (or none has published a position yet, which is the startup case). The release
+        // is explicit about what it means - a released thread no longer holds the delivery back - so no thread
+        // holding the water-mark means no thread holds anything back: deliver what is buffered, the way flushAll()
+        // does at shutdown.
         //
         // Returning instead is what stalled the field for 890 s (measured 2026-10-16, production log): the events
         // stayed buffered, the *old* water-mark kept reporting them as deliverable (warning 60062: "deliverable now:
@@ -387,7 +510,8 @@ namespace OpenLogReplicator {
         if (unlikely(ctx->isTraceSet(Ctx::TRACE::CHECKPOINT)))
             ctx->logTrace(Ctx::TRACE::CHECKPOINT, "delivery limit: no thread holds the low-water-mark (threads: " +
                           std::to_string(threadWatermark.size()) + ", closed: " + std::to_string(closedThreads.size()) +
-                          ", idle: " + std::to_string(idleThreads.size()) + ", unaligned: " +
+                          ", no work: " + std::to_string(noWorkThreads.size()) + ", idle: " +
+                          std::to_string(idleThreads.size()) + ", unaligned: " +
                           std::to_string(unalignedThreads.size()) + ") - watermark: " + watermark.toString() +
                           ", buffered events: " + std::to_string(pendingEvents) + " - flushing them anyway");
         // Nothing to wait for: Scn::none() makes flushUpTo() take everything buffered.
@@ -408,27 +532,32 @@ namespace OpenLogReplicator {
         refreshIdle(currentTime, idleReleaseUs);
         flushReady(executor, deliveryThread);
         if (flushLowest)
-            // The defect C emergency: the lowest buffered event, delivered even though the water-mark has not
-            // reached it. The parser can not be delivering right now (it is the one blocked in the wait), so
-            // nothing can slip in between the flush above and this one. It is load bearing, not a formality: it
-            // was measured with the duplicate-Xid hook that it still has to deliver the blocking commit even
-            // with the water-mark published at every commit - the minimum over the redo threads is another
-            // thread's position there.
+            // The defect C emergency: everything buffered is delivered even though the water-mark has not reached
+            // it. The parser can not be delivering right now (it is the one blocked in the wait), so nothing can
+            // slip in between the flush above and this one. It is load bearing, not a formality: it was measured
+            // with the duplicate-Xid hook that it still has to deliver the blocking commit even with the
+            // water-mark published at every commit - the minimum over the redo threads is another thread's
+            // position there.
             flushLowestPending(executor, deliveryThread);
     }
 
     void CommitSorter::flushLowestPending(Executor* executor, Thread* deliveryThread) {
         const std::unique_lock<std::mutex> deliveryLck(ctx->deliveryMtx);
         const DeliveryScope delivery(ctx, deliveryThread);
-        Scn lowest;
         {
             std::lock_guard const lck(sorterMtx);
             if (events.empty())
                 return;
-            lowest = events.begin()->first;
         }
-        // flushUpTo() is inclusive, so this takes exactly the lowest buffered SCN group
-        flushUpTo(executor, lowest);
+        // Everything that is buffered, not one SCN group per tick. The callers arm this only while a parser is
+        // blocked (in the swap wait or on the backpressure) and the water-mark can not be waited for, i.e. the
+        // cross thread order is already given up - and the delivery thread only goes through this path once per
+        // wait/notify, 100 ms apart at best, so "one SCN group" delivered about 10 groups per second and turned
+        // the escape into the stalling mechanism (measured 2026-10-19: the parser blocked for 29 s while 30,139
+        // commits sat in the sorter, the delivery idle except for the 5 s emergency rounds). The order of the
+        // buffered events themselves is unchanged - they are still delivered by ascending SCN, exactly what
+        // flushAll() does at shutdown.
+        flushUpTo(executor, Scn::none());
     }
 
     void CommitSorter::flushUpTo(Executor* executor, Scn limit) {
@@ -453,6 +582,15 @@ namespace OpenLogReplicator {
                 const auto it2 = pendingByThread.find(event->thread);
                 if (it2 != pendingByThread.end() && it2->second > 0)
                     --it2->second;
+                // The memory of the delivered transaction is handed back to the allowance of its thread here and
+                // not in the executor: this is the point the parser waits on, so the chunk counters and the events
+                // have to move together (both under sorterMtx).
+                const auto it3 = chunksByThread.find(event->thread);
+                if (it3 != chunksByThread.end() && it3->second > 0) {
+                    const uint64_t freed = it3->second < event->chunks ? it3->second : event->chunks;
+                    it3->second -= freed;
+                    pendingChunks = pendingChunks >= freed ? pendingChunks - freed : 0;
+                }
             }
             syncPendingEvents();
             // Backpressure: a parser of one of the redo threads may be waiting in enqueueCommit() for exactly
@@ -479,6 +617,8 @@ namespace OpenLogReplicator {
             ret += std::to_string(thread) + ": " + parsedScn.toString();
             if (closedThreads.find(thread) != closedThreads.end())
                 ret += " (closed)";
+            else if (noWorkThreads.find(thread) != noWorkThreads.end())
+                ret += " (no work)";
             else if (idleThreads.find(thread) != idleThreads.end())
                 ret += " (released)";
             else if (unalignedThreads.find(thread) != unalignedThreads.end())

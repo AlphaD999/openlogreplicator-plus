@@ -18,9 +18,11 @@ License along with this program; see the file LICENSE;
 If not, see <http://www.gnu.org/licenses/>. */
 
 #include <algorithm>
+#include <climits>
 #include <csignal>
 #include <pthread.h>
 #include <regex>
+#include <sys/stat.h>
 #include <sys/utsname.h>
 #include <thread>
 #include <unistd.h>
@@ -125,6 +127,26 @@ namespace {
                 ", release: " + name.release + ", build: " +
                 OpenLogReplicator_CMAKE_BUILD_TYPE + ", compiled: " + OpenLogReplicator_CMAKE_BUILD_TIMESTAMP + ", modules:"
                 HAS_KAFKA HAS_OCI HAS_PROMETHEUS HAS_PROTOBUF HAS_ZEROMQ HAS_STATIC HAS_THREAD_INFO);
+
+        // Which file is actually running. The field incident of 2026-10-20 was a replaced binary that the service
+        // had not picked up: the log said "compiled: 2026-10-19 23:43" while the delivered package said
+        // "compiled: 2026-10-20 07:12", and nothing in the run named the file behind the symlink
+        // /opt/olr/olr-zjsfrpt vs the real /opt/olr/OpenLogReplicator. One line with the resolved path and the size
+        // is enough to compare against bin/SHA256SUMS; init/olr-*-deploy-check.sh does the sha256 itself.
+        {
+            char exePath[PATH_MAX];
+            struct stat exeStat{};
+            const ssize_t exeLength = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+            if (exeLength > 0) {
+                exePath[exeLength] = '\0';
+                std::string sizeText("size unknown");
+                if (stat(exePath, &exeStat) == 0)
+                    sizeText = std::to_string(static_cast<uint64_t>(exeStat.st_size)) + " bytes";
+                mainCtx->welcome("binary: " + std::string(exePath) + " (" + sizeText + ", compiled " +
+                                 OpenLogReplicator_CMAKE_BUILD_TIMESTAMP +
+                                 ") - the deployment check verifies this file against /opt/olr/SHA256SUMS");
+            }
+        }
 
         const char* fileName = "scripts/OpenLogReplicator.json";
         try {

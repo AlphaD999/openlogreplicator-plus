@@ -1304,6 +1304,13 @@ namespace OpenLogReplicator {
 
         [[nodiscard]] uint64_t builderSize() const;
         [[nodiscard]] uint64_t getMaxMessageMb() const;
+        // How this builder reads a DATE / TIMESTAMP that carries no zone (Format::timestampZone): public because the
+        // replicator prints it once at startup, next to the database offset it applies - the mode decides what the
+        // value of every such column means in the messages, and it is a default (the configuration usually does not
+        // name it), so the log is the only place where the operator can read it back.
+        [[nodiscard]] Format::TIMESTAMP_ZONE getTimestampZone() const {
+            return format.timestampZone;
+        }
         void setMaxMessageMb(uint64_t maxMessageMb);
         void processBegin(Xid xid, uint16_t newThread, Seq newBeginSequence, Scn newBeginScn, Time newBeginTimestamp, Seq newCommitSequence, Scn newCommitScn,
                           Time newCommitTimestamp, const AttributeMap* newAttributes);

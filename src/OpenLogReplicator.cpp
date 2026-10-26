@@ -510,6 +510,7 @@ namespace OpenLogReplicator {
                     "flags",
                     "format",
                     "idle-thread-release-us",
+                    "min-trans-rewind-max-archives",
                     "memory",
                     "name",
                     "reader",
@@ -763,6 +764,7 @@ namespace OpenLogReplicator {
                     "timestamp-metadata",
                     "timestamp-type",
                     "timestamp-tz",
+                    "timestamp-zone",
                     "type",
                     "unknown",
                     "unknown-type",
@@ -791,6 +793,7 @@ namespace OpenLogReplicator {
             // Debezium connector compatible behaviour switches (used with the "schema-block" option)
             Format::DECIMAL_HANDLING_MODE decimalHandlingMode = Format::DECIMAL_HANDLING_MODE::PRECISE;
             Format::TIME_PRECISION_MODE timePrecisionMode = Format::TIME_PRECISION_MODE::ADAPTIVE;
+            Format::TIMESTAMP_ZONE timestampZone = Format::TIMESTAMP_ZONE::DB;
             Format::BINARY_HANDLING_MODE binaryHandlingMode = Format::BINARY_HANDLING_MODE::BYTES;
             Format::INTERVAL_HANDLING_MODE intervalHandlingMode = Format::INTERVAL_HANDLING_MODE::NUMERIC;
             Format::UNKNOWN_FORMAT unknownFormat = Format::UNKNOWN_FORMAT::QUESTION_MARK;
@@ -914,6 +917,17 @@ namespace OpenLogReplicator {
                 else
                     throw ConfigurationException(30001, R"(bad JSON, invalid "time-precision-mode" value: ")" + value +
                             R"(", expected: one of {"adaptive", "connect", "isostring"})");
+            }
+
+            if (formatJson.HasMember("timestamp-zone")) {
+                const std::string value = Ctx::getJsonFieldS(configFileName, Ctx::JSON_PARAMETER_LENGTH, formatJson, "timestamp-zone");
+                if (value == "db")
+                    timestampZone = Format::TIMESTAMP_ZONE::DB;
+                else if (value == "utc")
+                    timestampZone = Format::TIMESTAMP_ZONE::UTC;
+                else
+                    throw ConfigurationException(30001, R"(bad JSON, invalid "timestamp-zone" value: ")" + value +
+                            R"(", expected: one of {"db", "utc"})");
             }
 
             if (formatJson.HasMember("binary-handling-mode")) {
@@ -1078,6 +1092,7 @@ namespace OpenLogReplicator {
                 schemaFormat, columnFormat, unknownType, userType);
             format.decimalHandlingMode = decimalHandlingMode;
             format.timePrecisionMode = timePrecisionMode;
+            format.timestampZone = timestampZone;
             format.binaryHandlingMode = binaryHandlingMode;
             format.intervalHandlingMode = intervalHandlingMode;
             if (formatType == "json" || formatType == "debezium" || formatType == "debezium-json") {
@@ -1135,18 +1150,45 @@ namespace OpenLogReplicator {
                                                  std::to_string(ctx->slicePendingCommits) + ", expected: one of: {0 .. 10000000}");
             }
 
-            // An idle redo thread (its instance is not archiving anything) would hold back the low-water-mark
-            // of the commit sorter forever, so every transaction the other threads commit stays in memory.
-            // After this timeout such a thread is left out of the low-water-mark - it bounds the memory, but
-            // the global SCN order is no longer guaranteed for the transactions of that thread (0 = off).
+            // How a redo thread that can not advance is left out of the low-water-mark of the commit sorter.
+            // The decision itself is taken from the archive list ("no archived redo log left to read" - see
+            // Replicator::updateThreadWork): a thread with nothing to read can not move its position by waiting,
+            // so it is released immediately and no timer has to be tuned against the archive rhythm of the
+            // instances. This value is the fallback behind it, for a source that does not report what is left
+            // (query failures, a list that keeps returning nothing, an archive that can not be opened).
+            // 0 = strict: no release at all except for an instance that is gone (60038).
+            // Whatever the reason, the global SCN order is no longer guaranteed for the transactions of a
+            // released thread (warning 60045 says which thread and why).
             if (sourceJson.HasMember("idle-thread-release-us"))
                 ctx->idleThreadReleaseUs = Ctx::getJsonFieldU64(configFileName, sourceJson, "idle-thread-release-us");
+
+            if (ctx->idleThreadReleaseUs == 0)
+                ctx->info(0, "commit sorter: strict global SCN order - a redo thread is not released from the "
+                          "low-water-mark (\"idle-thread-release-us\" = 0)");
+            else
+                ctx->info(0, "commit sorter: a redo thread with no archived redo log left to read is released from the "
+                          "low-water-mark as soon as the archive list says so (drained); \"idle-thread-release-us\" = " +
+                          std::to_string(ctx->idleThreadReleaseUs) + " us is only the fallback for a source that does not "
+                          "report what is left");
 
             // A redo thread that stopped archiving (its instance is gone) must not hold back the low-water-mark
             // forever when one of its archives is missing. The state is taken from the archived redo log list
             // itself - the highest sequence of the thread that did not move for this long (0 = disabled).
             if (sourceJson.HasMember("thread-inactive-us"))
                 ctx->threadInactiveUs = Ctx::getJsonFieldU64(configFileName, sourceJson, "thread-inactive-us");
+
+            // Upper bound for the checkpoint rewind to the oldest unfinished transaction of a redo thread. Re-reading
+            // that window is what makes a transaction that was open at shutdown deliver all of its rows; the price is
+            // that everything already written from the same window is written again, and the window is as long as the
+            // transaction was open (a transaction open for two hours on a thread that archives 2.3 GB every two
+            // minutes is ~140 GB of redo and two hours of duplicates). 0 = no limit.
+            if (sourceJson.HasMember("min-trans-rewind-max-archives"))
+                ctx->minTransRewindMaxArchives = Ctx::getJsonFieldU64(configFileName, sourceJson, "min-trans-rewind-max-archives");
+
+            if (ctx->minTransRewindMaxArchives > 0)
+                ctx->info(0, "checkpoint: the rewind to the oldest unfinished transaction of a redo thread is limited to " +
+                          std::to_string(ctx->minTransRewindMaxArchives) + " archive(s) (\"min-trans-rewind-max-archives\"); a "
+                          "longer span is not replayed (warning 60063) to keep the duplicate burst bounded");
 
             if (sourceJson.HasMember("redo-verify-delay-us"))
                 ctx->redoVerifyDelayUs = Ctx::getJsonFieldU64(configFileName, sourceJson, "redo-verify-delay-us");

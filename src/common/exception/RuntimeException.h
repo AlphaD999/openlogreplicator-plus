@@ -36,10 +36,23 @@ namespace OpenLogReplicator {
 
         explicit RuntimeException(int newCode, std::string newMsg, int newSupCode = 0);
 
+        // The message std::terminate prints when an exception leaves a thread that has no handler:
+        //   terminate called after throwing an instance of 'OpenLogReplicator::RuntimeException'
+        //     what():  50072: swap file: ... - write returned: No space left on device
+        // Without this override the line reads "what():  std::exception" - the base class text - and a fatal abort
+        // leaves no clue at all (production 2026-10-22 05:48: the delivery thread died and neither the code nor the
+        // message was anywhere in the log). Kept in a member so the returned pointer stays valid for the lifetime of
+        // the exception object, as noexcept what() requires.
+        [[nodiscard]] const char* what() const noexcept override;
+
         RuntimeException(const RuntimeException&) = delete;
         RuntimeException& operator=(const RuntimeException&) = delete;
 
         friend std::ostream& operator<<(std::ostream& os, const RuntimeException& exception);
+
+    private:
+        // "<code>: <msg>", built once at construction (see what()).
+        std::string whatMsg;
     };
 }
 

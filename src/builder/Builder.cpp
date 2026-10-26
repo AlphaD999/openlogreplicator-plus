@@ -251,7 +251,14 @@ namespace OpenLogReplicator {
                             fraction > 999999999) {
                         columnUnknown(column->name, data, size);
                     } else {
-                        time_t timestamp = Data::valuesToEpoch(year, month, day, hour, minute, second, 0);
+                        // A DATE / TIMESTAMP holds a wall clock without a zone; the epoch must name an instant.
+                        // "utc" (upstream Debezium: the wall clock is taken as UTC) leaves the value shifted for
+                        // every consumer that renders the epoch in local time - measured in production on
+                        // 2026-10-21: TEST_TIME 2026-10-20 17:30:27 arrived in the sink as 2026-10-21 01:30:27 for
+                        // a database at +08:00. "db" (the default) subtracts the database offset, which is what
+                        // Oracle TIMESTAMP WITH (LOCAL) TIME ZONE above and source.ts_ms/ts_us have always done.
+                        time_t timestamp = Data::valuesToEpoch(year, month, day, hour, minute, second,
+                                format.timestampZone == Format::TIMESTAMP_ZONE::UTC ? 0 : metadata->dbTimezone);
                         if (year < 0 && fraction > 0) {
                             fraction = 1000000000 - fraction;
                             --timestamp;

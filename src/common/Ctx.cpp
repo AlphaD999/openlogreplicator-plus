@@ -83,7 +83,15 @@ namespace OpenLogReplicator {
     void Ctx::watchdogNote(uint16_t thread, uint64_t fileOffset, uint64_t pendingCommits) {
         if (watchdogUs == 0)
             return;
-        watchdogProgressUt.store(clock->getTimeUt(), std::memory_order_relaxed);
+        // Progress is a *position*, not a call: this is entered once per redo block in the parse loop, so a parser
+        // that walks in circles over the same blocks calls it just as often as a healthy one. Refreshing the
+        // timestamp on every call is what hid the production stall of 2026-10-20 (thread 2, archive 959664, 26
+        // minutes without a single FINISHED, no warning 60055 at all, and the whole delivery frozen behind it).
+        const uint16_t lastThread = watchdogThread.load(std::memory_order_relaxed);
+        const uint64_t lastOffset = watchdogOffset.load(std::memory_order_relaxed);
+        const uint64_t lastPending = watchdogPending.load(std::memory_order_relaxed);
+        if (thread != lastThread || fileOffset != lastOffset || pendingCommits != lastPending)
+            watchdogProgressUt.store(clock->getTimeUt(), std::memory_order_relaxed);
         watchdogThread.store(thread, std::memory_order_relaxed);
         watchdogOffset.store(fileOffset, std::memory_order_relaxed);
         watchdogPending.store(pendingCommits, std::memory_order_relaxed);
@@ -177,6 +185,17 @@ namespace OpenLogReplicator {
         bool first = true;
         for (uint16_t thread = 0; thread < 16; ++thread) {
             const uint64_t perThread = statPendingByThread[thread].load(std::memory_order_relaxed);
+            if (perThread == 0)
+                continue;
+            ss << (first ? "" : " ") << thread << ":" << perThread;
+            first = false;
+        }
+        if (first)
+            ss << "none";
+        ss << "] sorter_chunks=" << statSorterChunks.load(std::memory_order_relaxed) << " chunks_by_thread=[";
+        first = true;
+        for (uint16_t thread = 0; thread < 16; ++thread) {
+            const uint64_t perThread = statChunksByThread[thread].load(std::memory_order_relaxed);
             if (perThread == 0)
                 continue;
             ss << (first ? "" : " ") << thread << ":" << perThread;
@@ -905,6 +924,8 @@ namespace OpenLogReplicator {
             }
             const SwapChunk* sc = it->second;
 
+            uint64_t waitSince = 0;
+            uint64_t lastReport = 0;
             while (!hardShutdown) {
                 if (index < sc->swappedMin || index > sc->swappedMax) {
                     t->contextSet(Thread::CONTEXT::CPU);
@@ -912,21 +933,29 @@ namespace OpenLogReplicator {
                 }
 
                 // The chunk is on disk and the memory manager has to read it back (one chunk per iteration of its
-                // loop, stat + open + pread + close per chunk - see MemoryManager::unswap). That wait has no trace
-                // line, no counter and no warning of its own, which is why the production stall of 2026-10-15
-                // looked like a lock problem: counted here and named by warning 60055 (totals) and 60061 (a single
-                // wait that is long enough to be the reason for a stall).
-                const uint64_t swapWaitStart = clock->getTimeUt();
+                // loop, stat + open + pread + close per chunk - see MemoryManager::unswap). The report has to happen
+                // *while* waiting: this used to warn only after the wait returned, so a memory manager that never
+                // brings the chunk back (swap volume full, asmfs stat hanging, the entry taken over by a re-parse)
+                // left the caller inside wait() with no line at all - the same silent shape the parser stall of
+                // 2026-10-20 had (26 minutes, no warning of any kind). The timeout below is what makes the report
+                // reachable; notify_all still wakes the wait immediately when the chunk does come back.
+                const uint64_t now = clock->getTimeUt();
+                if (waitSince == 0)
+                    waitSince = now;
+                if (now >= waitSince + SWAP_WAIT_REPORT_US && (lastReport == 0 || now >= lastReport + SWAP_WAIT_REPORT_US)) {
+                    warning(60061, "still waiting after " + std::to_string((now - waitSince) / 1000000) +
+                            " s for the swapped out chunk <" + std::to_string(index) + "> of transaction: " +
+                            swapKey.toString() + " (swap entries: " + std::to_string(swapChunks.size()) +
+                            ", swap entries waiting for their file to be removed: " + std::to_string(commitedXids.size()) +
+                            ", waits so far: " + std::to_string(statSwapGetWaits.load(std::memory_order_relaxed)) +
+                            ") - the memory manager brings one chunk back per iteration of its loop (\"swap-path\"), so a "
+                            "full or slow swap volume shows up as a stalled delivery (warning 60055 / 60062 name the caller)");
+                    lastReport = now;
+                }
                 chunksMemoryManager.notify_all();
-                chunksTransaction.wait(lck);
-                const uint64_t swapWaited = clock->getTimeUt() - swapWaitStart;
+                chunksTransaction.wait_for(lck, std::chrono::microseconds(SWAP_WAIT_REPORT_US));
                 statSwapGetWaits.fetch_add(1, std::memory_order_relaxed);
-                statSwapGetWaitUs.fetch_add(swapWaited, std::memory_order_relaxed);
-                if (swapWaited >= SWAP_WAIT_REPORT_US)
-                    warning(60061, "reading back the swapped out chunk <" + std::to_string(index) + "> of transaction: " +
-                            swapKey.toString() + " took " + std::to_string(swapWaited / 1000000) + " s - the delivery "
-                            "waits here for the memory manager, which brings one chunk back per iteration of its loop "
-                            "(\"swap-path\"), so a slow or full swap volume shows up as a stalled delivery");
+                statSwapGetWaitUs.fetch_add(clock->getTimeUt() - now, std::memory_order_relaxed);
             }
         }
 

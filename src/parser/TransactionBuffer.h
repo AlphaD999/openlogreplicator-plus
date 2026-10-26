@@ -38,6 +38,9 @@ If not, see <http://www.gnu.org/licenses/>. */
 namespace OpenLogReplicator {
     class Transaction;
     class XmlCtx;
+    // Per-thread position (Metadata.h). Only forward declared here: this header is included by Metadata.h's users and
+    // must not pull the metadata layer in; the definition is used in TransactionBuffer.cpp.
+    struct ThreadPos;
 
     struct TransactionChunk {
         // The chunk is a whole pool block (Ctx::memoryChunkSize - see memory."transaction-block-kb"), the
@@ -152,7 +155,12 @@ namespace OpenLogReplicator {
         void addTransactionChunk(Transaction* transaction, RedoLogRecord* redoLogRecord1, const RedoLogRecord* redoLogRecord2);
         void rollbackTransactionChunk(Transaction* transaction);
         void mergeBlocks(uint8_t* mergeBuffer, RedoLogRecord* redoLogRecord1, const RedoLogRecord* redoLogRecord2);
-        void checkpoint(Seq& minSequence, FileOffset& minFileOffset, Xid& minXid);
+        // Oldest unfinished transaction: its position *and* its redo thread (a sequence number is only meaningful
+        // inside the sequence space of its own thread - see Metadata::minThread), plus the earliest unfinished
+        // transaction of *every* thread (minTrans, see Metadata::minTrans): a restart has to re-read all of them,
+        // not only the oldest one, or the other transactions commit with only their post-restart rows.
+        void checkpoint(Seq& minSequence, FileOffset& minFileOffset, Xid& minXid, uint16_t& minThread,
+                        std::map<uint16_t, ThreadPos>& minTrans);
         void addOrphanedLob(RedoLogRecord* redoLogRecord1);
         static uint8_t* allocateLob(const RedoLogRecord* redoLogRecord1);
     };

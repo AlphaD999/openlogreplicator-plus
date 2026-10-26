@@ -430,4 +430,60 @@ T0 ─> T1 ─> T2 ─> T3 ─┐
 
 ---
 
+## 11. 2026-10-20 增补:低水位线的"可推进性"释放与动态额度(ADR-12/ADR-13)
+
+### 11.1 现场证据(生产 2026-10-19,`idle-thread-release-us: 30000000`)
+
+- 8 分钟日志只有 49 条 WARN/ERROR,`60043/60050/10017` 全 0;`Memory HWM 1141MB`、`transaction HWM 1743MB`(池 12288 MB / 块 64 KB = 196608 chunk)⇒ 内存与换出不是本次原因。
+- 13:36:11 三个低产线程(t4/t1/t3)的归档读完,归档清单里已无它们的下一份(`60056`: `expected seq 1145788 / highest known 1145787`);它们的水位冻结在起始 SCN 附近,把高产线程(t2)的 **30139 个已提交事务**全部按在水位之上。
+- 13:36:14 起 `60055`: `pending commits: 30139` 且 **`delivery: idle`**;13:36:18/23/29/34/39 五次 `the parser is blocked on the backpressure limit and nothing is flushable below the low-water-mark`(正好是 `BACKPRESSURE_EMERGENCY_US` = 5 s 一轮)。
+- 13:36:41 三条 `60045 ... did not advance for: 30 s` 释放后才解冻;t2 的 2.47 GB 归档最后 19 秒读完(≈130 MB/s)。
+- 干净吞吐实测 2.48 GB/22 s ≈ 113 MB/s ≈ 6.8 GB/分钟,是现场峰值产量(1.27 GB/分钟)的 5 倍多 ⇒ **解析能力不是瓶颈**。
+- 全程 `delivery limit: no thread holds the low-water-mark ... flushing them anyway` 出现 **1,228,654** 次:除启动那 30 秒外,系统一直靠"没有线程参与 min"的全速分支运行。
+
+结论:卡顿的充分条件不是"线程空闲",而是**"该线程已无归档可读,而释放要等一个超时"**。
+
+### 11.2 ADR-12:释放判据从"时间"改为"可推进性"(drained release)
+
+- 判据(数据事实,不是计时):某 redo 线程**没有待解析的归档** ⇒ 它的已解析位置不可能再前进 ⇒ 与 `closedThreads` 同等地不参与低水位线。
+  - 判定源:`archiveRedoQueue`(含切片续读)、`gapArchives`(缺前序而停靠——**算有工作**,不是释放理由)、正在解析的 parser(其 `threadSequence` 未前移,天然算有工作)、归档清单里该线程的 `max(sequence)`。
+  - 实现:`Replicator::updateThreadWork()`(每轮 `archGetLog()` 成功后、每个归档 FINISHED 后、每轮队列排空后) → `CommitSorter::setThreadWork()` → `lowWaterMarkLocked()` 跳过 `noWorkThreads`。
+- 只对"有证据"的方向释放:`listed = archListError.empty() && archListRows > 0` 且 `expected > highest`;其余一律保持"有工作"。**查询失败、绑定被拒、resetlogs 不匹配(rows=0)都不会释放任何线程**。
+- 回来的方向沿用现成规则:低于水位则进 `unalignedThreads`(不把水位按回去),追上后自动重新参与 min。
+- `idle-thread-release-us` 语义:`0` = strict(只有 `threadClosed`/60038 释放);`>0` = drained + 该值仅作**异常兜底超时**(60045 `reason: timeout`)。**不新增配置键**,因此 `OpenLogReplicator.cpp` 与 `Checkpoint.cpp:138` 的白名单都无需改动,也没有 30001 风险。
+- 诊断:`60045` 增加 `reason: no-work` / `reason: timeout`;`getThreadWatermarksText()` 增加 `(no work)` 标记,`60062`/`60047` 直接可见。
+
+### 11.3 ADR-13:额度从"1/(2N)"改为"池子里剩下的"(动态额度)
+
+- 现状问题:额度是常量 `chunks/2/threads`(4 线程 ⇒ 高产线程只有 1/8 池子 = 24576 chunk),且**量纲错位**——占用按事件数(`pendingByThread`)统计,额度按 chunk 计,`transaction-block-kb` 一变含义就漂。
+- 新规则(`CommitSorter::allowanceLocked`):
+
+  ```
+  globalCap        = pool_chunks / 2                // 另一半留给 open 事务 / builder / reader,10017 的边界不动
+  minShare         = clamp(globalCap / (4*N), MIN_THREAD_CHUNKS(64), globalCap / N)
+  allowance(t)     = globalCap - (N-1)*minShare - Σ_{j≠t} used(j)
+  ```
+
+  即"别人正用着的 + 别人的保底"之外的部分都归当前线程;没人用的额度自然让给有数据的线程,而 **Σused ≤ globalCap − (N−1)·minShare** 由构造保证(每个线程的占用都受上式约束)。
+- 记账单位改成 **chunk**:`Event::chunks` 在 `enqueueCommit()` 时快照(`Ctx::swappedMemorySize`,换出的按 1 计),`flushUpTo()` 交出事件时扣减;`syncPendingEvents()` 把 per-thread chunk 镜像进 `Ctx::statChunksByThread` / `statSorterChunks` 供 `60062`、`layersLine()` 读取。
+- 保持的边界:`globalCap` 仍是池子的一半;`waitForBacklog()` 仍在**记录头**判定,单条记录的超发上限仍是一条记录 ⇒ 10017 的内存边界没有放宽。
+- `flushLowestPending()` 不再"一次只放一个 SCN 组"(那是 ~10 组/秒的滴漏),改为把缓冲区一次投空(与 `flushAll()` 同语义、同顺序);它只在 parser 已被卡住(换出等待/背压)时被 arm,此时跨线程顺序已放弃。
+- 为什么不用"未解析字节"做需求加权:需要新 SQL 列(`blocks*block_size`)或对 asmfs 上排队文件逐个 `stat`(现场单次 stat 可到秒级);而 Flink 的 `NetworkBufferPool.redistributeBuffers()` 本质也按容量比例分配,真实需求只通过 credit 的"要多少给多少"体现。"已占用"是需求的滞后但真实、零成本的代理量。
+
+### 11.4 合理性论证(可证伪)
+
+1. **不变量**:`Σused ≤ globalCap − (N−1)·minShare < globalCap`;`globalCap` 与"另一半池子"未变 ⇒ 10017 边界不变;每个线程始终有 `minShare`(≥64 chunk)可前进 ⇒ 不会全员饿死;计量与 `transaction-block-kb` 同量纲。
+2. **死锁**:`used` 只由 delivery 下降;delivery 在独立线程且 `deliveryLimitLocked()` 在无线程参与 min 时返回 `Scn::none()`;allowance 有保底 ⇒ 没有"只有 parser 能投、而 parser 正被背压"的闭环。**自我审查结论:ADR-13 单独上线不解决症状,且"水位卡住 ⇒ used 不降 ⇒ 全员停在 minShare"这条风险要求 ADR-12 先/同批上线** —— 提交顺序因此是 12 → 13。
+3. **顺序语义**:`no-work` 只在"数据暂时不存在"时释放,比原来的"无条件按时间释放"更少触发;真实乱序仍只发生在"该线程的归档晚于水位到达";`watermark` 单调不回退 + `unalignedThreads` 防二次卡死。
+4. **可证伪检查点**:F1 `pending>0` 且 `delivery: idle` 时,`thread watermarks` 里仍存在 `hasWork=false` 却未标 `(no work)` 的线程 ⇒ `updateThreadWork` 漏状态;F2 `hasWork=true` 的线程出现 `reason: no-work` 的 60045 ⇒ 释放路径串了;F3 `Σused > globalCap` 或 `60043/10017` 回归 ⇒ 硬闸门失效。
+5. **误释放来源清单**:归档清单刷新滞后(`arch-read-sleep-us`,默认 10 s)、切片续读 parser、`gapArchives`、正在解析、`setNextSequence()` 与 `hasWork` 计算的先后顺序 —— 前四条已覆盖,第五条由"在 FINISHED 且 `setNextSequence` 之后再计算"保证。
+6. **回滚**:ADR-12 回滚 = 恢复按时间释放(配置 `idle-thread-release-us: 30000000` 即当日行为);ADR-13 回滚 = 恢复 `chunks/2/threads`。两者都不改 checkpoint 格式与投递路径 ⇒ 回滚无需数据修复。
+
+### 11.5 已验证 / 待验证
+
+- 已验证:Release 构建零新告警(`g++ 8.5`,`-Wall -Wextra -Wshadow ...`);同款现场配置 `20003 = 0`、`30001 = 0`,启动信息行打印新策略;`--version` 正常。
+- 待验证(el6 门禁 + 装置):GLIBC ≤ 2.12 / `NEEDED` 无 rdkafka·zstd / `cfgcheck` 三码;装置矩阵(启动卡顿→0 s、`idle-thread-release-us=180000000` 下滞后不再单调上升、归档晚到 60 s 不二次卡死且不丢行、`slice-pending-commits=0` 的 10017 用例不变差、单线程逐字节、Kafka/Doris/源端三方对账)。
+
+---
+
 *本文档为开发计划文档,随实现进展持续更新;任务验收标准以 T0-T8 各节为准。*

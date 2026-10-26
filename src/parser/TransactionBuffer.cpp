@@ -25,6 +25,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include "../common/exception/RedoLogException.h"
 #include "../common/types/Scn.h"
 #include "../common/types/Seq.h"
+#include "../metadata/Metadata.h"
 #include "OpCode0501.h"
 #include "OpCode050B.h"
 #include "Transaction.h"
@@ -433,7 +434,8 @@ namespace OpenLogReplicator {
             redoLogRecord1->flg &= ~(OpCode::FLG_MULTIBLOCKUNDOHEAD | OpCode::FLG_MULTIBLOCKUNDOMID | OpCode::FLG_MULTIBLOCKUNDOTAIL);
     }
 
-    void TransactionBuffer::checkpoint(Seq& minSequence, FileOffset& minFileOffset, Xid& minXid) {
+    void TransactionBuffer::checkpoint(Seq& minSequence, FileOffset& minFileOffset, Xid& minXid, uint16_t& minThread,
+                                       std::map<uint16_t, ThreadPos>& minTrans) {
         // The walk has to hold the lock the parser takes around its inserts and erases: the same call is also
         // executed by the delivering thread - CommitSorter::tick() -> flushUpTo() -> Parser::executeCheckpoint()
         // runs on the writer since the delivery can be driven by it ("stage 3") - so without the lock the loop
@@ -442,15 +444,46 @@ namespace OpenLogReplicator {
         // With the lock the erase (and the delete that follows it) of a concurrent dropTransaction waits until
         // the walk is over, so every element seen here is live for the whole loop.
         std::lock_guard const lck(mtx);
+        // Oldest by begin SCN, not by begin sequence: a sequence number is only meaningful inside the sequence space
+        // of its own redo thread, so "lowest sequence" across threads picks an arbitrary transaction. Production
+        // 2026-10-21: thread 4 at seq 403019 looked "older" than thread 1 at 1146379 and became the min-tran of the
+        // checkpoint, although it was neither the oldest transaction nor on thread 1. The position written to the
+        // checkpoint is still the one of the chosen transaction - together with its thread, which is what makes the
+        // pair usable after a restart.
+        Scn minScn = Scn::none();
         for (const auto& [_, transaction]: xidTransactionMap) {
-            if (transaction->beginSequence < minSequence) {
-                minSequence = transaction->beginSequence;
-                minFileOffset = transaction->beginFileOffset;
-                minXid = transaction->xid;
-            } else if (transaction->beginSequence == minSequence && transaction->beginFileOffset < minFileOffset) {
-                minFileOffset = transaction->beginFileOffset;
-                minXid = transaction->xid;
+            // Per thread first: within one thread the sequence numbers are comparable, so the earliest unfinished
+            // transaction of each thread can be kept - and every one of them has to be re-read after a restart.
+            auto perThread = minTrans.find(transaction->thread);
+            if (perThread == minTrans.end()) {
+                ThreadPos pos;
+                pos.sequence = transaction->beginSequence;
+                pos.fileOffset = transaction->beginFileOffset;
+                minTrans.emplace(transaction->thread, pos);
+            } else if (transaction->beginSequence < perThread->second.sequence ||
+                       (transaction->beginSequence == perThread->second.sequence &&
+                        transaction->beginFileOffset < perThread->second.fileOffset)) {
+                perThread->second.sequence = transaction->beginSequence;
+                perThread->second.fileOffset = transaction->beginFileOffset;
             }
+
+            if (minSequence != Seq::none()) {
+                bool older;
+                if (transaction->beginScn != Scn::none() && minScn != Scn::none())
+                    older = transaction->beginScn < minScn ||
+                            (transaction->beginScn == minScn && transaction->beginFileOffset < minFileOffset);
+                else
+                    // No SCN on either side (should not happen for a transaction taken from redo): keep the old
+                    // sequence comparison rather than dropping the transaction from the search.
+                    older = transaction->beginSequence < minSequence;
+                if (!older)
+                    continue;
+            }
+            minScn = transaction->beginScn;
+            minSequence = transaction->beginSequence;
+            minFileOffset = transaction->beginFileOffset;
+            minXid = transaction->xid;
+            minThread = transaction->thread;
         }
     }
 

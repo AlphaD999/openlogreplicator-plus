@@ -258,16 +258,30 @@ Remediation: check the filesystem bridge (mount options, `arch-read-tries`/`arch
 or use a destination where the archive is written before it is read.
 Repeated short reads are usually harmless for the data - they only delay replication.
 
-==== code 60045: "redo thread: <number> did not advance for: <number> s - it stops holding back the low-water-mark (\"idle-thread-release-us\"); its transactions can now be delivered after transactions with a higher SCN"
+==== code 60045: "redo thread: <number> has no archived redo log left to read (expected seq: <number>, highest known seq: <number>) - it stops holding back the low-water-mark (reason: no-work); its transactions can now be delivered after transactions with a higher SCN" / "redo thread: <number> did not advance for: <number> s - it stops holding back the low-water-mark (reason: timeout, \"idle-thread-release-us\"); ..."
 
-Only reported with `idle-thread-release-us` set (`source` element, 0 = disabled). The redo thread did not
-report a new parsed SCN within the configured timeout, so it was left out of the low-water-mark of the commit
-sorter. This bounds the memory that transactions of the other threads keep while an instance is idle.
+Only reported with `idle-thread-release-us` set (`source` element, 0 = strict). A redo thread was left out of the
+low-water-mark of the commit sorter, for one of two reasons - the field `reason:` says which:
 
-_IMPORTANT:_ the global SCN order is not guaranteed for the transactions of the released thread any more - if
-it later delivers redo with an SCN below what has already been written, those transactions are written after
-transactions with a higher SCN. Remove the parameter (or set it to a higher value) if strict ordering by SCN
-is required.
+`reason: no-work`:: The archive list reports nothing left to read for this thread: everything it still has to read
+  (`expected seq`) is beyond the highest sequence the list returns (`highest known seq`), nothing of it is queued
+  and nothing is parked. Waiting can not move its parsed position in that state, so the release is a statement
+  about the data and not a guess about when the next archive might arrive - this is the normal, expected case for
+  the threads of instances that archive rarely (measured: three of four RAC threads hold 0.4-0.9 GB/h against 72 GB/h
+  of the fourth, so they are "empty" for minutes at a time).
+`reason: timeout`:: The fallback. The thread did not report a new parsed SCN within `idle-thread-release-us`, i.e.
+  the source does not tell what is left (a failing archive list query, a list that keeps returning nothing, an
+  archive that can not be opened). A run that reports this regularly has a problem with the source, not with the
+  release policy.
+
+_IMPORTANT:_ the global SCN order is not guaranteed for the transactions of the released thread any more - if it
+later delivers redo with an SCN below what has already been written, those transactions are written after
+transactions with a higher SCN. With `reason: no-work` that only happens when an archive of the thread arrives
+*after* the other threads have already delivered past its SCN range, which is exactly the case the timeout used to
+wait for; a thread that comes back behind the water-mark does not hold it back until it has caught up (an
+informational `has work again and is behind the low-water-mark` line follows). Set `idle-thread-release-us: 0` if
+strict ordering by SCN is required - the price is that an instance which is quiet for a long time holds back every
+transaction of the others.
 
 ==== code 60046: "file: <file name> - the parser is waiting for the reader for: <number> s (position: <number>, buffer: <number>-<number>, size: <number>, status: <number>, ret: <status>)" / "file: <file name> - the reader is waiting for free read buffer space for: <number> s (buffer: <number>-<number>, limit: <number>, size: <number>, status: <number>, ret: <status>)"
 
@@ -301,6 +315,15 @@ parsed and how many are parked waiting for a missing predecessor.
 Only reported when the parser progress watchdog is enabled (`watchdog-us` in the `source` element, or the
 environment variable `OLR_WATCHDOG` in seconds - it wins). It is meant to be switched on when a run has to be
 diagnosed; with the default (off) it does not cost more than a predictable branch per redo block.
+
+_Progress is a position, not a call_: the parser publishes its position once per redo block, and until 2026-10-20
+every one of those calls refreshed the watchdog timer. A parser that walked in circles over the same blocks
+therefore looked exactly like a healthy one - production ran 26 minutes inside one archive (thread 2, seq 959664,
+delivery frozen behind it) and this warning never fired. The timer is now refreshed only when the position
+actually changes (redo thread, file offset or the number of commits waiting for delivery), so a parser that
+stands still is reported `watchdog-us` after it stopped moving, and the message names the position it stands on.
+Expect a handful of `no progress for: 0 s` reports around a healthy flush (the default `watchdog-us: 300000` is
+shorter than one transaction flush): raise it to `2000000` if that is noise for the run.
 
 The parser did not advance for the configured time. The message carries the last position it was seen at (redo
 thread, file offset, commits waiting for delivery) and the result of a `try_lock` probe of the three locks that
@@ -388,7 +411,7 @@ At most one message per 30 seconds. A run that reports this has to be restarted 
 restart): the scheduler resumes from the checkpoint and the saved file offsets, so the data is not lost, it is
 only delayed.
 
-==== code 60061: "reading back the swapped out chunk <<number>> of transaction: <xid> (thread: <number>, conId: <number>) took <number> s - the delivery waits here for the memory manager, which brings one chunk back per iteration of its loop (\"swap-path\"), so a slow or full swap volume shows up as a stalled delivery"
+==== code 60061: "still waiting after <number> s for the swapped out chunk <<number>> of transaction: <xid> (swap entries: <number>, swap entries waiting for their file to be removed: <number>, waits so far: <number>) - the memory manager brings one chunk back per iteration of its loop (\"swap-path\"), so a full or slow swap volume shows up as a stalled delivery (warning 60055 / 60062 name the caller)"
 
 The delivery of a transaction that was swapped out reads its chunks back one by one
 (`Ctx::swappedMemoryGet`), and the memory manager brings back one chunk per iteration of its loop, each with a
@@ -398,21 +421,38 @@ neither the wait nor the pump left any trace in the log: the production stall of
 minutes, up to 70 s, delivered at about 150 transactions/s while the healthy rate was 500-1300/s) reported
 nothing but "locks held right now: deliveryMtx swapMtx" (60055), which reads like a lock problem.
 
-Reported when a single wait for one chunk exceeds 30 seconds (the same interval as 60050 uses for
-`Ctx::swappedMemoryInit`). The totals of these waits are named by 60055 (`swap chunk waits`). A run that reports
-this has "swap-path" on a volume that can not keep up with the transaction data rate: check that volume (a full
+Reported *while* the wait is still going on, every 30 seconds (the same interval as 60050 uses for
+`Ctx::swappedMemoryInit`), not after it returned: a memory manager that never brings the chunk back (full swap
+volume, an asmfs `stat` that hangs, the entry taken over by a re-parse) used to leave the caller inside the wait
+with no line at all. The `waits so far` counter is the number of 30 s rounds, not of notify round trips, so a
+climbing number with `still waiting` is a pump that is not moving. The totals of these waits are named by 60055
+(`swap chunk waits`). A run that reports this has "swap-path" on a volume that can not keep up with the
+transaction data rate: check that volume (a full
 file system reports its own error, a slow one does not), `swap-mb`, `memory-max-mb` and the transaction rate.
 
-==== code 60062: "the parser is waiting for the delivery for: <number> s - the commit sorter still holds <number> buffered commit(s) (limit: <number>, transaction pool: <number> chunk(s), thread watermarks: <...>); the parse of this thread is stopped on purpose: letting it go on would fill the pool with commits that are waiting for the low-water-mark (\"memory-max-mb\" / \"transaction-block-kb\")"
+==== code 60062: "the parser is waiting for the delivery for: <number> s - the commit sorter holds <number> chunk(s) of this thread against an allowance of <number> (of the <number> chunk(s) / <number> event(s) buffered in total, global cap: <number> chunk(s) of <number>, events of this thread: <number>, min share: <number>, deliverable now: <number>, above the low-water-mark: <number>, thread watermarks: <...>); the parse of this thread is stopped on purpose: ..."
 
 The parser is stopped by the backpressure of the commit sorter for longer than 30 seconds: the sorter holds more
-buffered commits of this redo thread than it is allowed to. The limit is that thread's share of the transaction
-pool (half of it, divided by the number of redo threads - `CommitSorter::pendingLimitLocked`) and the wait is
-applied at the *head* of a redo record (`CommitSorter::waitForBacklog`, called from the parser right after it
-published its water-mark there), not per commit: a record can carry more commits than the limit (measured: 4,097
-against a limit of 4,096) and inside a record the water-mark only moves at the next head, so the parser would
-wait for a water-mark only it could publish. The message names how much of the backlog the delivery may take
-right now (`deliverable now`) and how much of it waits for a higher water-mark (`above the low-water-mark`).
+*chunks of the transaction pool* for this redo thread than its allowance allows. The allowance is not a fixed
+share any more (`CommitSorter::allowanceLocked`): it is what is left of the global cap once the other redo threads
+have what they already use plus their guaranteed minimum -
+
+  allowance(t) = globalCap - (N-1)*minShare - sum(used(j), j != t)
+
+with `globalCap` = half of the pool (`memory-max-mb` / `transaction-block-kb`; the other half must cover the open
+transactions, the builder and the reader - that boundary is what keeps `10017` away) and `minShare` = an eighth of
+the even split, at least `MIN_THREAD_CHUNKS`. A thread that has data therefore gets the pool that the quiet
+threads are not using, while the sum over all threads stays below the cap. The measurement is chunks and not
+events: a transaction can own many chunks, so a count of events against a chunk budget bounds nothing.
+
+The wait is applied at the *head* of a redo record (`CommitSorter::waitForBacklog`, called from the parser right
+after it published its water-mark there), not per commit: a record can carry more commits than the allowance
+(measured: 4,097 commits in one record) and inside a record the water-mark only moves at the next head, so the
+parser would wait for a water-mark only it could publish. The message names how much of the backlog the delivery
+may take right now (`deliverable now`) and how much of it waits for a higher water-mark (`above the low-water-mark`),
+plus the per thread water-marks with the threads that do not hold the water-mark marked `(closed)`, `(no work)` -
+released because the archive list says they have nothing left to read, warning 60045 `reason: no-work` - or
+`(released)` / `(unaligned)`.
 
 The two numbers are what tells the two cases apart: a wait with a non-zero `deliverable now` is a delivery that
 is behind on work it may take (check its side: 60061/60055 for the swap read back, 60031 for a full writer
@@ -435,8 +475,31 @@ with a 4 GB pool and 1 MB blocks (4.5 GB) ended the run with 10017 while the sam
 delivered 18,625 commits with a backlog of 650.
 
 A run that reports this keeps working - the wait ends as soon as the delivery drains the backlog (the lock is
-released while waiting, and the low-water-mark moves as soon as the other redo threads publish, or after
-`idle-thread-release-us`). It is reported once per wait, after 30 seconds. Seeing it regularly means the
-delivery is systematically slower than the parse: check 60061/60055 (swap read back), the writer's throughput
-(`60031`, `output queue is full`) and whether the pool is too small for the redo rate (`memory-max-mb`,
-`transaction-block-kb`).
+released while waiting, and the low-water-mark moves as soon as the other redo threads publish, or as soon as a
+thread that can not advance is released - 60045). It is reported once per wait, after 30 seconds. Seeing it
+regularly means the delivery is systematically slower than the parse: check 60061/60055 (swap read back), the
+writer's throughput (`60031`, `output queue is full`) and whether the pool is too small for the redo rate
+(`memory-max-mb`, `transaction-block-kb`). A wait with `deliverable now: 0` and no `(no work)`/`(released)`
+thread in the water-marks is the water-mark pinned by a thread that is *behind*, not released: that thread has to
+be parsed further (its own allowance may be the reason it is not) before the backlog can move.
+
+==== code 60063: "thread <number> is not rewound to its oldest unfinished transaction: seq: <number> (from \"min-trans\"/\"min-tran\") is <number> archive(s) behind the checkpoint position seq: <number>, over the limit of <number> (\"min-trans-rewind-max-archives\") - the redo before the checkpoint is NOT replayed, so a transaction of this thread that commits later is delivered with only the rows written after the restart (duplicates avoided, completeness given up for this thread)"
+
+Only reported with `min-trans-rewind-max-archives` set (`source` element, 0 = no limit, the default). After a restart
+the checkpoint carries, per redo thread, the position of the oldest unfinished transaction of that thread
+(`min-trans`, written by `TransactionBuffer::checkpoint`). The thread is rewound to it, because a transaction whose
+begin was before the restart can only be delivered completely if its redo is read again from the start - the parser
+that resumes at the checkpoint position sees only its tail, and the commit then carries just those rows.
+
+Re-reading that window has a price: every transaction that was already delivered from the same redo range is
+delivered *again*, and the window is as long as the transaction was open (a transaction open for two hours on a
+thread that archives 2.3 GB every two minutes is ~140 GB of redo and two hours of duplicates). This warning is the
+counterweight: when the span (counted in archives of the thread's own sequence space - `threads[].seq` minus
+`min-trans[].seq`) exceeds the configured limit, that thread keeps its checkpoint position and the transaction is
+delivered **incomplete** instead. Both outcomes are deliberate; which one a run takes is visible in the log
+(`rewinding thread N ... (from "min-trans")` versus this warning).
+
+_IMPORTANT:_ when this is reported, the rows of that thread's unfinished transactions that were written before the
+restart are **not** in the output. If they matter more than the duplicates, raise the limit (or set it to 0) and
+restart again from a checkpoint that still carries the position; if the position is gone, the window can only be
+replayed by resetting the checkpoint.

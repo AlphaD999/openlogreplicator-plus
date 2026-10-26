@@ -84,10 +84,11 @@ class Thread;
         // (waitForBacklog), see the comment there for why it is not applied here.
         void enqueueCommit(Transaction* transaction, Scn commitScn);
 
-        // Backpressure (stage 2): waits while the sorter holds more buffered events of "thread" than its share of
-        // the transaction pool allows (pendingLimitLocked). Called by the parser at the *head* of a record, right
-        // after it published its water-mark there - the wait is per redo thread and at a record boundary, both for
-        // reasons that were measured (see the implementation). The lock is released while waiting.
+        // Backpressure (stage 2): waits while the sorter holds more chunks of the transaction pool for "thread"
+        // than what is left of the pool after the guaranteed shares of the other threads (allowanceLocked). Called
+        // by the parser at the *head* of a record, right after it published its water-mark there - the wait is per
+        // redo thread and at a record boundary, both for reasons that were measured (see the implementation). The
+        // lock is released while waiting.
         void waitForBacklog(uint16_t thread);
         void enqueueCheckpoint(const CheckpointEvent& event);
         // All records with scn <= parsedScn have been analyzed for the thread. "currentTime" is the
@@ -98,6 +99,17 @@ class Thread;
         // Closed thread (instance down): its final watermark stops holding back the global low-water-mark
         void threadClosed(uint16_t thread);
         void threadReopened(uint16_t thread);
+        // Whether the redo thread still has an archived redo log to read, published by the replicator after every
+        // archive list pass from the data it just read (the queue, the parked archives, the highest sequence the
+        // list reported - not from a timer). A thread with nothing left to read can not advance its parsed
+        // position by waiting, so it is left out of the low-water-mark exactly like a closed one: "the release"
+        // stops being a guess about when the next archive might arrive and becomes a statement about the state
+        // of the archive list. "expectedSeq"/"highestSeq" are only used for the report (warning 60045).
+        // Releasing is the aggressive direction and is only ever done on positive evidence (see the
+        // implementation); coming back is the safe one and is always allowed - a thread that returns behind the
+        // water-mark does not take part in the minimum until it has caught up, the same rule a thread released by
+        // the timeout or by a closed instance follows.
+        void setThreadWork(uint16_t thread, bool hasWork, Seq expectedSeq = Seq::none(), Seq highestSeq = Seq::none());
         // Flush all events with scn <= low-water-mark. Every path that delivers takes Ctx::deliveryMtx for the
         // whole delivery, the callbacks run outside the sorter lock. "deliveryThread" is the thread the delivery
         // is booked to (Ctx::accountThread, stage 1) and the thread whose swap key releases are held back until
@@ -130,7 +142,7 @@ class Thread;
         bool waitForDelivery(uint64_t timeoutUs);
 
         // Backpressure (stage 2): enqueueCommit() waits while the sorter holds more than the limit of the
-        // *enqueuing thread* (pendingLimitLocked - per redo thread, and not global: see the comment there). The
+        // *enqueuing thread* (allowanceLocked - per redo thread, and not global: see the comment there). The
         // wait is a bounded wait per round (the delivery notifies when a count drops), and a wait longer than
         // BACKPRESSURE_REPORT_US is reported once (warning 60062): a bounded wait that nobody can see is the same
         // blind spot the stalls of 2026-10-15 hid in.
@@ -141,11 +153,16 @@ class Thread;
         // as the swapped-memory one. Five seconds: long enough not to cut in front of a delivery that is merely busy,
         // short enough to break a real circle before the read buffer runs dry (60046).
         static constexpr uint64_t BACKPRESSURE_EMERGENCY_US{5000000};
+        // Lowest guaranteed backlog of one redo thread, in chunks (see minShareLocked): 64 chunks is 4 MB with the
+        // default 64 KB transaction block. Small on purpose - it only has to keep a thread that is behind able to
+        // enqueue, i.e. able to publish a water-mark; everything above it comes from the pool as it becomes free.
+        static constexpr uint64_t MIN_THREAD_CHUNKS{64};
 
-        // Deliver the lowest buffered event(s) even though the low-water-mark has not reached them. Only called
-        // by tick() with flushLowest (the defect C emergency). It is safe there: the event is a *commit* (the
-        // transaction is complete), it is the lowest buffered one (nothing can be delivered out of order) and
-        // the thread that would have to catch up is the blocked parser itself.
+        // Deliver everything buffered even though the low-water-mark has not reached it. Only called by tick() with
+        // flushLowest (the defect C emergency: a parser blocked in the swap wait or on the backpressure, i.e. the
+        // only thread that could publish a higher water-mark). It is safe there: the buffered events are complete
+        // transactions, they are delivered by ascending SCN, and the thread that would have to catch up is the
+        // blocked parser itself - the same thing flushAll() does at shutdown.
         void flushLowestPending(Executor* executor, Thread* deliveryThread = nullptr);
 
         // The low-water-mark: still the minimum over the active threads, but each thread publishes "the highest
@@ -208,11 +225,23 @@ class Thread;
         // reproduction rig before this existed: 4,500 buffered commits with a 4 GB pool and 1 MB blocks
         // (= 4.5 GB) ended the run with 10017.
         std::condition_variable backpressureCv;
-        // The backpressure bound of one redo thread, with sorterMtx held: half of the pool, divided by the number
-        // of redo threads the sorter has seen (a thread that holds more than one chunk can be swapped out, and a
-        // transaction that holds exactly one can not - so the pool has to cover the backlog of every thread plus
-        // the open transactions). 0 = no bound (the pool is not initialized yet).
-        [[nodiscard]] uint64_t pendingLimitLocked() const;
+        // The backpressure bound of one redo thread, with sorterMtx held, in chunks of the transaction pool.
+        //
+        // It used to be a constant: "half of the pool divided by the number of redo threads", so with four redo
+        // threads the thread that produced 100 times the redo of the others was allowed exactly the same backlog
+        // as the three that produced nothing - and in production that was 1/8 of the pool for the only thread that
+        // needed it (2026-10-19: 24,576 chunks against 30,139 buffered commits, the parser stopped while the
+        // delivery had nothing it was allowed to take). The share is now what is *left* of the pool:
+        //   allowance(t) = globalCap - (N-1)*minShare - sum(used(j), j != t)
+        // i.e. a thread that needs the pool gets it, and only the shares the other threads are guaranteed are held
+        // back from it. globalCap stays half of the pool (the other half must cover the open transactions, the
+        // builder and the reader - that boundary is what keeps 10017 away), so the sum over all threads never
+        // exceeds it and the released memory still comes back through the delivery alone.
+        // 0 = no bound (the pool is not initialized yet).
+        [[nodiscard]] uint64_t allowanceLocked(uint16_t thread) const;
+        // Guaranteed backlog of one redo thread, in chunks: enough to parse a small archive of a quiet instance
+        // without waiting for the delivery, small enough not to hold back the pool from a busy one.
+        [[nodiscard]] uint64_t minShareLocked(uint64_t globalCap) const;
         // The SCN a flush may deliver up to, with sorterMtx held: Scn::none() means "everything buffered" (no redo
         // thread holds the low-water-mark any more). Both the flush (flushReady) and the backpressure report (60062)
         // ask this - reporting "deliverable" against a different number than the flush delivers by made the field
@@ -226,9 +255,14 @@ class Thread;
             bool commit;
             Transaction* transaction{nullptr};
             CheckpointEvent checkpoint;
-            // The redo thread this event belongs to: the backlog is accounted per thread (see pendingByThread)
+            // The redo thread this event belongs to: the backlog is accounted per thread (see chunksByThread)
             // so that one thread can not stop the parser of another one.
             uint16_t thread{0};
+            // Chunks of the transaction pool this event holds at the moment it was enqueued (at least 1 for a
+            // commit, 0 for a checkpoint): the backlog is a memory measure and not a count of events, because a
+            // transaction can own many chunks. Taken once here so that the wait and the report do not have to
+            // look the transaction up in Ctx::swapChunks on every round.
+            uint64_t chunks{0};
         };
 
         Scn watermark{Scn::none()};
@@ -241,6 +275,11 @@ class Thread;
         // delivery with nothing it was allowed to take (60062, "deliverable now: 0") - a deadlock that no wait
         // could resolve.
         std::map<uint16_t, uint64_t> pendingByThread;
+        // Chunks of the transaction pool held by the buffered events of each thread, and the sum over all of them:
+        // the resource the backpressure is really about (see allowanceLocked). Both are moved by enqueueCommit()
+        // and by flushUpTo() only, i.e. under sorterMtx, so they can not drift away from the events.
+        std::map<uint16_t, uint64_t> chunksByThread;
+        uint64_t pendingChunks{0};
         std::map<Scn, std::vector<Event*>> events; // insertion order preserved within the same SCN
         std::map<uint16_t, Scn> threadWatermark;
         std::set<uint16_t> closedThreads;
@@ -253,6 +292,13 @@ class Thread;
         // behind the water-mark: they take part in the minimum again only once they have caught up with redo
         // that was already delivered.
         std::set<uint16_t> unalignedThreads;
+        // Threads the replicator reported as having no archived redo log left to read (setThreadWork). They are
+        // skipped by lowWaterMarkLocked() the way the closed ones are, because no amount of waiting can move
+        // their position: the redo they would have to parse does not exist yet (or is not visible in the list).
+        // Kept apart from idleThreads on purpose - that set is the time based fallback (warning 60045 "reason:
+        // timeout") and is cleared by the next advance, while this one is driven by the archive list alone and
+        // only an explicit setThreadWork(thread, true) clears it.
+        std::set<uint16_t> noWorkThreads;
 
         void flushUpTo(Executor* executor, Scn limit);
         // Body of refreshIdle() without the lock: setThreadWatermark() already holds it when it releases the

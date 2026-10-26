@@ -74,10 +74,32 @@ namespace OpenLogReplicator {
             ss << "]";
         }
         if (metadata->minSequence != Seq::none()) {
+            // The thread has to be written with the position: a sequence number only means something inside the
+            // sequence space of its own redo thread (see Metadata::minThread). Without it a restore can only guess,
+            // and guessing "it is thread 1" is wrong on every RAC database whose oldest open transaction lives
+            // somewhere else.
             ss << R"(,"min-tran":{)" <<
                     R"("seq":)" << metadata->minSequence.toString() <<
                     R"(,"offset":)" << metadata->minFileOffset.toString() <<
+                    R"(,"thread":)" << std::dec << metadata->minThread <<
                     R"(,"xid":")" << metadata->minXid.toString() << R"("})";
+        }
+        if (!metadata->minTrans.empty()) {
+            // Every thread that has an unfinished transaction, not only the oldest one: after a restart each of them
+            // has to be re-read from its own position, or the transaction commits with only the rows that were
+            // parsed after the restart (see Metadata::minTrans).
+            ss << R"(,"min-trans":[)";
+            bool hasMinTran = false;
+            for (const auto& [threadNumber, pos]: metadata->minTrans) {
+                if (hasMinTran)
+                    ss << ",";
+                else
+                    hasMinTran = true;
+                ss << R"({"thread":)" << std::dec << threadNumber <<
+                        R"(,"seq":)" << pos.sequence.toString() <<
+                        R"(,"offset":)" << pos.fileOffset.toString() << "}";
+            }
+            ss << "]";
         }
         ss << R"(,"big-endian":)" << std::dec << (metadata->ctx->isBigEndian() ? 1 : 0) <<
                 R"(,"context":")";
@@ -578,6 +600,7 @@ namespace OpenLogReplicator {
                     "log-archive-dest",
                     "log-archive-format",
                     "min-tran",
+                    "min-trans",
                     "nls-character-set",
                     "nls-nchar-character-set",
                     "offset",
@@ -617,26 +640,43 @@ namespace OpenLogReplicator {
             if (loadMetadata) {
                 metadata->checkpointScn = Ctx::getJsonFieldU64(fileName, document, "scn");
 
+                // The oldest unfinished transaction: its position *and* the redo thread it belongs to. It must not
+                // be applied to any other thread - a sequence number lives in the sequence space of its own thread,
+                // so "resume thread 1 at the oldest open transaction's sequence" makes thread 1 wait for an archive
+                // that can never exist. Production 2026-10-21: min-tran was thread 4 at seq 403019, thread 1 was at
+                // 1146379; restoring 403019 as thread 1's position produced 60027 once per second for hours and
+                // thread 1 delivered nothing at all.
+                Seq minTranSequence = Seq::none();
+                FileOffset minTranFileOffset;
+                uint16_t minTranThread = 0;
+                bool minTranHasThread = false;
                 if (document.HasMember("min-tran")) {
                     const rapidjson::Value& minTranJson = Ctx::getJsonFieldO(fileName, document, "min-tran");
                     if (!metadata->ctx->isDisableChecksSet(Ctx::DISABLE_CHECKS::JSON_TAGS)) {
                         static const std::vector<std::string> minTranJsonChildNames{
                             "offset",
                             "seq",
+                            "thread",
                             "xid"
                         };
                         Ctx::checkJsonFields(fileName, minTranJson, minTranJsonChildNames);
                     }
 
-                    metadata->sequence = Ctx::getJsonFieldU32(fileName, minTranJson, "seq");
-                    metadata->fileOffset = FileOffset(Ctx::getJsonFieldU64(fileName, minTranJson, "offset"));
-                } else {
-                    metadata->sequence = Ctx::getJsonFieldU32(fileName, document, "seq");
-                    metadata->fileOffset = FileOffset(Ctx::getJsonFieldU64(fileName, document, "offset"));
+                    minTranSequence = Ctx::getJsonFieldU32(fileName, minTranJson, "seq");
+                    minTranFileOffset = FileOffset(Ctx::getJsonFieldU64(fileName, minTranJson, "offset"));
+                    if (minTranJson.HasMember("thread")) {
+                        minTranThread = static_cast<uint16_t>(Ctx::getJsonFieldU32(fileName, minTranJson, "thread"));
+                        minTranHasThread = true;
+                    }
                 }
 
-                // Per-thread positions (RAC); old format without "threads" falls back to thread 1
+                // Per-thread positions (RAC); old format without "threads" falls back to the checkpoint SCN
                 if (document.HasMember("threads")) {
+                    // The top-level "seq"/"offset" is thread 1's own view (Metadata::checkpoint only lets a thread 1
+                    // event update it), so it is a valid position for thread 1 - and nothing else in the file is.
+                    metadata->sequence = Ctx::getJsonFieldU32(fileName, document, "seq");
+                    metadata->fileOffset = FileOffset(Ctx::getJsonFieldU64(fileName, document, "offset"));
+
                     const rapidjson::Value& threadsJson = Ctx::getJsonFieldA(fileName, document, "threads");
                     for (rapidjson::SizeType i = 0; i < threadsJson.Size(); ++i) {
                         if (!metadata->ctx->isDisableChecksSet(Ctx::DISABLE_CHECKS::JSON_TAGS)) {
@@ -653,11 +693,83 @@ namespace OpenLogReplicator {
                         pos.sequence = Ctx::getJsonFieldU32(fileName, threadsJson[i], "seq");
                         pos.fileOffset = FileOffset(Ctx::getJsonFieldU64(fileName, threadsJson[i], "offset"));
                     }
-                    // Never resume ahead of the oldest unfinished transaction (min-tran wins for thread 1)
-                    auto thread1It = metadata->threadPos.find(1);
-                    if (thread1It != metadata->threadPos.end() && thread1It->second.sequence > metadata->sequence) {
-                        thread1It->second.sequence = metadata->sequence;
-                        thread1It->second.fileOffset = metadata->fileOffset;
+
+                    // Rewind one thread to the start of its oldest unfinished transaction, within the configured
+                    // bound: the span is counted in archives of that thread's own sequence space (threads[].seq and
+                    // min-trans[].seq are both sequences of the same thread), so it needs no size or file lookup.
+                    // Over the bound the thread keeps its checkpoint position and the redo before it is not replayed
+                    // - a transaction of that thread that commits later is then delivered with only the rows written
+                    // after the restart. That is the trade the switch exists for: bounded duplicates instead of a
+                    // re-read of the whole life of a long transaction.
+                    const auto rewindThread = [&](uint16_t threadNumber, Seq positionSeq, FileOffset positionOffset,
+                                                  const char* source) {
+                        ThreadPos& pos = metadata->threadPosGet(threadNumber);
+                        if (pos.sequence != Seq::none() && !(positionSeq < pos.sequence))
+                            return; // already at or before that position
+                        uint64_t span = 0;
+                        if (pos.sequence != Seq::none() && pos.sequence.getData() > positionSeq.getData())
+                            span = static_cast<uint64_t>(pos.sequence.getData()) - static_cast<uint64_t>(positionSeq.getData());
+                        const uint64_t maxArchives = metadata->ctx == nullptr ? 0 : metadata->ctx->minTransRewindMaxArchives;
+                        if (maxArchives > 0 && span > maxArchives) {
+                            if (metadata->ctx != nullptr)
+                                metadata->ctx->warning(60063, "thread " + std::to_string(threadNumber) +
+                                                       " is not rewound to its oldest unfinished transaction: seq: " +
+                                                       positionSeq.toString() + " (from \"" + std::string(source) + "\") is " +
+                                                       std::to_string(span) + " archive(s) behind the checkpoint position seq: " +
+                                                       pos.sequence.toString() + ", over the limit of " +
+                                                       std::to_string(maxArchives) + " (\"min-trans-rewind-max-archives\") - the "
+                                                       "redo before the checkpoint is NOT replayed, so a transaction of this thread "
+                                                       "that commits later is delivered with only the rows written after the restart "
+                                                       "(duplicates avoided, completeness given up for this thread)");
+                            return;
+                        }
+                        if (metadata->ctx != nullptr)
+                            metadata->ctx->info(0, "rewinding thread " + std::to_string(threadNumber) +
+                                                " to its oldest unfinished transaction: seq: " + positionSeq.toString() +
+                                                ", offset: " + positionOffset.toString() + " (from \"" + std::string(source) + "\")");
+                        pos.sequence = positionSeq;
+                        pos.fileOffset = positionOffset;
+                    };
+
+                    // New format: every thread that had an unfinished transaction, not only the oldest one. A thread
+                    // that is left out here resumes ahead of that transaction's start, and when it commits only the
+                    // rows parsed after the restart are delivered - silently incomplete, with no warning anywhere.
+                    if (document.HasMember("min-trans")) {
+                        const rapidjson::Value& minTransJson = Ctx::getJsonFieldA(fileName, document, "min-trans");
+                        for (rapidjson::SizeType i = 0; i < minTransJson.Size(); ++i) {
+                            if (!metadata->ctx->isDisableChecksSet(Ctx::DISABLE_CHECKS::JSON_TAGS)) {
+                                static const std::vector<std::string> minTransChildNames{
+                                    "offset",
+                                    "seq",
+                                    "thread"
+                                };
+                                Ctx::checkJsonFields(fileName, minTransJson[i], minTransChildNames);
+                            }
+
+                            const uint16_t threadNumber =
+                                    static_cast<uint16_t>(Ctx::getJsonFieldU32(fileName, minTransJson[i], "thread"));
+                            Seq positionSeq;
+                            positionSeq = Ctx::getJsonFieldU32(fileName, minTransJson[i], "seq");
+                            const FileOffset positionOffset = FileOffset(Ctx::getJsonFieldU64(fileName, minTransJson[i], "offset"));
+                            rewindThread(threadNumber, positionSeq, positionOffset, "min-trans");
+                        }
+                    }
+
+                    // Never resume *that* thread ahead of the oldest unfinished transaction - the one that owns it.
+                    // Only when the file has no per-thread list: with "min-trans" present the single entry is a
+                    // redundant summary of the same state (a lower "min-tran" would rewind a thread further back than
+                    // its own entry says, i.e. re-read redo it does not need).
+                    if (!document.HasMember("min-trans") && minTranSequence != Seq::none()) {
+                        if (minTranHasThread) {
+                            rewindThread(minTranThread, minTranSequence, minTranFileOffset, "min-tran");
+                        } else if (metadata->ctx != nullptr) {
+                            // Written before "min-tran" carried its thread: there is no way to tell which thread the
+                            // position belongs to, and guessing (thread 1) is what broke a run for hours. Keep the
+                            // per-thread positions and say so.
+                            metadata->ctx->info(0, "checkpoint has a \"min-tran\" without its thread (legacy format): seq: " +
+                                                minTranSequence.toString() + " is not applied to any thread, the per-thread "
+                                                "positions of \"threads\" are used as they are");
+                        }
                     }
                 } else {
                     // Legacy checkpoint (written before the per-thread "threads" array): the single "seq" in the
@@ -667,6 +779,8 @@ namespace OpenLogReplicator {
                     // all, because that archive never exists). Drop the position instead of guessing: the
                     // per-thread starting sequences are then derived from the checkpoint SCN by positionReader()
                     // (Replicator.cpp: "sequence == none" triggers it), which is the authoritative source.
+                    metadata->sequence = Ctx::getJsonFieldU32(fileName, document, "seq");
+                    metadata->fileOffset = FileOffset(Ctx::getJsonFieldU64(fileName, document, "offset"));
                     if (metadata->ctx != nullptr)
                         metadata->ctx->info(0, "checkpoint has no per-thread positions (legacy format): ignoring seq: " +
                                             metadata->sequence.toString() + ", positioning every thread from scn: " +
@@ -692,6 +806,8 @@ namespace OpenLogReplicator {
                 metadata->minSequence = Seq::none();
                 metadata->minFileOffset = FileOffset::zero();
                 metadata->minXid = Xid::zero();
+                metadata->minThread = 0;
+                metadata->minTrans.clear();
                 metadata->lastCheckpointScn = Scn::none();
                 metadata->lastSequence = Seq::none();
                 metadata->lastCheckpointFileOffset = FileOffset::zero();

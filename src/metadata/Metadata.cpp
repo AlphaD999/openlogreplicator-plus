@@ -489,7 +489,7 @@ namespace OpenLogReplicator {
 
     void Metadata::checkpoint(Thread* t, uint16_t thread, Scn newCheckpointScn, Time newCheckpointTime, Seq newCheckpointSequence,
                               FileOffset newCheckpointFileOffset, uint64_t newCheckpointBytes, Seq newMinSequence, FileOffset newMinFileOffset,
-                              Xid newMinXid) {
+                              Xid newMinXid, uint16_t newMinThread, const std::map<uint16_t, ThreadPos>& newMinTrans) {
         {
             t->contextSet(Thread::CONTEXT::CHKPT, Thread::REASON::CHKPT);
             std::unique_lock const lck(mtxCheckpoint);
@@ -508,6 +508,10 @@ namespace OpenLogReplicator {
             minSequence = newMinSequence;
             minFileOffset = newMinFileOffset;
             minXid = newMinXid;
+            // The thread has to travel with the position: it is what makes the pair meaningful (see Metadata.h).
+            minThread = newMinThread;
+            // One entry per thread that has an unfinished transaction - all of them have to survive the restart.
+            minTrans = newMinTrans;
         }
         t->contextSet(Thread::CONTEXT::CPU);
     }

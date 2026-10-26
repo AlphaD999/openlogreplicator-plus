@@ -166,6 +166,19 @@ namespace OpenLogReplicator {
         Seq minSequence{Seq::none()};
         FileOffset minFileOffset;
         Xid minXid;
+        // Redo thread the oldest unfinished transaction belongs to. It has to travel with minSequence/minFileOffset:
+        // a position is only meaningful inside the sequence space of its own thread, and on RAC the oldest open
+        // transaction is usually not on thread 1 (production 2026-10-21: it was thread 4, at seq 403019, while
+        // thread 1 was at 1146379 - restoring that pair as thread 1's position left thread 1 waiting for an archive
+        // that does not exist: 60027 every second for hours, no delivery at all).
+        uint16_t minThread{0};
+        // Earliest unfinished transaction *per redo thread* (position only). Unlike minSequence/minThread - which
+        // name the single oldest transaction and exist for the log and for older checkpoint files - this keeps one
+        // entry for every thread that has an open transaction: after a restart each of those threads has to be
+        // re-read from its own entry, otherwise a transaction that commits later is delivered with only the rows
+        // that were parsed after the restart (silently incomplete, and on a RAC database the oldest transaction is
+        // usually not the only one: production 2026-10-21 had 38 open transactions at shutdown).
+        std::map<uint16_t, ThreadPos> minTrans;
         uint64_t schemaInterval{0};
         std::set<Scn> checkpointScnList;
         std::unordered_map<Scn, bool> checkpointSchemaMap;
@@ -224,7 +237,7 @@ namespace OpenLogReplicator {
         void wakeUp(Thread* t);
         void checkpoint(Thread* t, uint16_t thread, Scn newCheckpointScn, Time newCheckpointTime, Seq newCheckpointSequence,
                         FileOffset newCheckpointFileOffset, uint64_t newCheckpointBytes, Seq newMinSequence, FileOffset newMinFileOffset,
-                        Xid newMinXid);
+                        Xid newMinXid, uint16_t newMinThread, const std::map<uint16_t, ThreadPos>& newMinTrans);
         void writeCheckpoint(Thread* t, bool force);
         void readCheckpoints();
         void readCheckpoint(Scn scn);

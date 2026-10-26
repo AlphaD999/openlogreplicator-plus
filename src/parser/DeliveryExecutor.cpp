@@ -19,6 +19,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 
 #include "../builder/Builder.h"
 #include "../common/Ctx.h"
+#include "../common/exception/RuntimeException.h"
 #include "../common/metrics/Metrics.h"
 #include "../metadata/Metadata.h"
 #include "DeliveryExecutor.h"
@@ -92,9 +93,11 @@ namespace OpenLogReplicator {
             Seq minSequence = Seq::none();
             FileOffset minFileOffset;
             Xid minXid;
-            transactionBuffer->checkpoint(minSequence, minFileOffset, minXid);
+            uint16_t minThread = 0;
+            std::map<uint16_t, ThreadPos> minTrans;
+            transactionBuffer->checkpoint(minSequence, minFileOffset, minXid, minThread, minTrans);
             metadata->checkpoint(ctx->thread(), event.thread, event.scn, event.timestamp, event.sequence, event.fileOffset,
-                                 event.bytes, minSequence, minFileOffset, minXid);
+                                 event.bytes, minSequence, minFileOffset, minXid, minThread, minTrans);
 
             if (ctx->stopCheckpoints > 0 && metadata->isNewData(event.scn, builder->lwnIdx)) {
                 --ctx->stopCheckpoints;
@@ -134,6 +137,9 @@ namespace OpenLogReplicator {
         // belong to the delivering thread, not to the parser.
         Ctx::accountThread = this;
 
+        // The whole loop is guarded below (the body keeps its indentation, so the change stays readable as a diff);
+        // the handler is what turns a fatal exception here into an error line instead of a SIGABRT.
+        try {
         while (!ctx->hardShutdown) {
             if (ctx->softShutdown) {
                 // The run is over: nothing may stay buffered behind the low-water-mark any more, so everything that
@@ -170,7 +176,7 @@ namespace OpenLogReplicator {
                                  "the parser is blocked waiting for a swapped transaction to be delivered - the "
                                  "delivery thread releases it (defect C)" :
                                  "the parser is blocked on the backpressure limit and nothing is flushable below the "
-                                 "low-water-mark - the delivery thread delivers the lowest buffered commit to release it");
+                                 "low-water-mark - the delivery thread delivers what is buffered to release it");
                 }
             } else if (swapWaitReported) {
                 swapWaitReported = false;
@@ -181,7 +187,7 @@ namespace OpenLogReplicator {
             deliveredInTick = 0;
             // The defect C emergency is part of the tick: while the parser is blocked in Ctx::swappedMemoryInit()
             // the low-water-mark can not move past the transaction it waits for (the parser is the only thread that
-            // publishes one), so the lowest buffered commit is delivered without waiting for it.
+            // publishes one), so what is buffered is delivered without waiting for it.
             // The tick is marked as "in flight" for the parser progress watchdog (60055): since the delivery has a
             // thread of its own, a held deliveryMtx no longer means that the parser is blocked by a lock (the gate
             // is held for a whole delivery), and a report has to tell the two apart.
@@ -203,6 +209,27 @@ namespace OpenLogReplicator {
                 // used to call Builder::flush() at the end of every pass, and without it a writer that waits for its
                 // fallback (5 s, and only while its output queue is empty) would leave the messages sitting there.
                 builder->flush();
+            }
+        } catch (RuntimeException& ex) {
+            // One handler for the whole loop: everything this thread does - building the messages, reading a
+            // transaction back from the swap, writing a checkpoint - can throw, and until now the throw left the
+            // thread (std::terminate, SIGABRT) and the process died with nothing but "what(): std::exception" in the
+            // log (production 2026-10-22 05:48, no error code anywhere). A failure here can not be recovered from:
+            // the buffered state is not trustworthy any more, so it is reported - code, message, stacktrace - and the
+            // run is stopped hard, exactly like the other threads do (Parser, Checkpoint, MemoryManager).
+            ctx->error(ex.code, ex.msg + " - the delivery thread can not continue, the run is stopped");
+            ctx->printStacktrace();
+            ctx->stopHard();
+        } catch (std::bad_alloc& ex) {
+            ctx->error(10018, "memory allocation failed in the delivery thread: " + std::string(ex.what()) +
+                      " - the run is stopped");
+            ctx->printStacktrace();
+            ctx->stopHard();
+        } catch (std::exception& ex) {
+            ctx->error(10014, "unexpected exception in the delivery thread: " + std::string(ex.what()) +
+                      " - the run is stopped");
+            ctx->printStacktrace();
+            ctx->stopHard();
         }
     }
 

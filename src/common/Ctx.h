@@ -358,6 +358,13 @@ namespace OpenLogReplicator {
         // instance is idle (no log switches for hours). 0 = disabled (default): the strict global SCN order
         // is kept, at the price of an idle instance being able to exhaust "max-mb". See warning 60045.
         uint64_t idleThreadReleaseUs{0};
+        // Upper bound, in archives, for the rewind to the oldest unfinished transaction of one redo thread (see
+        // SerializerJson: "min-trans"). Re-reading that window is what makes a transaction that was open at shutdown
+        // deliver all of its rows - but it also delivers again everything that was already written from that window,
+        // and the window is as long as the transaction was open. 0 = no limit (the default: completeness first).
+        // A non-zero value trades completeness for a bounded duplicate burst: warning 60063 names the thread, the
+        // span and the limit whenever a rewind is skipped because of it.
+        uint64_t minTransRewindMaxArchives{0};
         // A redo thread whose highest archived redo log sequence does not move for this many microseconds is
         // treated as an instance that stopped producing redo: when one of its archives is missing it no longer
         // holds back the global low-water-mark (warning 60038). The value is derived from the archived redo log
@@ -507,7 +514,15 @@ namespace OpenLogReplicator {
         // back yet" (swapChunks) from "delivered, waiting for the swap file to be removed" (commitedXids).
         std::atomic<uint64_t> statSorterEvents{0};
         std::atomic<uint64_t> statSorterScns{0};
+
         std::array<std::atomic<uint64_t>, 16> statPendingByThread{};
+        // Chunks of the transaction pool held by the buffered (committed, not delivered yet) transactions of each
+        // thread, mirrored from the sorter by CommitSorter::syncPendingEvents(). This - and not the event count -
+        // is what the backpressure of the parser is measured against (CommitSorter::allowanceLocked): the pool is
+        // accounted in chunks, and one transaction can own many of them ("transaction-block-kb"), so an event
+        // count against a chunk budget is not a memory bound at all.
+        std::array<std::atomic<uint64_t>, 16> statChunksByThread{};
+        std::atomic<uint64_t> statSorterChunks{0};
 
         // One line with those layers plus the swap side (read under swapMtx). Written every 30 s by the delivery
         // tick and appended to warning 60055.
