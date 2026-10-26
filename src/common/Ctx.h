@@ -534,6 +534,12 @@ namespace OpenLogReplicator {
         // buffered, sorter_events=0, credit never fired, the parse ran on. This field is what makes that state
         // visible again.
         std::atomic<uint64_t> statInDelivery{0};
+        // g5: messages the writer holds unconfirmed (Writer::currentQueueSize) and its peak. This is the part of the
+        // backlog that is *past* the commit sorter: together with the producer queue of librdkafka it is what a
+        // stalled client absorbs without the credit noticing (the sorter can be empty while thousands of messages
+        // wait here). Published by Writer::createMessage / confirmMessage, read by layersLine only.
+        std::atomic<uint64_t> statWriterQueue{0};
+        std::atomic<uint64_t> statWriterQueueHwm{0};
 
         // Cost of the last min-tran walk (TransactionBuffer::checkpoint), reported in the "backlog layers" line:
         // transactions walked and microseconds spent. It only runs when a checkpoint file is written (every

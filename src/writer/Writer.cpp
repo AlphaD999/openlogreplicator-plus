@@ -73,6 +73,12 @@ namespace OpenLogReplicator {
 
         queue[currentQueueSize++] = msg;
         hwmQueueSize = std::max(currentQueueSize, hwmQueueSize);
+        // g5: published for the "backlog layers" line. A client that does not keep up makes this grow (up to
+        // "queue-size") while sorter_pending stays low - which is exactly the state the parser's credit can not
+        // see, so it has to be readable somewhere.
+        ctx->statWriterQueue.store(currentQueueSize, std::memory_order_relaxed);
+        if (currentQueueSize > ctx->statWriterQueueHwm.load(std::memory_order_relaxed))
+            ctx->statWriterQueueHwm.store(currentQueueSize, std::memory_order_relaxed);
     }
 
     void Writer::sortQueue() {
@@ -175,6 +181,9 @@ namespace OpenLogReplicator {
                 queue[i] = queue[currentQueueSize];
             }
         }
+
+        // g5: the queue just shrank, publish it with the rest (see createMessage).
+        ctx->statWriterQueue.store(currentQueueSize, std::memory_order_relaxed);
 
         builder->releaseBuffers(this, maxId);
         contextSet(CONTEXT::CPU);

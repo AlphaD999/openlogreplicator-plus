@@ -74,6 +74,18 @@ namespace OpenLogReplicator {
         void wakeUp() override;
         virtual void flush() {}
 
+        // How many messages this writer holds that the client has not confirmed yet, and the highest value seen so
+        // far. Published to Ctx::statWriterQueue / statWriterQueueHwm for the "backlog layers" line: this is the
+        // part of the backlog that sits past the commit sorter, inside the producer queues, and the credit of the
+        // parser can not see it (it only bounds what waits in the sorter).
+        [[nodiscard]] uint64_t getQueueSize() const {
+            return currentQueueSize;
+        }
+
+        [[nodiscard]] uint64_t getHwmQueueSize() const {
+            return hwmQueueSize;
+        }
+
         std::string getName() const override {
             return {"Writer: " + getType()};
         }
