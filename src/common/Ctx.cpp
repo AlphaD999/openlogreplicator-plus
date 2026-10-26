@@ -211,6 +211,10 @@ namespace OpenLogReplicator {
                << " waiting_file_removal=" << commitedXids.size();
         }
         ss << " parser_in_swap_wait=" << (parserInSwapWait.load(std::memory_order_relaxed) ? 1 : 0);
+        // Min-tran walk of the last checkpoint file write: the one heavy step left in the checkpoint path.
+        ss << " checkpoint_walk_tx=" << statCheckpointWalkTx.load(std::memory_order_relaxed)
+           << " checkpoint_walk_us=" << statCheckpointWalkUs.load(std::memory_order_relaxed);
+        // (g3 removed)
         return ss.str();
     }
 

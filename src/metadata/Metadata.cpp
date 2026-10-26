@@ -50,6 +50,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #include "../common/table/SysDeferredStg.h"
 #include "../common/table/SysECol.h"
 #include "../common/table/SysObj.h"
+#include "../parser/TransactionBuffer.h"
 #include "../common/table/SysTab.h"
 #include "../common/table/SysTabComPart.h"
 #include "../common/table/SysTabPart.h"
@@ -488,8 +489,7 @@ namespace OpenLogReplicator {
     }
 
     void Metadata::checkpoint(Thread* t, uint16_t thread, Scn newCheckpointScn, Time newCheckpointTime, Seq newCheckpointSequence,
-                              FileOffset newCheckpointFileOffset, uint64_t newCheckpointBytes, Seq newMinSequence, FileOffset newMinFileOffset,
-                              Xid newMinXid, uint16_t newMinThread, const std::map<uint16_t, ThreadPos>& newMinTrans) {
+                              FileOffset newCheckpointFileOffset, uint64_t newCheckpointBytes) {
         {
             t->contextSet(Thread::CONTEXT::CHKPT, Thread::REASON::CHKPT);
             std::unique_lock const lck(mtxCheckpoint);
@@ -505,13 +505,6 @@ namespace OpenLogReplicator {
                 checkpointFileOffset = newCheckpointFileOffset;
             }
             checkpointBytes += newCheckpointBytes;
-            minSequence = newMinSequence;
-            minFileOffset = newMinFileOffset;
-            minXid = newMinXid;
-            // The thread has to travel with the position: it is what makes the pair meaningful (see Metadata.h).
-            minThread = newMinThread;
-            // One entry per thread that has an unfinished transaction - all of them have to survive the restart.
-            minTrans = newMinTrans;
         }
         t->contextSet(Thread::CONTEXT::CPU);
     }
@@ -544,6 +537,25 @@ namespace OpenLogReplicator {
                     schemaInterval = 0;
             } else
                 schemaInterval = 0;
+
+            // The min-tran positions are read by the serializer below and by nothing else, so they are collected
+            // here - once per written checkpoint file - instead of at every LWN event. The walk is O(open
+            // transactions) and runs under TransactionBuffer::mtx, the mutex the parser takes for every
+            // transaction: run per event it made a backlog slow down the parse that was supposed to drain it
+            // (production 2026-10-22: 176 MB/s -> 4.9 MB/s, one 2.3 GB archive taking 29-61 minutes instead of
+            // 11-15 s, `swap_entries` up to 22,605, `pending_commits` frozen at 9,393). Collected under
+            // mtxCheckpoint: no other path takes that lock and then TransactionBuffer::mtx, so the order is safe.
+            if (transactionBuffer != nullptr) {
+                const uint64_t walkStartUs = ctx->clock->getTimeUt();
+                minSequence = Seq::none();
+                minFileOffset = FileOffset::zero();
+                minXid = Xid::zero();
+                minThread = 0;
+                minTrans.clear();
+                const uint64_t walked = transactionBuffer->checkpoint(minSequence, minFileOffset, minXid, minThread, minTrans);
+                ctx->statCheckpointWalkTx.store(walked, std::memory_order_relaxed);
+                ctx->statCheckpointWalkUs.store(ctx->clock->getTimeUt() - walkStartUs, std::memory_order_relaxed);
+            }
 
             serializer->serialize(this, ss, storeSchema);
 

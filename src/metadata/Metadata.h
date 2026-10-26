@@ -50,6 +50,7 @@ namespace OpenLogReplicator {
     class State;
     class StateDisk;
     class Thread;
+    class TransactionBuffer;
 
     // Per-thread replication position (RAC support); single instance keeps only thread 1
     struct ThreadPos {
@@ -88,6 +89,9 @@ namespace OpenLogReplicator {
         State* stateDisk{nullptr};
         Serializer* serializer{nullptr};
         CommitSorter* commitSorter{nullptr};
+        // Where the min-tran positions come from: collected in writeCheckpoint() only (see checkpoint() above).
+        // Null in offline/batch mode, where there is no transaction buffer to walk.
+        TransactionBuffer* transactionBuffer{nullptr};
         std::atomic<STATUS> status{STATUS::READY};
 
         // Startup parameters
@@ -235,9 +239,13 @@ namespace OpenLogReplicator {
         void setStatusStarting(Thread* t);
         void setStatusReplicating(Thread* t);
         void wakeUp(Thread* t);
+        // Only the scalars of the position: the min-tran values (minSequence/minThread and the per-thread minima)
+        // are collected in writeCheckpoint(), i.e. once per written checkpoint file, not on every LWN event. They
+        // are read by nobody else, and the walk that produces them is O(open transactions) inside the lock the
+        // parser needs for every transaction - per event it turned a backlog into a slowdown of the parser itself
+        // (production 2026-10-22: 176 MB/s -> 4.9 MB/s, 2.3 GB archives taking 29-61 minutes instead of 11-15 s).
         void checkpoint(Thread* t, uint16_t thread, Scn newCheckpointScn, Time newCheckpointTime, Seq newCheckpointSequence,
-                        FileOffset newCheckpointFileOffset, uint64_t newCheckpointBytes, Seq newMinSequence, FileOffset newMinFileOffset,
-                        Xid newMinXid, uint16_t newMinThread, const std::map<uint16_t, ThreadPos>& newMinTrans);
+                        FileOffset newCheckpointFileOffset, uint64_t newCheckpointBytes);
         void writeCheckpoint(Thread* t, bool force);
         void readCheckpoints();
         void readCheckpoint(Scn scn);

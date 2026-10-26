@@ -159,8 +159,13 @@ namespace OpenLogReplicator {
         // inside the sequence space of its own thread - see Metadata::minThread), plus the earliest unfinished
         // transaction of *every* thread (minTrans, see Metadata::minTrans): a restart has to re-read all of them,
         // not only the oldest one, or the other transactions commit with only their post-restart rows.
-        void checkpoint(Seq& minSequence, FileOffset& minFileOffset, Xid& minXid, uint16_t& minThread,
-                        std::map<uint16_t, ThreadPos>& minTrans);
+        //
+        // Call it from the checkpoint *file* write only (Metadata::writeCheckpoint), never per LWN event: the walk
+        // is O(open transactions) and runs under the same mutex the parser takes for every transaction, so on a
+        // busy instance with a backlog it used to cost more than the parse it was meant to observe (production
+        // 2026-10-22: 176 MB/s -> 4.9 MB/s). Returns the number of transactions walked, for the layers report.
+        uint64_t checkpoint(Seq& minSequence, FileOffset& minFileOffset, Xid& minXid, uint16_t& minThread,
+                            std::map<uint16_t, ThreadPos>& minTrans);
         void addOrphanedLob(RedoLogRecord* redoLogRecord1);
         static uint8_t* allocateLob(const RedoLogRecord* redoLogRecord1);
     };

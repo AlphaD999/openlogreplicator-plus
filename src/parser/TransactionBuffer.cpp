@@ -434,8 +434,8 @@ namespace OpenLogReplicator {
             redoLogRecord1->flg &= ~(OpCode::FLG_MULTIBLOCKUNDOHEAD | OpCode::FLG_MULTIBLOCKUNDOMID | OpCode::FLG_MULTIBLOCKUNDOTAIL);
     }
 
-    void TransactionBuffer::checkpoint(Seq& minSequence, FileOffset& minFileOffset, Xid& minXid, uint16_t& minThread,
-                                       std::map<uint16_t, ThreadPos>& minTrans) {
+    uint64_t TransactionBuffer::checkpoint(Seq& minSequence, FileOffset& minFileOffset, Xid& minXid, uint16_t& minThread,
+                                           std::map<uint16_t, ThreadPos>& minTrans) {
         // The walk has to hold the lock the parser takes around its inserts and erases: the same call is also
         // executed by the delivering thread - CommitSorter::tick() -> flushUpTo() -> Parser::executeCheckpoint()
         // runs on the writer since the delivery can be driven by it ("stage 3") - so without the lock the loop
@@ -451,7 +451,9 @@ namespace OpenLogReplicator {
         // checkpoint is still the one of the chosen transaction - together with its thread, which is what makes the
         // pair usable after a restart.
         Scn minScn = Scn::none();
+        uint64_t walked = 0;
         for (const auto& [_, transaction]: xidTransactionMap) {
+            ++walked;
             // Per thread first: within one thread the sequence numbers are comparable, so the earliest unfinished
             // transaction of each thread can be kept - and every one of them has to be re-read after a restart.
             auto perThread = minTrans.find(transaction->thread);
@@ -485,6 +487,7 @@ namespace OpenLogReplicator {
             minXid = transaction->xid;
             minThread = transaction->thread;
         }
+        return walked;
     }
 
     void TransactionBuffer::addOrphanedLob(RedoLogRecord* redoLogRecord1) {

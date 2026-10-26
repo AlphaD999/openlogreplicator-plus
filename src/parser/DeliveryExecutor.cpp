@@ -90,14 +90,11 @@ namespace OpenLogReplicator {
                               const CheckpointEvent& event) {
             builder->processCheckpoint(event.sequence, event.scn, event.timestamp, event.fileOffset, event.switchRedo);
 
-            Seq minSequence = Seq::none();
-            FileOffset minFileOffset;
-            Xid minXid;
-            uint16_t minThread = 0;
-            std::map<uint16_t, ThreadPos> minTrans;
-            transactionBuffer->checkpoint(minSequence, minFileOffset, minXid, minThread, minTrans);
+            // The min-tran positions are not collected here any more: they are only read when a checkpoint file is
+            // written and are gathered there (Metadata::writeCheckpoint), so a LWN event no longer walks the
+            // transaction buffer (see Metadata::checkpoint).
             metadata->checkpoint(ctx->thread(), event.thread, event.scn, event.timestamp, event.sequence, event.fileOffset,
-                                 event.bytes, minSequence, minFileOffset, minXid, minThread, minTrans);
+                                 event.bytes);
 
             if (ctx->stopCheckpoints > 0 && metadata->isNewData(event.scn, builder->lwnIdx)) {
                 --ctx->stopCheckpoints;

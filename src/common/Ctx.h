@@ -515,6 +515,15 @@ namespace OpenLogReplicator {
         std::atomic<uint64_t> statSorterEvents{0};
         std::atomic<uint64_t> statSorterScns{0};
 
+        // Cost of the last min-tran walk (TransactionBuffer::checkpoint), reported in the "backlog layers" line:
+        // transactions walked and microseconds spent. It only runs when a checkpoint file is written (every
+        // "interval-s"/"interval-mb"), so this is the number that says whether that walk can explain a stall -
+        // it used to run per LWN event and, once a backlog made it O(10k), it was invisible except as a parser
+        // that made no progress at all (production 2026-10-22).
+        std::atomic<uint64_t> statCheckpointWalkTx{0};
+        std::atomic<uint64_t> statCheckpointWalkUs{0};
+
+        // (g3 removed)
         std::array<std::atomic<uint64_t>, 16> statPendingByThread{};
         // Chunks of the transaction pool held by the buffered (committed, not delivered yet) transactions of each
         // thread, mirrored from the sorter by CommitSorter::syncPendingEvents(). This - and not the event count -

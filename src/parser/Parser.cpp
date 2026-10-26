@@ -1833,18 +1833,13 @@ namespace OpenLogReplicator {
                         } else {
                             builder->processCheckpoint(sequence, lwnScn, lwnTimestamp, FileOffset(currentBlock, reader->getBlockSize()), switchRedo);
 
-                            Seq minSequence = Seq::none();
-                            FileOffset minFileOffset;
-                            Xid minXid;
-                            uint16_t minThread = 0;
-                            std::map<uint16_t, ThreadPos> minTrans;
-                            transactionBuffer->checkpoint(minSequence, minFileOffset, minXid, minThread, minTrans);
                             if (unlikely(ctx->isTraceSet(Ctx::TRACE::LWN)))
                                 ctx->logTrace(Ctx::TRACE::LWN, "* checkpoint: " + lwnScn.toString());
+                            // The min-tran positions are collected in Metadata::writeCheckpoint (only a written
+                            // checkpoint file reads them), not here.
                             metadata->checkpoint(ctx->thread(), thread, lwnScn, lwnTimestamp, sequence,
                                                  FileOffset(currentBlock, reader->getBlockSize()),
-                                                 static_cast<uint64_t>(currentBlock - lwnConfirmedBlock) * reader->getBlockSize(),
-                                                 minSequence, minFileOffset, minXid, minThread, minTrans);
+                                                 static_cast<uint64_t>(currentBlock - lwnConfirmedBlock) * reader->getBlockSize());
 
                             if (ctx->stopCheckpoints > 0 && metadata->isNewData(lwnScn, builder->lwnIdx)) {
                                 --ctx->stopCheckpoints;

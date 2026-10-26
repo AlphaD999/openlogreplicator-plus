@@ -483,6 +483,8 @@ namespace OpenLogReplicator {
             if (stateJson.HasMember("keep-checkpoints"))
                 ctx->checkpointKeep = Ctx::getJsonFieldU64(configFileName, stateJson, "keep-checkpoints");
 
+            // (g3 removed)
+
             if (stateJson.HasMember("schema-force-interval"))
                 ctx->schemaForceInterval = Ctx::getJsonFieldU64(configFileName, stateJson, "schema-force-interval");
         }
@@ -736,6 +738,9 @@ namespace OpenLogReplicator {
             // TRANSACTION BUFFER
             auto* transactionBuffer = new TransactionBuffer(ctx);
             transactionBuffers.push_back(transactionBuffer);
+            // The metadata writes the checkpoint file and is the only place that needs the min-tran positions:
+            // it collects them there, once per file, instead of the LWN path collecting them per event.
+            metadata->transactionBuffer = transactionBuffer;
 
             // FORMAT
             const rapidjson::Value& formatJson = Ctx::getJsonFieldO(configFileName, sourceJson, "format");
