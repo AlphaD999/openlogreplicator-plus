@@ -525,6 +525,8 @@ namespace OpenLogReplicator {
                     "idle-thread-release-us",
                     "min-trans-rewind-max-archives",
                     "memory",
+                    "pending-commits-per-thread",
+                    "stall-yield-us",
                     "name",
                     "reader",
                     "redo-read-sleep-us",
@@ -1165,6 +1167,47 @@ namespace OpenLogReplicator {
                     throw ConfigurationException(30001, "bad JSON, invalid \"slice-pending-commits\" value: " +
                                                  std::to_string(ctx->slicePendingCommits) + ", expected: one of: {0 .. 10000000}");
             }
+
+            // g4: the credit of one redo thread - how many of its commits may wait in the commit sorter before its
+            // parser is stopped at the next record head. 0 = automatic (the delivery thread halves it while the
+            // parsers are being stopped by it and raises it again when the queue is empty); a large value = off, the
+            // behaviour of the versions before g4.
+            if (sourceJson.HasMember("pending-commits-per-thread")) {
+                ctx->pendingCommitsPerThread = Ctx::getJsonFieldU64(configFileName, sourceJson, "pending-commits-per-thread");
+                if (ctx->pendingCommitsPerThread > 1000000)
+                    throw ConfigurationException(30001, "bad JSON, invalid \"pending-commits-per-thread\" value: " +
+                                                 std::to_string(ctx->pendingCommitsPerThread) +
+                                                 ", expected: one of: {0 .. 1000000} (0 = automatic)");
+                if (ctx->pendingCommitsPerThread == 0) {
+                    ctx->creditCurrent.store(4096, std::memory_order_relaxed);
+                    ctx->info(0, "commit sorter: commit credit: automatic (4096 down to 512 and back, AIMD) - a redo "
+                              "thread stops its parser at a record head once that many of its commits wait for the "
+                              "low-water-mark (\"pending-commits-per-thread\" = 0)");
+                } else {
+                    ctx->info(0, "commit sorter: commit credit: " + std::to_string(ctx->pendingCommitsPerThread) +
+                              " commit(s) per redo thread (\"pending-commits-per-thread\")");
+                }
+            } else {
+                ctx->info(0, "commit sorter: commit credit: " + std::to_string(ctx->pendingCommitsPerThread) +
+                          " commit(s) per redo thread (\"pending-commits-per-thread\", default)");
+            }
+
+            // g4: how long one archive may deliver no data before the parser yields it at its last confirmed LWN
+            // boundary and parses another redo thread first. The parse loop is a single thread, so without this one
+            // archive that is still being written (or read slowly) stops every thread behind it.
+            if (sourceJson.HasMember("stall-yield-us")) {
+                ctx->stallYieldUs = Ctx::getJsonFieldU64(configFileName, sourceJson, "stall-yield-us");
+                if (ctx->stallYieldUs != 0 && ctx->stallYieldUs < 100000)
+                    throw ConfigurationException(30001, "bad JSON, invalid \"stall-yield-us\" value: " +
+                                                 std::to_string(ctx->stallYieldUs) +
+                                                 ", expected: 0 (off) or at least 100000 microseconds");
+            }
+            if (ctx->stallYieldUs == 0)
+                ctx->info(0, "parser: a stalled archive is not yielded (\"stall-yield-us\" = 0)");
+            else
+                ctx->info(0, "parser: an archive that delivers no data for: " + std::to_string(ctx->stallYieldUs / 1000) +
+                          " ms is yielded at its last confirmed LWN boundary so the other redo threads are parsed "
+                          "first (\"stall-yield-us\")");
 
             // How a redo thread that can not advance is left out of the low-water-mark of the commit sorter.
             // The decision itself is taken from the archive list ("no archived redo log left to read" - see

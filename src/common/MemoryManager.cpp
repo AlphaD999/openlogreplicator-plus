@@ -304,6 +304,28 @@ namespace OpenLogReplicator {
     }
 
     void MemoryManager::getChunkToSwap(SwapKey& swapKey, int64_t& index) {
+        // g4: the swap bound. Past a quarter of the pool this stops selecting new transactions: reading them back
+        // competes with reading the archives (the same mount and the same cores) and the whole run crawls -
+        // production 2026-10-23 held 18,245 entries while the parse ran at 0.3 MB/s. The parser is stopped at a
+        // record boundary by the same flag instead (CommitSorter::waitForBacklog), so the pool drains through the
+        // delivery and not through the disk.
+        if (ctx->swapCapReached()) {
+            constexpr uint64_t SWAP_CAP_REPORT_MS{60000};
+            const uint64_t nowMs = ctx->getTimeMs();
+            const uint64_t lastMs = ctx->swapCapWarnMs.load(std::memory_order_relaxed);
+            if (lastMs == 0 || (nowMs > lastMs && nowMs - lastMs >= SWAP_CAP_REPORT_MS)) {
+                uint64_t expected = lastMs;
+                if (ctx->swapCapWarnMs.compare_exchange_strong(expected, nowMs)) {
+                    ctx->warning(60065, "swap chunks reached the limit: " +
+                                 std::to_string(ctx->swappedChunks.load(std::memory_order_relaxed)) + " of " +
+                                 std::to_string(ctx->swapChunksLimit.load(std::memory_order_relaxed)) +
+                                 " chunk(s) are on the swap file - no further transaction is written out and the "
+                                 "parser is stopped at a record boundary instead (the bound is a quarter of "
+                                 "\"memory.max-mb\"); the delivery reading chunks back releases it");
+                }
+            }
+            return;
+        }
         if (ctx->nothingToSwap(this))
             return;
 
@@ -374,6 +396,8 @@ namespace OpenLogReplicator {
                     sc->swappedMin = sc->swappedMax = -1;
                 else
                     ++sc->swappedMin;
+                // g4: one chunk left the swap file, so one chunk of the bound is free again.
+                ctx->swappedChunkFreed(1);
                 contextSet(CONTEXT::CPU);
                 return true;
             }
@@ -393,6 +417,8 @@ namespace OpenLogReplicator {
                         throw RuntimeException(50072, "swap file: " + fileName + " - truncate returned: " + strerror(errno));
                 }
 
+                // g4: one chunk left the swap file, in both branches above (unlink and truncate).
+                ctx->swappedChunkFreed(1);
                 contextSet(CONTEXT::CPU);
                 return true;
             }
@@ -493,6 +519,10 @@ namespace OpenLogReplicator {
             return false;
         }
 
+        // g4: this write is kept (the discard branches above returned already), so one more chunk of the bound is
+        // in use. Counted here and not next to "sc->swappedMax = index", because a write that is immediately
+        // discarded must not move the bound.
+        ctx->swappedChunkStored();
         ctx->freeMemoryChunk(this, Ctx::MEMORY::TRANSACTIONS, tc);
         return true;
     }

@@ -353,6 +353,19 @@ namespace OpenLogReplicator {
         // is held per waiting transaction, so this bounds the memory used by the transactions of one archive.
         // 0 disables slicing (every archive is parsed in one go).
         uint64_t slicePendingCommits{1024};
+        // g4 credit: how many commits of one redo thread may wait in the commit sorter before its parser stops at
+        // the next record head and lets the delivery catch up. The chunk bound next to it can be bypassed by the
+        // swap pump - a transaction that has been written out reports a single chunk - so 59,000 buffered commits
+        // still fit under half a pool (production 2026-10-23: one thread produced 18,211 commits in 10 seconds,
+        // 59,048 were buffered in total, swap entries 18,245, the parse fell from 162 MB/s to 1.6 MB/s).
+        // 0 = adapt automatically (AIMD between "CREDIT_MIN" and "CREDIT_MAX"), a large value = off.
+        uint64_t pendingCommitsPerThread{4096};
+        // g4 stall yield: when the archive the parser is reading delivers no new data for this many microseconds,
+        // the parser yields at the next verified record head (the existing slice path: the position is saved and
+        // the other redo threads are parsed first). One archive that is still being written - or read slowly
+        // through the mount - otherwise stops *all* parsing, because the parse loop is a single thread.
+        // 0 disables it (every archive is parsed to its end, or to its next backpressure stop, in one pass).
+        uint64_t stallYieldUs{5000000};
         // A redo thread that does not advance its parsed SCN for this many microseconds stops holding back
         // the low-water-mark, so the transaction memory kept by the other threads stays bounded while one
         // instance is idle (no log switches for hours). 0 = disabled (default): the strict global SCN order
@@ -550,6 +563,75 @@ namespace OpenLogReplicator {
         // count against a chunk budget is not a memory bound at all.
         std::array<std::atomic<uint64_t>, 16> statChunksByThread{};
         std::atomic<uint64_t> statSorterChunks{0};
+
+        // g4: the credit actually applied (written by CommitSorter: the configured value, or the one AIMD picked).
+        std::atomic<uint64_t> creditCurrent{4096};
+        // Highest number of buffered commits seen for a single thread since the last layers report - the number that
+        // says whether the credit holds (it should stay at the credit plus one record) or whether something still
+        // runs away from it. Mirrored by CommitSorter::syncPendingEvents(), reset by layersLine().
+        std::array<std::atomic<uint64_t>, 16> statPendingMaxByThread{};
+        // Microseconds each thread spent stopped by the credit in the current report interval: the congestion signal
+        // of the AIMD controller, and the number that tells "the parser is held on purpose" from "the parser is
+        // slow". Reset by the delivery tick that reads it.
+        std::array<std::atomic<uint64_t>, 16> statCreditBlockedUs{};
+        // g4 swap bound: chunks currently written out to the swap path, and the limit derived from the pool
+        // ("memory.max-mb" / 4, 0 = not initialized yet, which means no bound). The swap pump stops selecting new
+        // transactions at the limit and the parser waits at a record head instead: unbounded swapping is what
+        // turned a backlog into a 0.3 MB/s parse on 2026-10-23 (18,245 swap entries, all four threads crawling at
+        // once, because reading back competes with reading archives).
+        std::atomic<uint64_t> swappedChunks{0};
+        std::atomic<uint64_t> swapChunksLimit{0};
+        // Reminder timestamp (milliseconds, see Ctx::getTimeMs) of warning 60065 - the swap bound was reached. The
+        // state itself is not stored: it is derived from the two counters above (swapCapReached), so it clears itself
+        // as soon as the delivery reads chunks back and the parser may go on.
+        std::atomic<uint64_t> swapCapWarnMs{0};
+        // Archives yielded because the read stalled (see stallYieldUs): cumulative, and per thread for the 60067
+        // report.
+        std::atomic<uint64_t> statStallYields{0};
+        // Archives waiting in the replicator queue, mirrored by Replicator::run() when it takes one out. A stalled
+        // parser only yields when this is not zero: with nothing else to parse, yielding would reopen the same file.
+        std::atomic<uint64_t> archivesQueued{0};
+        std::array<std::atomic<uint64_t>, 16> statStallYieldsByThread{};
+
+        // The credit to enforce right now: the configured value, or - when "pending-commits-per-thread" is 0 - the
+        // one the AIMD controller picked (CommitSorter::adaptCredit). Read at a record head only.
+        [[nodiscard]] uint64_t creditToEnforce() const {
+            return pendingCommitsPerThread > 0 ? pendingCommitsPerThread : creditCurrent.load(std::memory_order_relaxed);
+        }
+
+        // True once as many chunks have been written out as the pool allows. False while the pool is not
+        // initialized (limit 0) and while nothing has been swapped out.
+        [[nodiscard]] bool swapCapReached() const {
+            const uint64_t limit = swapChunksLimit.load(std::memory_order_relaxed);
+            return limit != 0 && swappedChunks.load(std::memory_order_relaxed) >= limit;
+        }
+
+        // Chunks of one swap entry that are on the disk right now: swappedMin..swappedMax form the range that has
+        // been written out and not read back (-1 = nothing on the disk). Only valid under swapMtx.
+        [[nodiscard]] static uint64_t swappedOnDisk(const SwapChunk* sc) {
+            if (sc == nullptr || sc->swappedMin < 0 || sc->swappedMax < sc->swappedMin)
+                return 0;
+            return static_cast<uint64_t>(sc->swappedMax - sc->swappedMin + 1);
+        }
+
+        // One chunk was written out and is kept on the disk (MemoryManager::swap, discard writes excluded).
+        void swappedChunkStored() {
+            swappedChunks.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // Chunks left the disk again: read back (MemoryManager::unswap), dropped by a purge/rollback
+        // (swappedMemoryRemove) or by a release that found the entry already empty (swappedMemoryKeyRelease).
+        // Saturating on purpose: a counter that got stuck above zero would keep the swap pump switched off for the
+        // rest of the run, which is much worse than an imprecise bound.
+        void swappedChunkFreed(uint64_t count) {
+            if (count == 0)
+                return;
+            uint64_t current = swappedChunks.load(std::memory_order_relaxed);
+            while (current > 0 &&
+                   !swappedChunks.compare_exchange_weak(current, current > count ? current - count : 0,
+                                                        std::memory_order_relaxed)) {
+            }
+        }
 
         // One line with those layers plus the swap side (read under swapMtx). Written every 30 s by the delivery
         // tick and appended to warning 60055.

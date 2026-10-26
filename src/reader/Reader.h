@@ -206,7 +206,13 @@ namespace OpenLogReplicator {
         bool updateRedoLog();
         void setStatusRead();
         void confirmReadData(FileOffset confirmedBufferStart);
-        [[nodiscard]] bool checkFinished(Thread* t, FileOffset confirmedBufferStart);
+        // "stallUs" > 0 gives the wait below a deadline: after that long without a single byte the method returns
+        // false with "starving" set instead of waiting for the reader indefinitely. The parse loop is a single
+        // thread, so one archive that delivers nothing (still being written, or read slowly through the mount) would
+        // otherwise stop every redo thread behind it - the parser uses this to yield at the last confirmed LWN
+        // boundary and parse something else first (Ctx::stallYieldUs).
+        [[nodiscard]] bool checkFinished(Thread* t, FileOffset confirmedBufferStart, uint64_t stallUs = 0,
+                                         bool* starving = nullptr);
         virtual void showHint(Thread* t, std::string origPath, std::string mappedPath) const = 0;
 
         std::string getName() const override {

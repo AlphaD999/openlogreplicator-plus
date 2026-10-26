@@ -1951,7 +1951,44 @@ namespace OpenLogReplicator {
 
                 reader->setRet(Reader::REDO_CODE::SHUTDOWN);
             } else {
-                if (reader->checkFinished(ctx->thread(), confirmedBufferStart)) {
+                bool starving = false;
+                const bool finished = reader->checkFinished(ctx->thread(), confirmedBufferStart, ctx->stallYieldUs, &starving);
+                if (starving && !finished) {
+                    const uint64_t nowUs = ctx->clock->getTimeUt();
+                    // g4 stall yield: this archive delivered nothing for "stall-yield-us" while there is another one
+                    // waiting, so the pass stops at the last *confirmed* LWN boundary and the other redo threads are
+                    // parsed first. The parse loop is a single thread: without this, one archive that is still being
+                    // written (or read slowly through the mount) stops every thread behind it - production
+                    // 2026-10-23: one 2.3 GB archive took 1,039 s while the three other threads had 18,000 commits
+                    // waiting. Resuming at the confirmed boundary re-reads at most the redo of the record the pass had
+                    // started, and that is counted like the STOPPED path below.
+                    if (ctx->archivesQueued.load(std::memory_order_relaxed) > 0 &&
+                        (stallYieldLastUs == 0 || (nowUs > stallYieldLastUs && nowUs - stallYieldLastUs >= 2 * ctx->stallYieldUs))) {
+                        stallYieldLastUs = nowUs;
+                        if (stallYieldWindowStartUs == 0 || (nowUs > stallYieldWindowStartUs && nowUs - stallYieldWindowStartUs >= 60000000)) {
+                            stallYieldWindowStartUs = nowUs;
+                            stallYieldWindowCount = 0;
+                        }
+                        ++stallYieldWindowCount;
+                        ctx->statStallYields.fetch_add(1, std::memory_order_relaxed);
+                        ctx->statStallYieldsByThread[thread].fetch_add(1, std::memory_order_relaxed);
+                        if (stallYieldWindowCount == 4)
+                            ctx->warning(60067, "redo thread: " + std::to_string(thread) + " yielded archive seq: " +
+                                         sequence.toString() + " " + std::to_string(stallYieldWindowCount) +
+                                         " time(s) within a minute because it delivered no data for: " +
+                                         std::to_string(ctx->stallYieldUs / 1000000) + " s - the parser is a single "
+                                         "thread, so while it waits on this archive the other redo threads are not "
+                                         "parsed either (check the archive itself: still being written, missing, or "
+                                         "read slowly through the mount; \"stall-yield-us\")");
+                        metadata->saveFileOffset(thread, sequence, FileOffset(lwnConfirmedBlock, reader->getBlockSize()));
+                        if (lwnScn != Scn::none())
+                            sliceScn = lwnScn;
+                        slicePending = true;
+                        passSummary("stall-yield");
+                        break;
+                    }
+                }
+                if (finished) {
                     if (reader->getRet() == Reader::REDO_CODE::FINISHED && nextScn == Scn::none() && reader->getNextScn() != Scn::none())
                         nextScn = reader->getNextScn();
                     if (reader->getRet() == Reader::REDO_CODE::STOPPED || reader->getRet() == Reader::REDO_CODE::OVERWRITTEN) {

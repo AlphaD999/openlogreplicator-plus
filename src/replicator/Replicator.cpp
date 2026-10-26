@@ -978,6 +978,10 @@ namespace OpenLogReplicator {
                 const size_t bestIndex = bestArchiveIndex();
                 parser = archiveRedoQueue[bestIndex];
                 archiveRedoQueue.erase(archiveRedoQueue.begin() + static_cast<std::ptrdiff_t>(bestIndex));
+                // g4: mirrored for the parser, which is a single thread: it only yields a stalled archive (see
+                // stallYieldUs) when there is another one waiting - yielding with nothing else to parse would just
+                // reopen the same file. The number is "the others", the current one has just been taken out.
+                ctx->archivesQueued.store(archiveRedoQueue.size(), std::memory_order_relaxed);
                 if (unlikely(ctx->isTraceSet(Ctx::TRACE::REDO)))
                     ctx->logTrace(Ctx::TRACE::REDO, parser->path + " is seq: " + parser->sequence.toString() + " thread: " +
                                   std::to_string(parser->thread) + ", scn: " + parser->firstScn.toString());

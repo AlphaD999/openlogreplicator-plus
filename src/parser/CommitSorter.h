@@ -184,6 +184,11 @@ class Thread;
         // type in this header (Ctx.h includes it).
         [[nodiscard]] uint64_t getPendingEvents() const;
 
+        // g4 AIMD: adjusts Ctx::creditCurrent when "pending-commits-per-thread" is 0. Called once per report
+        // interval by the delivery thread, which is the thread that reads both numbers it depends on: the time the
+        // parsers spent stopped by the credit and the delivery rate next to it.
+        void adaptCredit();
+
         // Mirror of pendingEvents into Ctx::statPendingDeliveries, called with sorterMtx held whenever the value
         // changes (also defined in CommitSorter.cpp: Ctx is incomplete here). Warning 60050 and the pending_commits
         // metric read that mirror without taking the sorter lock - a delivery may be in flight and call back in.
@@ -266,6 +271,21 @@ class Thread;
         };
 
         Scn watermark{Scn::none()};
+        // g4: the events are recycled instead of allocated per commit. A backlog of 50,000 events is 50,000
+        // new/delete pairs, and this process allocates them at thousands per second - measurable in the parser's
+        // time and in the fragmentation it leaves behind. The pool is bounded; what does not fit is deleted.
+        static constexpr size_t EVENT_POOL_MAX{8192};
+        std::vector<Event*> eventPool;
+        std::mutex eventPoolMtx;
+        [[nodiscard]] Event* allocEvent();
+        void releaseEvent(Event* event) noexcept;
+
+        static constexpr uint64_t CREDIT_BASE{4096};
+        static constexpr uint64_t CREDIT_MIN{512};
+        // Congestion: this much time spent stopped by the credit within one report interval (30 s) halves it. A
+        // quarter of the interval is enough to be a real slowdown and not a single burst at a record boundary.
+        static constexpr uint64_t CREDIT_SHRINK_US{5000000};
+
         uint64_t pendingEvents{0};
         // Buffered events per redo thread. The backpressure of enqueueCommit() uses the count of *its own*
         // thread: a global count lets a thread that runs ahead hold back the parser of a thread that is behind -

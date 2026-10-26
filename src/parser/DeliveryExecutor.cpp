@@ -110,8 +110,11 @@ namespace OpenLogReplicator {
         }
 
         // Body of Parser::executeCheckpoint, taken out of Parser (it already used the SCN of the event itself).
-        void checkpointCommon(Ctx* ctx, Builder* builder, Metadata* metadata, TransactionBuffer* transactionBuffer,
-                              const CheckpointEvent& event) {
+        // The transaction buffer is part of the signature for symmetry with commitCommon and for the next change that
+        // needs it again: since g2 the min-tran positions are collected in Metadata::writeCheckpoint, so nothing here
+        // touches it (hence [[maybe_unused]]).
+        void checkpointCommon(Ctx* ctx, Builder* builder, Metadata* metadata,
+                              [[maybe_unused]] TransactionBuffer* transactionBuffer, const CheckpointEvent& event) {
             builder->processCheckpoint(event.sequence, event.scn, event.timestamp, event.fileOffset, event.switchRedo);
 
             // The min-tran positions are not collected here any more: they are only read when a checkpoint file is
@@ -228,6 +231,9 @@ namespace OpenLogReplicator {
             const uint64_t layersNowUs = ctx->clock->getTimeUt();
             if (layersReportUs == 0 || layersNowUs - layersReportUs >= 30000000) {
                 layersReportUs = layersNowUs;
+                // g4: the credit is adapted once per report interval, here, because this thread reads both numbers
+                // it depends on: how long the parsers were stopped by it and how fast the delivery runs.
+                sorter->adaptCredit();
                 const uint64_t deliveredNow = ctx->statDeliveredCommits.load(std::memory_order_relaxed);
                 const uint64_t swapWaitUsNow = ctx->statSwapGetWaitUs.load(std::memory_order_relaxed);
                 if (lastDeliveredUs != 0 && layersNowUs > lastDeliveredUs) {

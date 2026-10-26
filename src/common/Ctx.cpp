@@ -219,6 +219,23 @@ namespace OpenLogReplicator {
         ss << " delivered_per_s=" << statDeliveredPerS.load(std::memory_order_relaxed)
            << " restart_reread_drops=" << statRestartRereadDrops.load(std::memory_order_relaxed)
            << " swap_get_wait_ms=" << statSwapGetWaitMs.load(std::memory_order_relaxed);
+        // g4 parse side: the credit actually enforced, the highest number of buffered commits seen for a single
+        // thread since the start (it should stay at the credit plus one record - anything larger means a path that
+        // still runs away from it), the swap bound and how often a parser yielded a stalled archive.
+        {
+            uint64_t pendingMax = 0;
+            for (const auto& perThread: statPendingMaxByThread) {
+                const uint64_t value = perThread.load(std::memory_order_relaxed);
+                if (value > pendingMax)
+                    pendingMax = value;
+            }
+            ss << " credit=" << creditCurrent.load(std::memory_order_relaxed)
+               << " pending_max=" << pendingMax;
+        }
+        ss << " swap_chunks=" << swappedChunks.load(std::memory_order_relaxed)
+           << " swap_chunks_max=" << swapChunksLimit.load(std::memory_order_relaxed)
+           << " swap_cap_hit=" << (swapCapReached() ? 1 : 0)
+           << " stall_yields=" << statStallYields.load(std::memory_order_relaxed);
         return ss.str();
     }
 
@@ -501,6 +518,11 @@ namespace OpenLogReplicator {
             memoryChunksMin = mbsToChunks(memoryMinMb);
             memoryChunksMax = mbsToChunks(memoryMaxMb);
             memoryChunksSwap = mbsToChunks(memorySwapMb);
+            // g4: the swap pump stops at a quarter of the pool. Past that point reading the transactions back
+            // competes with reading the archives (both go through the same mount and the same cores) and the whole
+            // run crawls: production 2026-10-23 had 18,245 entries and 0.3 MB/s. Derived from the pool so that no
+            // per-machine tuning is needed; 0 (pool not initialized) disables the bound.
+            swapChunksLimit.store(memoryChunksMax / 4, std::memory_order_relaxed);
 
             memoryChunksReadBufferMax = mbsToChunks(memoryReadBufferMaxMb);
             memoryChunksReadBufferMin = mbsToChunks(memoryReadBufferMinMb);
@@ -1119,6 +1141,10 @@ namespace OpenLogReplicator {
         {
             t->contextSet(Thread::CONTEXT::MUTEX, Thread::REASON::CTX_SWAPPED_FLUSH2);
             std::unique_lock const lck(swapMtx);
+            // g4: whatever of this transaction is still on the disk is dropped together with its file (the memory
+            // manager unlinks it after this entry is handed over) - it must not keep the swap bound occupied for the
+            // rest of the run. A purge of a rolled back or skipped transaction is the common case here.
+            swappedChunkFreed(swappedOnDisk(sc));
             sc->chunks.clear();
             // The entry stays in swapChunks until the memory manager removes it: queued together with the entry
             // itself, so that the cleanup can tell whether the entry it finds under this key is still the one it
@@ -1184,6 +1210,9 @@ namespace OpenLogReplicator {
                 return;
             if (swappedFlushXid == swapKey)
                 swappedFlushXid = SwapKey{};
+            // g4: nothing should be left on the disk here (the guard above returns while chunks are held), so this
+            // is a defensive subtraction - it can not push the bound below what is really written out.
+            swappedChunkFreed(swappedOnDisk(sc));
             swapChunks.erase(it);
             // The memory manager still has to unlink the swap file, so the key is handed over to it. The entry is
             // queued as a null identity: this one is already erased, so if the cleanup finds a live entry under

@@ -124,6 +124,12 @@ namespace OpenLogReplicator {
         // this parser to resume it later. See Replicator::processArchivedRedoLogs.
         bool slicePending{false};
         Scn sliceScn{Scn::none()};
+        // g4 stall yield: when this pass last yielded a stalled archive (microseconds, 0 = never), and how often it
+        // did so within the current report window - warning 60067 fires on the fourth one in a minute, which is the
+        // point where an operator should look at that thread's archives instead of at the delivery.
+        uint64_t stallYieldLastUs{0};
+        uint64_t stallYieldWindowStartUs{0};
+        uint64_t stallYieldWindowCount{0};
 
         Parser(Ctx* newCtx, Builder* newBuilder, Metadata* newMetadata, TransactionBuffer* newTransactionBuffer, int newGroup, std::string newPath);
         ~Parser();

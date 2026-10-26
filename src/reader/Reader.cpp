@@ -1491,7 +1491,7 @@ namespace OpenLogReplicator {
         return true;
     }
 
-    bool Reader::checkFinished(Thread* t, FileOffset confirmedBufferStart) {
+    bool Reader::checkFinished(Thread* t, FileOffset confirmedBufferStart, uint64_t stallUs, bool* starving) {
         t->contextSet(CONTEXT::MUTEX, REASON::READER_CHECK_FINISHED);
         {
             std::unique_lock lck(mtx);
@@ -1519,12 +1519,26 @@ namespace OpenLogReplicator {
                 // the handshake observable - the reader can also be blocked on the read buffer (see
                 // Reader::mainLoop) and then nothing at all would be written to the log.
                 uint64_t stallIterations = 0;
+                uint64_t starvedUs = 0;
                 while (!ctx->softShutdown && confirmedBufferStart.getData() == bufferEnd &&
                        ret != REDO_CODE::STOPPED && ret != REDO_CODE::OVERWRITTEN && ret != REDO_CODE::FINISHED &&
                        status != STATUS::SLEEPING) {
                     t->contextSet(CONTEXT::WAIT, REASON::READER_FINISHED);
                     condParserSleeping.wait_for(lck, std::chrono::microseconds(ctx->redoReadSleepUs));
                     t->contextSet(CONTEXT::MUTEX, REASON::READER_CHECK_FINISHED);
+                    // g4: hand the wait back to the parser once the deadline is over. It yields the archive at its
+                    // last confirmed LWN boundary and lets the other redo threads be parsed meanwhile; the saved
+                    // position is a boundary the parser has already validated, so resuming there re-reads at most
+                    // the redo of the record it had started (counted, like the STOPPED path).
+                    if (stallUs > 0) {
+                        starvedUs += ctx->redoReadSleepUs;
+                        if (starvedUs >= stallUs) {
+                            if (starving != nullptr)
+                                *starving = true;
+                            t->contextSet(CONTEXT::CPU);
+                            return false;
+                        }
+                    }
                     ++stallIterations;
                     if (stallIterations == 200 || (stallIterations % 1200) == 0)
                         ctx->warning(60046, "file: " + fileName + " - the parser is waiting for the reader for: " +

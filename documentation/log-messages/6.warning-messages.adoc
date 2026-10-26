@@ -503,3 +503,67 @@ _IMPORTANT:_ when this is reported, the rows of that thread's unfinished transac
 restart are **not** in the output. If they matter more than the duplicates, raise the limit (or set it to 0) and
 restart again from a checkpoint that still carries the position; if the position is gone, the window can only be
 replayed by resetting the checkpoint.
+
+==== code 60064: "the parser is stopped by its commit credit for: <number> s - redo thread: <number> holds <number> buffered commit(s) against a credit of <number> ... - this is not a memory problem: the commits wait for a water-mark, so the parser of the thread that holds it (or its archive) is the one to look at"
+
+Reported once per wait when a redo thread has been stopped at a record head by its commit credit
+(`source` element, `pending-commits-per-thread`, default 4096, 0 = automatic) for longer than the backpressure
+report interval. The credit is the bound on how far one redo thread may run ahead of the delivery; it is enforced in
+`CommitSorter::waitForBacklog`, i.e. at a record boundary and not inside a record (a wait inside a record would wait
+for a water-mark only the blocked parser could publish).
+
+This warning is *not* about memory: it says the commits of this thread are buffered and waiting for the low-water-mark,
+which is held by another redo thread. Look at the water-marks in the message (or at `backlog layers`) to see which
+thread is behind, and at that thread's archives: still being written, missing, or read slowly. The chunk based
+backpressure (`60062`) is the memory side of the same wait and is reported separately; a run that reports 60064 but
+not 60062 has a *sequencing* problem, not a pool problem.
+
+The credit holds a thread at its limit plus the commits of one record: a single record can carry more commits than the
+credit (measured: 4,097 commits in one record against a limit of 4,096), and that overshoot is on purpose - waiting
+inside the record would be the deadlock described above.
+
+_IMPORTANT:_ with `pending-commits-per-thread` set to a very large value (or the versions before g4) this bound does not
+exist; the backlog then grows until the pool is full and the swap pump takes over, which is what the production run of
+2026-10-23 did (59,048 buffered commits, 18,245 swap entries, the parse falling to 1.6 MB/s).
+
+==== code 60065: "swap chunks reached the limit: <number> of <number> chunk(s) are on the swap file - no further transaction is written out and the parser is stopped at a record boundary instead (the bound is a quarter of \"memory.max-mb\"); the delivery reading chunks back releases it"
+
+Reported when the swap pump finds as many chunks written out as the bound allows (a quarter of the transaction pool,
+derived from `memory.max-mb`; no per-machine setting). Nothing is written out past that point: the parser is stopped at
+a record boundary instead (`CommitSorter::waitForBacklog`), so the pool drains through the delivery and not through the
+disk. The condition clears itself as soon as the delivery has read chunks back - this is a bound, not a switch.
+
+Why the bound exists: reading the transactions back competes with reading the archives (the same mount and the same
+cores), so unbounded swapping turns a backlog into a slowdown of everything. Production 2026-10-23 reached 18,245 swap
+entries and a parse at 0.3 MB/s (a 2.3 GB archive took 8,133 s instead of 11-15 s) with no warning at all.
+
+_IMPORTANT:_ a run that reports this warning is *slower on purpose*. If it repeats, the cause is above this bound: the
+delivery not keeping up (Kafka, the writer), a redo thread holding the low-water-mark, or a pool too small for the rows
+the subscribed tables produce between two advances of the water-mark. It is reported at most once a minute.
+
+==== code 60066: "the commit credit is lowered: <number> -> <number> commit(s) per redo thread - a parser was stopped by it for: <number> ms in the last report interval, delivery: <number>/s (\"pending-commits-per-thread\": 0 = automatic)"
+
+Reported when the credit is in the automatic mode (`pending-commits-per-thread` = 0) and the delivery thread adapts it:
+halved when a parser spent more than 5 s of the last 30 s report interval stopped by the credit (down to 512), raised by
+a quarter when nothing was stopped by it and the buffered commits stay below a quarter of what it allows (back up to
+4096). The same code reports the raise ("the commit credit is raised: ...").
+
+The signal is deliberately *not* the delivery rate alone: a credit that stops the parsers means the design is working,
+and the question the controller answers is only "how far ahead is useful on this machine". Each adjustment is a line in
+the log, so the reason can be reconstructed afterwards - the value itself is also in `backlog layers` (`credit=`).
+
+==== code 60067: "redo thread: <number> yielded archive seq: <number> <number> time(s) within a minute because it delivered no data for: <number> s - the parser is a single thread, so while it waits on this archive the other redo threads are not parsed either (check the archive itself: still being written, missing, or read slowly through the mount; \"stall-yield-us\")"
+
+Reported on the fourth yield of the same redo thread within a minute. There is **one** parse thread: without this yield
+an archive that delivers no data (still being written, missing from the mount, or read slowly) stops every other redo
+thread for as long as it lasts. The parser saves its position at the last *confirmed* LWN boundary and returns, so the
+scheduler parses another thread first and resumes this archive afterwards; resuming at a confirmed boundary re-reads at
+most the redo of the record that had been started (counted like the STOPPED path, see `parse statistics`).
+
+Tuning: `stall-yield-us` (`source` element, default 5000000 = 5 s, 0 = off). A yield costs a reopen of the archive, so
+the threshold should stay well above the archive arrival jitter; the yield is rate limited per thread (twice the
+threshold) and only happens when another archive is waiting to be parsed.
+
+_IMPORTANT:_ repeated 60067 is a storage/archive-supply symptom, not a parser symptom: check whether that thread's
+archives are complete when they are picked up (`thread_<n>_seq_<seq>` in the mount), and whether the mount is slow at
+that moment. The yield keeps the other threads moving, it does not make this archive faster.

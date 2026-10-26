@@ -25,14 +25,102 @@ If not, see <http://www.gnu.org/licenses/>. */
 namespace OpenLogReplicator {
     CommitSorter::~CommitSorter() {
         for (const auto& [_, eventList]: events) {
-            for (const Event* event: eventList)
+            for (Event* event: eventList)
                 delete event;
         }
         events.clear();
+        // Nothing is handed back here: the pooled events are owned by the pool.
+        for (Event* event: eventPool)
+            delete event;
+        eventPool.clear();
+    }
+
+    CommitSorter::Event* CommitSorter::allocEvent() {
+        {
+            std::lock_guard const lck(eventPoolMtx);
+            if (!eventPool.empty()) {
+                Event* const event = eventPool.back();
+                eventPool.pop_back();
+                return event;
+            }
+        }
+        return new Event();
+    }
+
+    void CommitSorter::releaseEvent(Event* event) noexcept {
+        if (event == nullptr)
+            return;
+        event->scn = Scn::none();
+        event->commit = false;
+        event->transaction = nullptr;
+        event->checkpoint = CheckpointEvent{};
+        event->thread = 0;
+        event->chunks = 0;
+        {
+            std::lock_guard const lck(eventPoolMtx);
+            if (eventPool.size() < EVENT_POOL_MAX) {
+                eventPool.push_back(event);
+                return;
+            }
+        }
+        delete event;
+    }
+
+    void CommitSorter::adaptCredit() {
+        // Only in the automatic mode: an operator who configured a value keeps it.
+        if (ctx == nullptr || ctx->pendingCommitsPerThread != 0)
+            return;
+
+        // The congestion signal: how long the parsers were stopped by the credit in the report interval that just
+        // ended. The counters are handed over (exchanged to 0) so every interval stands on its own; a few
+        // microseconds lost to the race with a parser that is just adding to them does not matter.
+        uint64_t blockedUs = 0;
+        for (auto& counter: ctx->statCreditBlockedUs) {
+            const uint64_t value = counter.exchange(0, std::memory_order_relaxed);
+            if (value > blockedUs)
+                blockedUs = value;
+        }
+
+        uint64_t credit = ctx->creditCurrent.load(std::memory_order_relaxed);
+        if (credit == 0)
+            credit = CREDIT_BASE;
+
+        if (blockedUs >= CREDIT_SHRINK_US) {
+            const uint64_t lowered = credit / 2 < CREDIT_MIN ? CREDIT_MIN : credit / 2;
+            if (lowered < credit) {
+                ctx->creditCurrent.store(lowered, std::memory_order_relaxed);
+                ctx->warning(60066, "the commit credit is lowered: " + std::to_string(credit) + " -> " +
+                             std::to_string(lowered) + " commit(s) per redo thread - a parser was stopped by it for: " +
+                             std::to_string(blockedUs / 1000) + " ms in the last report interval, delivery: " +
+                             std::to_string(ctx->statDeliveredPerS.load(std::memory_order_relaxed)) + "/s "
+                             "(\"pending-commits-per-thread\": 0 = automatic)");
+            }
+            return;
+        }
+
+        // Nothing was stopped by the credit: grow back towards the base while the queue stays shallow. The
+        // threshold is a fraction of what the credit allows in total, so a run that merely uses its credit does not
+        // keep pushing it up and down.
+        if (blockedUs != 0 || credit >= CREDIT_BASE)
+            return;
+        const uint64_t threads = threadWatermark.empty() ? 1 : threadWatermark.size();
+        const uint64_t shallow = credit * threads / 4;
+        if (ctx->statSorterEvents.load(std::memory_order_relaxed) >= shallow)
+            return;
+        uint64_t raised = credit + credit / 4;
+        if (raised <= credit)
+            raised = credit + 1;
+        if (raised > CREDIT_BASE)
+            raised = CREDIT_BASE;
+        ctx->creditCurrent.store(raised, std::memory_order_relaxed);
+        ctx->warning(60066, "the commit credit is raised: " + std::to_string(credit) + " -> " +
+                     std::to_string(raised) + " commit(s) per redo thread - nothing was stopped by it and the "
+                     "buffered commits are below " + std::to_string(shallow) +
+                     " (\"pending-commits-per-thread\": 0 = automatic)");
     }
 
     void CommitSorter::enqueueCommit(Transaction* transaction, Scn commitScn) {
-        auto* event = new Event();
+        auto* event = allocEvent();
         event->scn = commitScn;
         event->commit = true;
         event->transaction = transaction;
@@ -88,6 +176,7 @@ namespace OpenLogReplicator {
             return; // the pool is not initialized (yet): nothing to bound against
 
         bool reported = false;
+        bool creditReported = false;
         // Emergency: a wait longer than BACKPRESSURE_EMERGENCY_US means this parser can not go on while the delivery
         // has nothing it may flush below the low-water-mark - the same circle the swapped-memory wait has (see
         // Ctx::parserInSwapWait): the parser is the only thread that publishes a position, and it is the blocked one.
@@ -95,6 +184,11 @@ namespace OpenLogReplicator {
         // cleared on every way out of this function, so the delivery is back to the ordinary water-mark afterwards.
         bool emergency = false;
         const uint64_t waitingSince = ctx->clock->getTimeUt();
+        // g4: when this thread was first held by the credit (or by the swap bound) in this call. The accumulated
+        // time is what the AIMD controller reads as its congestion signal (Ctx::statCreditBlockedUs): a chunk wait
+        // is the pool being full, a credit wait is the design working as intended, and only the second one is a
+        // reason to lower the credit.
+        uint64_t creditBlockedSince = 0;
         while (!ctx->hardShutdown && !ctx->softShutdown) {
             // Both numbers are re-read on every round: the allowance is what is left of the pool once the other
             // threads have their guaranteed share, so a delivery of another thread (or a thread that stopped
@@ -104,8 +198,24 @@ namespace OpenLogReplicator {
                 break;
             const auto usedIt = chunksByThread.find(thread);
             const uint64_t used = usedIt == chunksByThread.end() ? 0 : usedIt->second;
-            if (used <= allowance)
+            const auto bufferedIt = pendingByThread.find(thread);
+            const uint64_t buffered = bufferedIt == pendingByThread.end() ? 0 : bufferedIt->second;
+            // g4: the two bounds that are counted in commits instead of chunks. The chunk bound can be satisfied
+            // while tens of thousands of commits wait for the low-water-mark, because the swap pump hands the
+            // chunks of a written-out transaction back to the pool (production 2026-10-23: 59,048 buffered,
+            // 18,245 swapped entries, warning 60062 never fired and the parse fell to 1.6 MB/s). The credit does
+            // not care whether the data sits in the pool or on the disk - it bounds how far this thread may run
+            // ahead of the delivery, which is what actually keeps the pool and the parse out of the feedback loop.
+            const uint64_t credit = ctx->creditToEnforce();
+            const bool hitChunks = used > allowance;
+            const bool hitCredit = credit > 0 && buffered >= credit;
+            const bool hitSwapCap = ctx->swapCapReached();
+            if (!hitChunks && !hitCredit && !hitSwapCap)
                 break;
+            if (hitCredit || hitSwapCap) {
+                if (creditBlockedSince == 0)
+                    creditBlockedSince = ctx->clock->getTimeUt();
+            }
 
             backpressureCv.wait_for(lck, std::chrono::milliseconds(BACKPRESSURE_WAIT_MS));
             const uint64_t now = ctx->clock->getTimeUt();
@@ -114,6 +224,30 @@ namespace OpenLogReplicator {
                 ctx->parserInBacklogWait.store(true, std::memory_order_relaxed);
                 // Wake the delivery thread: it is the one that acts on the flag (DeliveryExecutor::run).
                 notifyDeliveryLocked();
+            }
+            // g4: the credit has its own report. 60062 talks about the pool (chunks); a thread stopped by the
+            // credit is not waiting for memory, it is waiting for the delivery to catch up - mixing the two in one
+            // message made the analysis read a memory problem where there was an ordering one.
+            if (!creditReported && creditBlockedSince != 0 && now > creditBlockedSince &&
+                now - creditBlockedSince >= BACKPRESSURE_REPORT_US) {
+                creditReported = true;
+                const Scn creditDeliveryLimit = deliveryLimitLocked();
+                uint64_t creditDeliverable = 0;
+                for (const auto& [scn, list]: events) {
+                    if (creditDeliveryLimit == Scn::none() || !(scn > creditDeliveryLimit))
+                        creditDeliverable += list.size();
+                }
+                ctx->warning(60064, "the parser is stopped by its commit credit for: " +
+                             std::to_string((now - creditBlockedSince) / 1000000) + " s - redo thread: " +
+                             std::to_string(thread) + " holds " + std::to_string(buffered) +
+                             " buffered commit(s) against a credit of " + std::to_string(credit) +
+                             (hitSwapCap ? ", the swap bound is reached as well (\"swap_chunks\" of \"swap_chunks_max\")" :
+                                           ", and the swap bound is not the reason") +
+                             "; deliverable now: " + std::to_string(creditDeliverable) + " of " +
+                             std::to_string(pendingEvents) + " buffered event(s), thread watermarks: " +
+                             getThreadWatermarksText() + " - this is not a memory problem: the commits wait for a "
+                             "water-mark, so the parser of the thread that holds it (or its archive) is the one to "
+                             "look at");
             }
             if (reported || now <= waitingSince || now - waitingSince < BACKPRESSURE_REPORT_US)
                 continue;
@@ -133,13 +267,14 @@ namespace OpenLogReplicator {
                 else
                     aboveWatermark += list.size();
             }
-            const uint64_t globalCap = ctx->getMemoryChunksMax() / 2;
+            const uint64_t globalCap = ctx->getMemoryChunksMax() / 3;
             ctx->warning(60062, "the parser is waiting for the delivery for: " + std::to_string((now - waitingSince) / 1000000) +
                          " s - the commit sorter holds " + std::to_string(used) + " chunk(s) of this thread against an "
                          "allowance of " + std::to_string(allowance) + " (of the " + std::to_string(pendingChunks) +
                          " chunk(s) / " + std::to_string(pendingEvents) + " event(s) buffered in total, global cap: " +
                          std::to_string(globalCap) + " chunk(s) of " + std::to_string(ctx->getMemoryChunksMax()) +
-                         ", events of this thread: " + std::to_string(pendingByThread[thread]) +
+                         ", events of this thread: " + std::to_string(buffered) +
+                         ", credit: " + std::to_string(credit) + (hitSwapCap ? " (reached)" : "") +
                          ", min share: " + std::to_string(minShareLocked(globalCap)) + ", deliverable now: " +
                          std::to_string(deliverable) + ", above the low-water-mark: " + std::to_string(aboveWatermark) +
                          ", thread watermarks: " + getThreadWatermarksText() + ")" +
@@ -148,10 +283,15 @@ namespace OpenLogReplicator {
                          "; the parse of this thread is stopped on purpose: letting it go on "
                          "would fill the pool with commits that are waiting for the low-water-mark (\"memory-max-mb\" / "
                          "\"transaction-block-kb\")");
-                         }
-                         if (emergency)
-                         ctx->parserInBacklogWait.store(false, std::memory_order_relaxed);
-                         }
+        }
+        if (creditBlockedSince != 0) {
+            const uint64_t now = ctx->clock->getTimeUt();
+            if (now > creditBlockedSince)
+                ctx->statCreditBlockedUs[thread].fetch_add(now - creditBlockedSince, std::memory_order_relaxed);
+        }
+        if (emergency)
+            ctx->parserInBacklogWait.store(false, std::memory_order_relaxed);
+    }
 
     uint64_t CommitSorter::minShareLocked(uint64_t globalCap) const {
         // One quarter of the even split of the cap: with four redo threads that is 1/16 of the cap each. It is the
@@ -174,11 +314,11 @@ namespace OpenLogReplicator {
         const uint64_t chunks = ctx->getMemoryChunksMax();
         if (chunks == 0)
             return 0;
-        // Half of the pool for the buffered commits (the other half takes the open transactions, the builder
-        // buffers and the reader). It is the boundary the constant this replaces was derived from and it stays:
-        // every buffered commit owns at least one chunk and a transaction owning exactly one chunk can not be
-        // swapped out, so the backlog of all threads together must not be able to exhaust the pool on its own.
-        const uint64_t globalCap = chunks / 2;
+        // A third of the pool for the buffered commits - the rest takes the open transactions, the reader buffers
+        // and the builder. g4 lowered this from a half: on 2026-10-23 the backlog sat at half a pool (6 GB of 12)
+        // while the parser crawled, and the credit next to this bound (waitForBacklog) is what really limits the
+        // run-ahead, so the chunk bound only has to keep the pool from being eaten by commits alone.
+        const uint64_t globalCap = chunks / 3;
         const uint64_t threads = threadWatermark.empty() ? 1 : threadWatermark.size();
         const uint64_t minShare = minShareLocked(globalCap);
         // What the *other* threads are guaranteed is held back from this one, so that the sum over all threads
@@ -197,7 +337,7 @@ namespace OpenLogReplicator {
     }
 
     void CommitSorter::enqueueCheckpoint(const CheckpointEvent& checkpoint) {
-        auto* event = new Event();
+        auto* event = allocEvent();
         event->scn = checkpoint.scn;
         event->commit = false;
         event->checkpoint = checkpoint;
@@ -427,8 +567,13 @@ namespace OpenLogReplicator {
         ctx->statSorterScns.store(events.size(), std::memory_order_relaxed);
         for (uint16_t thread = 0; thread < 16; ++thread) {
             const auto it = pendingByThread.find(thread);
-            ctx->statPendingByThread[thread].store(it == pendingByThread.end() ? 0 : it->second,
-                                                   std::memory_order_relaxed);
+            const uint64_t buffered = it == pendingByThread.end() ? 0 : it->second;
+            ctx->statPendingByThread[thread].store(buffered, std::memory_order_relaxed);
+            // g4: the peak since the start, per thread. The credit should hold every thread at or below its limit
+            // plus one record; anything above that means a path still runs away from it, and the peak is the number
+            // that shows it in the layers report without having to catch the moment.
+            if (buffered > ctx->statPendingMaxByThread[thread].load(std::memory_order_relaxed))
+                ctx->statPendingMaxByThread[thread].store(buffered, std::memory_order_relaxed);
             // Same mirror for the chunk side: the number the backpressure is really about (warning 60062 and
             // Ctx::layersLine read it without taking the sorter lock).
             const auto itChunks = chunksByThread.find(thread);
@@ -605,7 +750,7 @@ namespace OpenLogReplicator {
                 executor->executeCommit(event->transaction);
             else
                 executor->executeCheckpoint(event->checkpoint);
-            delete event;
+            releaseEvent(event);
         }
     }
 
