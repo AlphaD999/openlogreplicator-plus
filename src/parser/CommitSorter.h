@@ -286,7 +286,17 @@ class Thread;
         // quarter of the interval is enough to be a real slowdown and not a single burst at a record boundary.
         static constexpr uint64_t CREDIT_SHRINK_US{5000000};
 
+        // g5: how many delivered events are accounted back in one go. The counters move with the delivery (see
+        // flushUpTo), so the sorter lock would be taken once per event without a batch; with it the parser's wait
+        // still wakes every 64 events, which is far below the 20 ms poll of the backpressure wait.
+        static constexpr size_t ACCOUNTING_BATCH{64};
+
         uint64_t pendingEvents{0};
+        // g5: of the events counted above, the ones the delivery has already taken out of the map and is handing to
+        // the writer right now. They stay counted (that is the point: the credit has to see them), this is only the
+        // part of the backlog that is past the sorter, so a blocked writer is visible as "sorter_pending, most of it
+        // in_delivery" instead of as an empty queue.
+        uint64_t inDelivery{0};
         // Buffered events per redo thread. The backpressure of enqueueCommit() uses the count of *its own*
         // thread: a global count lets a thread that runs ahead hold back the parser of a thread that is behind -
         // and that behind thread is the one whose water-mark has to move for anything to become deliverable.

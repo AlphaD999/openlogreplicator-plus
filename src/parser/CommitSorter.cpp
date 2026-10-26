@@ -244,10 +244,14 @@ namespace OpenLogReplicator {
                              (hitSwapCap ? ", the swap bound is reached as well (\"swap_chunks\" of \"swap_chunks_max\")" :
                                            ", and the swap bound is not the reason") +
                              "; deliverable now: " + std::to_string(creditDeliverable) + " of " +
-                             std::to_string(pendingEvents) + " buffered event(s), thread watermarks: " +
-                             getThreadWatermarksText() + " - this is not a memory problem: the commits wait for a "
-                             "water-mark, so the parser of the thread that holds it (or its archive) is the one to "
-                             "look at");
+                             std::to_string(pendingEvents) + " buffered event(s), of which " +
+                             std::to_string(inDelivery) + " are in the delivery (" +
+                             (inDelivery >= static_cast<uint64_t>(pendingEvents) ? "the writer is the one that does not "
+                                                                                  "take them, not the water-mark"
+                                                                                : "the rest waits for the water-mark") +
+                             "), thread watermarks: " + getThreadWatermarksText() + " - this is not a memory "
+                             "problem: the commits wait for the delivery, so either the thread that holds the "
+                             "low-water-mark (or its archive) or the writer is the one to look at");
             }
             if (reported || now <= waitingSince || now - waitingSince < BACKPRESSURE_REPORT_US)
                 continue;
@@ -558,6 +562,10 @@ namespace OpenLogReplicator {
 
     void CommitSorter::syncPendingEvents() const {
         ctx->statPendingDeliveries.store(pendingEvents, std::memory_order_relaxed);
+        // g5: the part of the backlog that is already past the sorter (its commit is being sent right now). Kept
+        // separate so that a blocked writer reads as "sorter_pending=4096, in_delivery=4096" and not as an idle
+        // delivery.
+        ctx->statInDelivery.store(inDelivery, std::memory_order_relaxed);
         // Layered mirror for Ctx::layersLine(): how many events are buffered, in how many SCN groups, and how they
         // sit per redo thread. Relaxed stores only, in the critical section that already holds sorterMtx.
         uint64_t totalEvents = 0;
@@ -722,36 +730,72 @@ namespace OpenLogReplicator {
                     ready.push_back(event);
                 events.erase(it);
             }
-            pendingEvents -= ready.size();
-            for (const Event* event: ready) {
-                const auto it2 = pendingByThread.find(event->thread);
+            // g5: the events are *not* taken out of the accounting here any more. They are handed to the executor
+            // below, outside the lock, and only when executeCommit() returns has the backlog really shrunk. Before
+            // g5 the counters dropped at collection time, so a writer that could not send (QUEUE_FULL, a black-holed
+            // broker, a stalled Kafka) hid the whole backlog in this vector: the credit saw an empty queue and let
+            // the parser run on, sorter_events read 0, and only the memory showed it. Reproduced in the rig: 50,000
+            // commits buffered, warn 60031 347,162 times, sorter_events=0, no 60064.
+            inDelivery += ready.size();
+            syncPendingEvents();
+        }
+
+        // The accounting of the events that have just been delivered: applied every "ACCOUNTING_BATCH" events and
+        // once at the end, so that a long delivery does not take the sorter lock 50,000 times, while a blocked one
+        // keeps the whole backlog counted (which is exactly what the credit has to see).
+        struct Delivered {
+            uint16_t thread;
+            uint64_t chunks;
+        };
+        std::vector<Delivered> delivered;
+        delivered.reserve(ready.size());
+        const auto applyDelivered = [this, &delivered]() {
+            if (delivered.empty())
+                return;
+            std::lock_guard const lck(sorterMtx);
+            pendingEvents = pendingEvents >= delivered.size() ? pendingEvents - delivered.size() : 0;
+            inDelivery = inDelivery >= delivered.size() ? inDelivery - delivered.size() : 0;
+            for (const Delivered& one: delivered) {
+                const auto it2 = pendingByThread.find(one.thread);
                 if (it2 != pendingByThread.end() && it2->second > 0)
                     --it2->second;
                 // The memory of the delivered transaction is handed back to the allowance of its thread here and
                 // not in the executor: this is the point the parser waits on, so the chunk counters and the events
                 // have to move together (both under sorterMtx).
-                const auto it3 = chunksByThread.find(event->thread);
+                const auto it3 = chunksByThread.find(one.thread);
                 if (it3 != chunksByThread.end() && it3->second > 0) {
-                    const uint64_t freed = it3->second < event->chunks ? it3->second : event->chunks;
+                    const uint64_t freed = it3->second < one.chunks ? it3->second : one.chunks;
                     it3->second -= freed;
                     pendingChunks = pendingChunks >= freed ? pendingChunks - freed : 0;
                 }
             }
+            delivered.clear();
             syncPendingEvents();
-            // Backpressure: a parser of one of the redo threads may be waiting in enqueueCommit() for exactly
-            // this drop - each waits on the count of its own thread, so any drop can bring one under its limit.
-            // Notified with the lock held like the delivery wake up (the waiter re-reads the count under the
-            // same lock).
+            // Backpressure: a parser of one of the redo threads may be waiting for exactly this drop - each waits on
+            // the count of its own thread, so any drop can bring one under its limit. Notified with the lock held
+            // like the delivery wake up (the waiter re-reads the count under the same lock).
             backpressureCv.notify_all();
-        }
+        };
 
-        for (Event* event: ready) {
-            if (event->commit)
-                executor->executeCommit(event->transaction);
-            else
-                executor->executeCheckpoint(event->checkpoint);
-            releaseEvent(event);
+        try {
+            for (Event* event: ready) {
+                if (event->commit)
+                    executor->executeCommit(event->transaction);
+                else
+                    executor->executeCheckpoint(event->checkpoint);
+                // Read before the event goes back to the pool: releaseEvent() resets both fields.
+                delivered.push_back(Delivered{event->thread, event->chunks});
+                releaseEvent(event);
+                if (delivered.size() >= ACCOUNTING_BATCH)
+                    applyDelivered();
+            }
+        } catch (...) {
+            // The counters must not be left behind on an exception out of the delivery: a parser that waits for a
+            // drop that never comes would block until shutdown.
+            applyDelivered();
+            throw;
         }
+        applyDelivered();
     }
 
     std::string CommitSorter::getThreadWatermarksText() const {

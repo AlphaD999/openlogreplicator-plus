@@ -90,6 +90,7 @@
 |---|---|
 | `credit` | 当前生效的 credit（自动模式下是 AIMD 的值） |
 | `pending_max` | 进程启动以来**单线程**缓冲提交数的峰值（应 ≈ credit + 一条记录；更大说明还有路径在绕开） |
+| `in_delivery` | `sorter_pending` 之中已经交给 writer、但 `executeCommit()` 还没返回的事件数（g5）。writer 一堵这里就顶到 `sorter_pending`，用来区分"等水位"和"等 writer" |
 | `swap_chunks` / `swap_chunks_max` | 当前在盘 chunk 数与上限（池的 1/4） |
 | `swap_cap_hit` | 是否正卡在换出上限 |
 | `stall_yields` | 累计"停滞让出"次数 |

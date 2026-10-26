@@ -527,6 +527,13 @@ namespace OpenLogReplicator {
         // back yet" (swapChunks) from "delivered, waiting for the swap file to be removed" (commitedXids).
         std::atomic<uint64_t> statSorterEvents{0};
         std::atomic<uint64_t> statSorterScns{0};
+        // g5: events that have left the sorter but whose commit has not reached the writer yet. They are counted in
+        // sorter_pending as well (the credit counts them, see CommitSorter::flushUpTo): before g5 they were taken
+        // out of the accounting when the flush *collected* them, so a writer that could not send made the backlog
+        // disappear from every number - production state reproducible with the black hole target: 50,000 commits
+        // buffered, sorter_events=0, credit never fired, the parse ran on. This field is what makes that state
+        // visible again.
+        std::atomic<uint64_t> statInDelivery{0};
 
         // Cost of the last min-tran walk (TransactionBuffer::checkpoint), reported in the "backlog layers" line:
         // transactions walked and microseconds spent. It only runs when a checkpoint file is written (every

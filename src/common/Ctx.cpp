@@ -181,6 +181,7 @@ namespace OpenLogReplicator {
         ss << " sorter_events=" << statSorterEvents.load(std::memory_order_relaxed)
            << " sorter_scns=" << statSorterScns.load(std::memory_order_relaxed)
            << " sorter_pending=" << statPendingDeliveries.load(std::memory_order_relaxed)
+           << " in_delivery=" << statInDelivery.load(std::memory_order_relaxed)
            << " pending_by_thread=[";
         bool first = true;
         for (uint16_t thread = 0; thread < 16; ++thread) {
