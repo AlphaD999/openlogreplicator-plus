@@ -62,7 +62,9 @@ namespace OpenLogReplicator {
 
     void ReaderFilesystem::refreshFileSize() {
         struct stat fileStat{};
-        const int statRet = fileDes != -1 ? fstat(fileDes, &fileStat) : stat(fileName.c_str(), &fileStat);
+        // fstat on the open descriptor is the safe path; the stat fallback needs the locked copy for the same
+        // reason as redoOpen (the parser thread reassigns Reader::fileName underneath).
+        const int statRet = fileDes != -1 ? fstat(fileDes, &fileStat) : stat(fileNameForDiagnostics().c_str(), &fileStat);
         if (statRet != 0)
             return;
 
@@ -71,6 +73,7 @@ namespace OpenLogReplicator {
             newFileSize &= ~(Ctx::MIN_BLOCK_SIZE - 1);
 
         fileSizeStat = newFileSize;
+        fileSizeStatPublished = fileSizeStat;
 
         // Only growth is accepted. A smaller value is a stale answer of the filesystem bridge (asmfs answers
         // 0 for a file that is not fully visible yet) and lowering the size below the position already read
@@ -87,25 +90,34 @@ namespace OpenLogReplicator {
     Reader::REDO_CODE ReaderFilesystem::redoOpen() {
         struct stat fileStat{};
 
+        // One copy for the whole call: the parser thread reassigns Reader::fileName when it hands over the next
+        // archive, and stat()/open() on a string that is being assigned is both undefined behaviour and the
+        // reason a pass of one thread opened - and sized itself by - another thread's archive (measured
+        // 2026-10-28: thread 2 seq 15207 stat'ed thread 1 seq 19775 and took its 52 MB size, which then made
+        // the 60024 gate judge the middle of the file as its end).
+        const std::string path = fileNameForDiagnostics();
+
         // The archive is opened through its filesystem bridge (the mount of the ASM diskgroup): stat() and open()
         // are answered by that bridge, so a stalled query on its side blocks here with no error and no log line.
         // Reports itself as warning 60053/60054.
-        const Ctx::SlowOp slowOp(ctx, Ctx::SLOW_OP_ARCH_OPEN, fileName);
+        const Ctx::SlowOp slowOp(ctx, Ctx::SLOW_OP_ARCH_OPEN, path);
 
         contextSet(CONTEXT::OS, REASON::OS);
-        const int statRet = stat(fileName.c_str(), &fileStat);
+        const int statRet = stat(path.c_str(), &fileStat);
         contextSet(CONTEXT::CPU);
         if (statRet != 0) {
-            ctx->error(10003, "file: " + fileName + " - get metadata returned: " + strerror(errno));
+            ctx->error(10003, "file: " + path + " - get metadata returned: " + strerror(errno));
             return REDO_CODE::ERROR;
         }
 
         flags = O_RDONLY;
         fileSize = fileStat.st_size;
         fileSizeStat = fileSize;
+        fileSizePublished = fileSize;
+        fileSizeStatPublished = fileSizeStat;
         if ((fileSize & (Ctx::MIN_BLOCK_SIZE - 1)) != 0) {
             fileSize &= ~(Ctx::MIN_BLOCK_SIZE - 1);
-            ctx->warning(10071, "file: " + fileName + " size is not a multiplication of " + std::to_string(Ctx::MIN_BLOCK_SIZE) + ", reading only " +
+            ctx->warning(10071, "file: " + path + " size is not a multiplication of " + std::to_string(Ctx::MIN_BLOCK_SIZE) + ", reading only " +
                          std::to_string(fileSize) + " bytes ");
         }
 
@@ -115,10 +127,10 @@ namespace OpenLogReplicator {
 #endif
 
         contextSet(CONTEXT::OS, REASON::OS);
-        fileDes = open(fileName.c_str(), flags);
+        fileDes = open(path.c_str(), flags);
         contextSet(CONTEXT::CPU);
         if (fileDes == -1) {
-            ctx->error(10001, "file: " + fileName + " - open for read returned: " + strerror(errno));
+            ctx->error(10001, "file: " + path + " - open for read returned: " + strerror(errno));
             return REDO_CODE::ERROR;
         }
 

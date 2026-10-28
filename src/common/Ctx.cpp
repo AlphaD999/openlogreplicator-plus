@@ -1750,27 +1750,32 @@ namespace OpenLogReplicator {
         }
     }
 
+    // The counters below are chunk counts, not megabytes: MEMORY_CHUNK_SIZE_MB is 1 (the "MB" unit of the
+    // options) while a chunk is memory."transaction-block-kb" (64 KB by default). Multiplying by
+    // MEMORY_CHUNK_SIZE_MB printed the chunk count with an "MB" suffix, which made the line self-contradictory:
+    // measured 2026-10-27 "Memory HWM: 1047MB ... disk read buffer HWM: 16384MB" - the reader line was 16,384
+    // chunks of 64 KB, i.e. 1024 MB, the configured read buffer. chunksToMb() does the real conversion.
     void Ctx::printMemoryUsageHWM() const {
         info(0, "Memory HWM: " + std::to_string(getMemoryHWM()) + "MB, builder HWM: " +
-             std::to_string(memoryModulesHWM[static_cast<uint>(MEMORY::BUILDER)] * MEMORY_CHUNK_SIZE_MB) + "MB, misc HWM: " +
-             std::to_string(memoryModulesHWM[static_cast<uint>(MEMORY::MISC)] * MEMORY_CHUNK_SIZE_MB) + "MB, parser HWM: " +
-             std::to_string(memoryModulesHWM[static_cast<uint>(MEMORY::PARSER)] * MEMORY_CHUNK_SIZE_MB) + "MB, disk read buffer HWM: " +
-             std::to_string(memoryModulesHWM[static_cast<uint>(MEMORY::READER)] * MEMORY_CHUNK_SIZE_MB) + "MB, transaction HWM: " +
-             std::to_string(memoryModulesHWM[static_cast<uint>(MEMORY::TRANSACTIONS)] * MEMORY_CHUNK_SIZE_MB) + "MB, swapped: " +
+             std::to_string(chunksToMb(memoryModulesHWM[static_cast<uint>(MEMORY::BUILDER)])) + "MB, misc HWM: " +
+             std::to_string(chunksToMb(memoryModulesHWM[static_cast<uint>(MEMORY::MISC)])) + "MB, parser HWM: " +
+             std::to_string(chunksToMb(memoryModulesHWM[static_cast<uint>(MEMORY::PARSER)])) + "MB, disk read buffer HWM: " +
+             std::to_string(chunksToMb(memoryModulesHWM[static_cast<uint>(MEMORY::READER)])) + "MB, transaction HWM: " +
+             std::to_string(chunksToMb(memoryModulesHWM[static_cast<uint>(MEMORY::TRANSACTIONS)])) + "MB, swapped: " +
              std::to_string(swappedMB) + "MB, disk write buffer HWM: " +
-             std::to_string(memoryModulesHWM[static_cast<uint>(MEMORY::WRITER)] * MEMORY_CHUNK_SIZE_MB) + "MB");
+             std::to_string(chunksToMb(memoryModulesHWM[static_cast<uint>(MEMORY::WRITER)])) + "MB");
     }
 
     void Ctx::printMemoryUsageCurrent() const {
-        info(0, "Memory current swap: " + std::to_string(memoryChunksSwap * MEMORY_CHUNK_SIZE_MB) + "MB, allocated: " +
-             std::to_string(memoryChunksAllocated * MEMORY_CHUNK_SIZE_MB) + "MB, free: " +
-             std::to_string(memoryChunksFree * MEMORY_CHUNK_SIZE_MB) + "MB, memory builder: " +
-             std::to_string(memoryModulesAllocated[static_cast<uint>(MEMORY::BUILDER)] * MEMORY_CHUNK_SIZE_MB) + "MB, misc: " +
-             std::to_string(memoryModulesAllocated[static_cast<uint>(MEMORY::MISC)] * MEMORY_CHUNK_SIZE_MB) + "MB, parser: " +
-             std::to_string(memoryModulesAllocated[static_cast<uint>(MEMORY::PARSER)] * MEMORY_CHUNK_SIZE_MB) + "MB, disk read buffer: " +
-             std::to_string(memoryModulesAllocated[static_cast<uint>(MEMORY::READER)] * MEMORY_CHUNK_SIZE_MB) + "MB, transaction: " +
-             std::to_string(memoryModulesAllocated[static_cast<uint>(MEMORY::TRANSACTIONS)] * MEMORY_CHUNK_SIZE_MB) + "MB, swapped: " +
+        info(0, "Memory current swap: " + std::to_string(chunksToMb(memoryChunksSwap)) + "MB, allocated: " +
+             std::to_string(chunksToMb(memoryChunksAllocated)) + "MB, free: " +
+             std::to_string(chunksToMb(memoryChunksFree)) + "MB, memory builder: " +
+             std::to_string(chunksToMb(memoryModulesAllocated[static_cast<uint>(MEMORY::BUILDER)])) + "MB, misc: " +
+             std::to_string(chunksToMb(memoryModulesAllocated[static_cast<uint>(MEMORY::MISC)])) + "MB, parser: " +
+             std::to_string(chunksToMb(memoryModulesAllocated[static_cast<uint>(MEMORY::PARSER)])) + "MB, disk read buffer: " +
+             std::to_string(chunksToMb(memoryModulesAllocated[static_cast<uint>(MEMORY::READER)])) + "MB, transaction: " +
+             std::to_string(chunksToMb(memoryModulesAllocated[static_cast<uint>(MEMORY::TRANSACTIONS)])) + "MB, swapped: " +
              std::to_string(swappedMB) + "MB, disk write buffer: " +
-             std::to_string(memoryModulesAllocated[static_cast<uint>(MEMORY::WRITER)] * MEMORY_CHUNK_SIZE_MB) + "MB");
+             std::to_string(chunksToMb(memoryModulesAllocated[static_cast<uint>(MEMORY::WRITER)])) + "MB");
     }
 }

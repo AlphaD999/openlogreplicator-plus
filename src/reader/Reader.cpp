@@ -143,7 +143,9 @@ namespace OpenLogReplicator {
             const Seq expectedSequence = archiveSequence != Seq::zero() ? archiveSequence : sequence;
             if (unlikely(expectedSequence == Seq::zero())) {
                 ctx->warning(60024, "file: " + fileName + " - the sequence of this archive is not known (block: " +
-                             std::to_string(blockNumber) + ", block header says: " + sequenceHeader.toString() +
+                             std::to_string(blockNumber) + ", offset: " +
+                             std::to_string(static_cast<uint64_t>(blockNumber) * blockSize) + " of size: " +
+                             std::to_string(fileSizePublished.load()) + ", block header says: " + sequenceHeader.toString() +
                              ") - refusing to read a data block that can not be attributed to an archive");
                 return REDO_CODE::ERROR_SEQUENCE;
             }
@@ -151,7 +153,10 @@ namespace OpenLogReplicator {
                 sequence = expectedSequence;
             if (sequenceHeader != expectedSequence) {
                 ctx->warning(60024, "file: " + fileName + " - invalid header sequence, found: " + sequenceHeader.toString() +
-                             ", expected: " + expectedSequence.toString());
+                             ", expected: " + expectedSequence.toString() + ", offset: " +
+                             std::to_string(static_cast<uint64_t>(blockNumber) * blockSize) + " of size: " +
+                             std::to_string(fileSizePublished.load()) + " (the tail of the file is the normal case, the middle is "
+                             "a block of another archive in a shared read buffer)");
                 return REDO_CODE::ERROR_SEQUENCE;
             }
         } else {
@@ -334,6 +339,7 @@ namespace OpenLogReplicator {
             const uint64_t fileSizeHeader = static_cast<uint64_t>(numBlocksHeader) * blockSize;
             if (fileSizeHeader > fileSize) {
                 fileSize = fileSizeHeader;
+        fileSizePublished = fileSize;
                 ctx->info(0, "raising redo log size to: " + std::to_string(fileSize) + " for: " + fileName);
             } else if (fileSizeHeader < fileSize) {
                 // A smaller header must not shorten the archive: the header block count of an archived log is
@@ -496,6 +502,57 @@ namespace OpenLogReplicator {
 
         // Partial online redo log file
         if (goodBlocks == 0 && group == 0) {
+            // The very first block at this position belongs to another archive (60024). At the end of the file
+            // that is how an archive ends; in the middle it is a block of a neighbour that landed in a shared
+            // read buffer (measured 2026-10-26, two archives that read a third one that was still growing).
+            // archiveEndConfirmed() probes the file and would confirm the end all the same, so the position gate
+            // has to decide first - otherwise the rest of the archive is skipped in silence.
+            if (currentRet == REDO_CODE::ERROR_SEQUENCE) {
+                // A resume that lands on a foreign block must not be tried again: the next pass reopens the
+                // archive (close/open/re-read header), the only path that can recover from a stale buffer or
+                // from a file that changed underneath.
+                resumeBlocked = true;
+                // The published copies, not the members: fileSize belongs to the archive the reader thread last
+                // opened, and reading it from this thread is what reported the size of another archive.
+                const uint64_t pubSize = fileSizePublished.load();
+                const uint64_t pubStat = fileSizeStatPublished.load();
+                const uint64_t gateSize = pubSize > pubStat ? pubSize : pubStat;
+                const bool nearEnd = gateSize != 0 && bufferScan + SEQUENCE_ERROR_SLACK >= gateSize;
+                // Diagnostic (info, one line per event, kept on purpose): the two sizes and the value the gate
+                // compares against - the only place that shows why a 60024 was taken as the end of the archive
+                // or as a foreign block in the middle of it.
+                ctx->info(0, "60024 gate: scan: " + std::to_string(bufferScan) + " fileSize: " +
+                          std::to_string(pubSize) + " fileSizeStat: " + std::to_string(pubStat) +
+                          " gateSize: " + std::to_string(gateSize) + " nearEnd: " + (nearEnd ? "yes" : "no") +
+                          " attempts: " + std::to_string(sequenceErrorCount));
+                if (!nearEnd) {
+                    const bool sameSpot = sequenceErrorCount > 0 && sequenceErrorOffset == bufferScan &&
+                                          sequenceErrorSeq == sequence;
+                    if (sameSpot) {
+                        ++sequenceErrorCount;
+                    } else {
+                        sequenceErrorOffset = bufferScan;
+                        sequenceErrorSeq = sequence;
+                        sequenceErrorCount = 1;
+                    }
+                    if (sequenceErrorCount < SEQUENCE_ERROR_MAX) {
+                        // Middle of the archive: stop the pass (the position is kept by the caller) and read the
+                        // archive again next time.
+                        ret = REDO_CODE::STOPPED;
+                        return false;
+                    }
+                    // Persistent: give up on the tail instead of stopping forever, but say so.
+                    ctx->warning(60024, "file: " + fileName + " - giving up on the tail behind position: " +
+                                 std::to_string(bufferScan) + " of size: " + std::to_string(gateSize) +
+                                 " after: " + std::to_string(sequenceErrorCount) +
+                                 " attempts - the rest of this archive is NOT parsed");
+                    ret = REDO_CODE::FINISHED;
+                    if (nextScnHeader != Scn::none())
+                        nextScn = nextScnHeader;
+                    return false;
+                }
+            }
+
             // Not a single good block was found although the archive may still hold data at this position: a
             // filesystem bridge (asmfs) can report a size the file does not have yet, answer the read with
             // zero bytes or answer a shorter size - and it can return zero filled blocks over data it has not
@@ -574,22 +631,86 @@ namespace OpenLogReplicator {
             }
         }
 
-        // Batch mode with a partial online redo log file.
-        // A block carrying another sequence is not "data that could not be read": it is a block of a
-        // different redo log, and that is precisely how this file ends here. The end verification used for
-        // the size driven decisions (archiveEndConfirmed) must therefore not be applied: it reads a
-        // non-empty block as data that was skipped, which by construction is always the case at this point.
+        // A block carrying another sequence is not "data that could not be read": it is a block of a different
+        // redo log. At the END of a file that is how the file ends (ASM handed the extent to another archive,
+        // the 60052 family) - but in the MIDDLE it means the bytes came from somewhere else: the read buffers
+        // are shared by every reader of this instance, and an archive that is still being written has been read
+        // before, so a block of a neighbour with a valid redo header can land in a window that is being scanned.
+        //
+        // Measured 2026-10-26 16:43: two archives reported 60024 with the sequence of a third one that was
+        // still growing (137 MB -> 650 MB in 47 s). Both hits were at 99.9% of their file, so nothing was lost
+        // by luck. In the middle the old code took it as the end and skipped the rest of the archive in
+        // silence; that is what this branch now refuses to do.
+        //
+        // The end verification used for the size driven decisions (archiveEndConfirmed) is still not applied:
+        // it reads a non-empty block as data that was skipped, which by construction is always the case here.
         if (currentRet == REDO_CODE::ERROR_SEQUENCE && group == 0) {
-            if (nextScnHeader != Scn::none()) {
-                ret = REDO_CODE::FINISHED;
-                nextScn = nextScnHeader;
+            // The size to judge "is this the tail" by: fileSize can be the block count the redo header
+            // declares, which lags behind while an archive is still being written (measured on a rig archive:
+            // header said 2 MB, the file was 51 MB), and a gate that trusts the smaller one declares every
+            // mid-file hit to be the tail - exactly what this branch is here to prevent. The filesystem size
+            // (fileSizeStat) is the better witness; take the larger of the two.
+            // The published copies, not the members - see the note in the goodBlocks == 0 branch above.
+            const uint64_t pubSize = fileSizePublished.load();
+            const uint64_t pubStat = fileSizeStatPublished.load();
+            const uint64_t gateSize = pubSize > pubStat ? pubSize : pubStat;
+            const bool nearEnd = gateSize != 0 && bufferScan + SEQUENCE_ERROR_SLACK >= gateSize;
+            // Diagnostic (info, one line per event, kept on purpose): the two sizes and the value the gate
+            // actually compares against - see the note in the goodBlocks == 0 branch above.
+            ctx->info(0, "60024 gate: scan: " + std::to_string(bufferScan) + " fileSize: " +
+                      std::to_string(pubSize) + " fileSizeStat: " + std::to_string(pubStat) +
+                      " gateSize: " + std::to_string(gateSize) + " nearEnd: " + (nearEnd ? "yes" : "no") +
+                      " attempts: " + std::to_string(sequenceErrorCount));
+            if (nearEnd) {
+                // The tail of the archive: keep the historical behaviour, and take the next SCN from the block
+                // header as before.
+                if (nextScnHeader != Scn::none()) {
+                    ret = REDO_CODE::FINISHED;
+                    nextScn = nextScnHeader;
+                } else {
+                    ctx->warning(60023, "file: " + fileName + " - position: " + std::to_string(bufferScan) + " - unexpected end of file");
+                    ret = REDO_CODE::STOPPED;
+                }
             } else {
-                ctx->warning(60023, "file: " + fileName + " - position: " + std::to_string(bufferScan) + " - unexpected end of file");
-                ret = REDO_CODE::STOPPED;
+                const bool sameSpot = sequenceErrorCount > 0 && sequenceErrorOffset == bufferScan &&
+                                      sequenceErrorSeq == sequence;
+                if (sameSpot) {
+                    ++sequenceErrorCount;
+                } else {
+                    sequenceErrorOffset = bufferScan;
+                    sequenceErrorSeq = sequence;
+                    sequenceErrorCount = 1;
+                }
+
+                if (sequenceErrorCount < SEQUENCE_ERROR_MAX) {
+                    // Middle of the archive: stop the pass (the position is kept by the caller) and read the
+                    // archive again next time. Do NOT take nextScn from a block that is not ours - that would
+                    // carry another archive's SCN into this one's chain. checkBlockHeader already said which
+                    // block it was (60024 with position/size), so no second line is printed here.
+                    ret = REDO_CODE::STOPPED;
+                } else {
+                    // The same spot failed the same way too often: give up on the tail instead of stopping
+                    // forever, but say so - the old code did exactly this and said nothing.
+                    ctx->warning(60024, "file: " + fileName + " - giving up on the tail behind position: " +
+                                 std::to_string(bufferScan) + " of size: " + std::to_string(fileSize) +
+                                 " after: " + std::to_string(sequenceErrorCount) +
+                                 " attempts - the rest of this archive is NOT parsed");
+                    ret = REDO_CODE::FINISHED;
+                    if (nextScnHeader != Scn::none())
+                        nextScn = nextScnHeader;
+                }
             }
             return false;
         }
 
+        // Only a pass that gets *past* the position where the last 60024 stopped clears the counter: a spot
+        // that keeps failing is a spot. Clearing it on every pass that merely re-reads the good blocks in front
+        // of that position kept the counter at 1 for hours (measured on the rig: "attempts: 0" on every pass),
+        // so "give up on the tail after three attempts" never fired and the archive was stopped forever.
+        if (sequenceErrorOffset != 0 && bufferScan > sequenceErrorOffset)
+            sequenceErrorCount = 0;
+        // Blocks of this archive were read: a resume from here on is safe again.
+        resumeBlocked = false;
         return true;
     }
 
@@ -810,6 +931,7 @@ namespace OpenLogReplicator {
                             const uint64_t fileSizeHeader = static_cast<uint64_t>(numBlocksHeader) * blockSize;
                             if (fileSizeHeader > fileSize)
                                 fileSize = fileSizeHeader;
+        fileSizePublished = fileSize;
                         }
                         if (fileSize > fileSizeBefore) {
                             ctx->info(0, "updating redo log size to: " + std::to_string(fileSize) + " for: " + fileName);
@@ -936,7 +1058,7 @@ namespace OpenLogReplicator {
                         ++stallIterations;
                         if (stallIterations == 200 || (stallIterations % 1200) == 0)
                             ctx->warning(60044, "file: " + fileName + " - no progress at position: " + std::to_string(bufferScan) +
-                                         ", size: " + std::to_string(fileSize) + " for: " +
+                                         ", size: " + std::to_string(fileSizePublished.load()) + " for: " +
                                          std::to_string(stallIterations * ctx->redoReadSleepUs / 1000000) + " s");
                     } else {
                         stallIterations = 0;
@@ -1351,6 +1473,54 @@ namespace OpenLogReplicator {
     std::string Reader::fileNameForDiagnostics() const {
         std::unique_lock const lck(fileNameMtx);
         return fileNameSafe;
+    }
+
+    void Reader::resumeAt(uint64_t offset) {
+        // Precondition (guaranteed by the caller): the reader is SLEEPING - it parked itself after the last
+        // pass, so nothing is inside the read loop and the three positions can be set in one go. The sequence
+        // is deliberately not touched: it is the identity every block is checked against (60024/50049), and
+        // the caller has already verified that it matches the archive it is about to parse.
+        const uint64_t aligned = blockSize != 0 ? offset - (offset % blockSize) : offset;
+        std::unique_lock lck(mtx);
+        bufferStart = aligned;
+        bufferEnd = aligned;
+        bufferScan = aligned;
+        lastRead = 0;
+        lastReadTime = 0;
+        readTime = 0;
+        loopTime = 0;
+        ret = REDO_CODE::OK;
+        status = STATUS::READ;
+        condBufferFull.notify_all();
+        condReaderSleeping.notify_all();
+        condParserSleeping.notify_all();
+    }
+
+    bool Reader::isSleeping() const {
+        return status.load() == STATUS::SLEEPING;
+    }
+
+    bool Reader::parkForResume(uint64_t timeoutUs) {
+        // Ask the reader to park without a CHECK request: the top of the read loop tests status == READ, so
+        // setting SLEEPING makes it leave the loop on its own and wait in the SLEEPING branch - which does not
+        // close or open anything. CHECK (Reader::checkRedoLog) is exactly what must not be asked here.
+        {
+            std::unique_lock lck(mtx);
+            if (status != STATUS::READ) {
+                // Already parked, or a request is in flight: do not interfere.
+                return status == STATUS::SLEEPING;
+            }
+            status = STATUS::SLEEPING;
+            condBufferFull.notify_all();
+            condReaderSleeping.notify_all();
+            condParserSleeping.notify_all();
+        }
+        for (uint64_t waited = 0; waited < timeoutUs; waited += 1000) {
+            if (status.load() == STATUS::SLEEPING)
+                return true;
+            ctx->usleepInt(1000);
+        }
+        return false;
     }
 
     const char* Reader::statusName(STATUS value) {

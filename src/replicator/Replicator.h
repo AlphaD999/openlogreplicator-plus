@@ -61,7 +61,13 @@ namespace OpenLogReplicator {
         bool deliveryStarted{false};
         std::string redoCopyPath;
         // Redo log files
-        Reader* archReader{nullptr};
+        // One reader per redo thread, created on first use. A reader carries the identity of the archive it has
+        // open (fileName, fileSize, header buffer, sequence) and a single object shared by every thread let one
+        // pass see - and print - the state of another one: measured 2026-10-28, thread 2 seq 15207 reported
+        // 52,630,528, the size of thread 1 seq 19775, and the 60024 gate then judged the middle of a file as
+        // its end. Indexed by redo thread (1..threads); slot 0 is unused.
+        std::vector<Reader*> archReaders;
+        [[nodiscard]] Reader* archReaderFor(uint16_t thread);
         std::string lastCheckedDay;
         // Archived redo logs waiting to be parsed. The next one is selected on demand by the SCN still to be
         // parsed (see bestArchiveIndex) instead of by (thread, sequence): with several redo threads the

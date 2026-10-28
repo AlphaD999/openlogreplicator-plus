@@ -175,12 +175,28 @@ namespace OpenLogReplicator {
             delete reader;
         }
 
-        archReader = nullptr;
+        for (Reader* reader : archReaders) {
+            if (reader != nullptr) {
+                ctx->finishThread(reader);
+                delete reader;
+            }
+        }
+        archReaders.clear();
         readers.clear();
     }
 
+    Reader* Replicator::archReaderFor(uint16_t thread) {
+        // Lazily created, so the number of redo threads does not have to be known here: the first archive of a
+        // thread creates its reader, and every later pass of that thread reuses it (that is what keeps the
+        // reader's state - open handle, window, sequence - belonging to one thread only).
+        if (thread >= archReaders.size())
+            archReaders.resize(thread + 1, nullptr);
+        if (archReaders[thread] == nullptr)
+            archReaders[thread] = readerCreate(0);
+        return archReaders[thread];
+    }
+
     void Replicator::loadDatabaseMetadata() {
-        archReader = readerCreate(0);
     }
 
     void Replicator::positionReader() {
@@ -1060,6 +1076,9 @@ namespace OpenLogReplicator {
                 ctx->parserWaitingForArchive.store(false, std::memory_order_relaxed);
                 if (metadata->commitSorter != nullptr)
                     metadata->commitSorter->threadReopened(parser->thread);
+                // One reader per redo thread: it owns the state of the archive it has open (handle, window,
+                // sequence, sizes), so the pass of one thread can no longer see or print the state of another.
+                Reader* const archReader = archReaderFor(parser->thread);
                 parser->reader = archReader;
 
                 // The archive's sequence is known from the list this parser came from: hand it to the reader
@@ -1089,8 +1108,43 @@ namespace OpenLogReplicator {
                     contextSet(CONTEXT::CPU);
                 }
 
+                // L4: continue on the same handle when the previous pass of this very archive stopped at a
+                // slice point (see Reader::resumeAt). Re-opening the file is what handed the reader a
+                // CHECK/UPDATE request while it was parked in its buffer-full wait - the cycle of
+                // 2026-10-27/28 - and it costs a close, an open, a stat and a re-read of the header block on
+                // every slice. The reader must be SLEEPING (nothing is inside its read loop), the pass must
+                // have ended with STOPPED and the archive identity must match; otherwise the old path runs.
+                bool resumedInPlace = false;
+                const uint64_t resumeOffset = archReader->sliceResumeOffset;
+                // Slice resume is DISABLED (2026-10-28): the first implementation let the pass of one redo
+                // thread consume the position recorded by another - one archReader serves every thread of the
+                // instance - and positioned thread 2's archive at thread 1's offset: both passes then reported
+                // 60024 while the other archive's size was still in place (rig, 20 resumes, 4 x 60024). It
+                // needs a per-thread resume record and a run of its own before it can be switched on; the
+                // reopening path below stays the proven one.
+                static constexpr bool sliceResumeEnabled = false;
+                if (sliceResumeEnabled && resumeOffset != 0 && !archReader->resumeBlocked &&
+                    archReader->sliceResumeSeq == parser->sequence.getData() &&
+                    archReader->parkForResume(2000000)) {
+                    archReader->sliceResumeOffset = 0;
+                    archReader->sliceResumeSeq = 0;
+                    archReader->resumeAt(resumeOffset);
+                    archReader->setArchiveSequence(parser->sequence);
+                    resumedInPlace = true;
+                    ctx->info(0, "archive " + parser->path + " - thread: " + std::to_string(parser->thread) +
+                              ", seq: " + parser->sequence.toString() + " - continuing on the open handle at: " +
+                              std::to_string(resumeOffset) + " (the handle is not closed and the header is not "
+                              "read again, \"slice-resume\")");
+                } else {
+                    archReader->sliceResumeOffset = 0;
+                    archReader->sliceResumeSeq = 0;
+                }
+
                 while (true) {
                     if (ctx->softShutdown)
+                        break;
+                    // Already positioned on the open handle: nothing to open, nothing to re-read.
+                    if (resumedInPlace)
                         break;
                     if (archReader->checkRedoLog() && archReader->updateRedoLog()) {
                         // Opening the file re-reads the archive list (checkRedoLog/updateRedoLog): hand the
@@ -1158,6 +1212,10 @@ namespace OpenLogReplicator {
                 // (and with it the transaction memory held by the commit sorter) small.
                 if (parser->slicePending) {
                     parser->slicePending = false;
+                    // L4: the next pass of this archive continues on this very handle (see Reader::resumeAt).
+                    // The position reported as "sliced" is exactly where the parser stopped.
+                    archReader->sliceResumeOffset = archReader->getBufferStart().getFileOffset();
+                    archReader->sliceResumeSeq = parser->sequence.getData();
                     // No archiveQueued() check here, and none is wanted: this is the very Parser that was just taken
                     // out of the queue (it was sliced and its position was saved), put back for its resume. The
                     // check exists for an archive a *new* list read hands out again while it is still waiting -

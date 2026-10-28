@@ -107,12 +107,30 @@ namespace OpenLogReplicator {
         // block, because the wait is one tick per pass through the read loop now - a local counter would be
         // reset on every pass and the warning would only ever be produced on the first tick.
         uint64_t bufferFullTicks{0};
+        // The file size and the filesystem size as the reader thread last set them, published as atomics: the
+        // parser thread prints them too, and a torn or stale read is what made a 60024 of one thread's archive
+        // report the size of another thread's archive (measured 2026-10-28: thread 2 seq 15207 reporting
+        // 52,630,528 = thread 1 seq 19775). Atomics and not a lock: several of the readers are already inside
+        // Reader::mtx, so taking a second mutex there would be a lock-order hazard.
+        std::atomic<uint64_t> fileSizePublished{0};
+        std::atomic<uint64_t> fileSizeStatPublished{0};
         // Handshake bound (see Ctx::handshakeTimeoutUs): when the wait for the reader to serve
         // checkRedoLog/updateRedoLog started, when 60067 was last written and how many times the handshake has
         // been forced back to sleeping since it last worked. All three are touched only by the parser thread.
         uint64_t handshakeSinceUs{0};
         uint64_t handshakeLastWarnUs{0};
         uint32_t handshakeResets{0};
+        // Warning 60024: a block that belongs to another archive. At the end of a file that is how the file
+        // ends (an ASM extent handed to another archive, 60052 family) - but in the middle it means the bytes
+        // came from somewhere else (the read buffers are shared by every reader, and an archive that is still
+        // being written has been read before). Treating that as the end skips the rest of the archive in
+        // silence, so the pass stops and comes back instead - unless the same spot keeps failing, which is
+        // given up on with a message that says so. Touched only by the reader thread.
+        static constexpr uint64_t SEQUENCE_ERROR_SLACK{1024 * 1024};
+        static constexpr uint32_t SEQUENCE_ERROR_MAX{3};
+        uint64_t sequenceErrorOffset{0};
+        Seq sequenceErrorSeq{Seq::zero()};
+        uint32_t sequenceErrorCount{0};
         uint lastRead{0};
         time_ut lastReadTime{0};
         time_ut readTime{0};
@@ -224,6 +242,31 @@ namespace OpenLogReplicator {
         [[nodiscard]] uint64_t getSumRead() const;
         [[nodiscard]] uint64_t getSumTime() const;
         [[nodiscard]] uint16_t getThread() const;
+        // True when the reader is parked (nothing is inside its read loop), which is the precondition of
+        // resumeAt(); STATUS itself stays protected - the scheduler has no business switching states.
+        [[nodiscard]] bool isSleeping() const;
+
+        // ---- slice resume on the same handle (L4) ---------------------------------------------------------
+        // The position the last slice of this archive stopped at (0 = none). The scheduler stores it right
+        // before it queues the parser again and resumeAt() consumes it on the next pass: continuing on the
+        // same file handle instead of closing and opening the archive keeps a slice out of the
+        // checkRedoLog/updateRedoLog handshake - the request that deadlocked the two threads on 2026-10-27/28
+        // - and spares the open/stat/re-read-header of every slice.
+        std::atomic<uint64_t> sliceResumeOffset{0};
+        // The sequence that offset belongs to. One archReader serves every redo thread of the instance, so a
+        // resume recorded for thread 1 must not be taken by the pass of thread 2 - measured on the rig: without
+        // this check thread 2's archive was positioned at thread 1's offset and both passes reported 60024.
+        std::atomic<uint32_t> sliceResumeSeq{0};
+        // Set when the first block after a resume could not be attributed to this archive (60024 / CRC): the
+        // next pass has to reopen the file instead of resuming again, so a resume that keeps landing on a bad
+        // position can not spin forever.
+        std::atomic<bool> resumeBlocked{false};
+        void resumeAt(uint64_t offset);
+        // Asks the reader to park *without* a CHECK request (which would close and open the archive): the read
+        // loop leaves on its own because its condition includes status == READ. Returns false when the reader
+        // is not reading (already parked, or being served elsewhere) or did not park in time - the caller then
+        // falls back to the reopening path.
+        bool parkForResume(uint64_t timeoutUs);
 
         void setRet(REDO_CODE newRet);
         void setBufferStartEnd(FileOffset newBufferStart, FileOffset newBufferEnd);
