@@ -245,6 +245,9 @@ namespace OpenLogReplicator {
         // True when the reader is parked (nothing is inside its read loop), which is the precondition of
         // resumeAt(); STATUS itself stays protected - the scheduler has no business switching states.
         [[nodiscard]] bool isSleeping() const;
+        // The published size, rendered for a message: 0 means "the file was not stat'ed yet" (a 60024 on the
+        // header block is emitted before redoOpen), which must not be printed as a 0-byte archive.
+        [[nodiscard]] std::string fileSizeText() const;
 
         // ---- slice resume on the same handle (L4) ---------------------------------------------------------
         // The position the last slice of this archive stopped at (0 = none). The scheduler stores it right

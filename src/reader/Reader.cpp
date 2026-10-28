@@ -145,7 +145,7 @@ namespace OpenLogReplicator {
                 ctx->warning(60024, "file: " + fileName + " - the sequence of this archive is not known (block: " +
                              std::to_string(blockNumber) + ", offset: " +
                              std::to_string(static_cast<uint64_t>(blockNumber) * blockSize) + " of size: " +
-                             std::to_string(fileSizePublished.load()) + ", block header says: " + sequenceHeader.toString() +
+                             fileSizeText() + ", block header says: " + sequenceHeader.toString() +
                              ") - refusing to read a data block that can not be attributed to an archive");
                 return REDO_CODE::ERROR_SEQUENCE;
             }
@@ -155,7 +155,7 @@ namespace OpenLogReplicator {
                 ctx->warning(60024, "file: " + fileName + " - invalid header sequence, found: " + sequenceHeader.toString() +
                              ", expected: " + expectedSequence.toString() + ", offset: " +
                              std::to_string(static_cast<uint64_t>(blockNumber) * blockSize) + " of size: " +
-                             std::to_string(fileSizePublished.load()) + " (the tail of the file is the normal case, the middle is "
+                             fileSizeText() + " (the tail of the file is the normal case, the middle is "
                              "a block of another archive in a shared read buffer)");
                 return REDO_CODE::ERROR_SEQUENCE;
             }
@@ -517,7 +517,9 @@ namespace OpenLogReplicator {
                 const uint64_t pubSize = fileSizePublished.load();
                 const uint64_t pubStat = fileSizeStatPublished.load();
                 const uint64_t gateSize = pubSize > pubStat ? pubSize : pubStat;
-                const bool nearEnd = gateSize != 0 && bufferScan + SEQUENCE_ERROR_SLACK >= gateSize;
+                // gateSize == 0 means the file was not stat'ed yet (this message comes from the header block,
+                // before redoOpen): keep the historical behaviour instead of stopping on a size nobody measured.
+                const bool nearEnd = gateSize == 0 || bufferScan + SEQUENCE_ERROR_SLACK >= gateSize;
                 // Diagnostic (info, one line per event, kept on purpose): the two sizes and the value the gate
                 // compares against - the only place that shows why a 60024 was taken as the end of the archive
                 // or as a foreign block in the middle of it.
@@ -654,7 +656,8 @@ namespace OpenLogReplicator {
             const uint64_t pubSize = fileSizePublished.load();
             const uint64_t pubStat = fileSizeStatPublished.load();
             const uint64_t gateSize = pubSize > pubStat ? pubSize : pubStat;
-            const bool nearEnd = gateSize != 0 && bufferScan + SEQUENCE_ERROR_SLACK >= gateSize;
+            // gateSize == 0: not stat'ed yet, keep the historical behaviour (see the goodBlocks == 0 branch).
+            const bool nearEnd = gateSize == 0 || bufferScan + SEQUENCE_ERROR_SLACK >= gateSize;
             // Diagnostic (info, one line per event, kept on purpose): the two sizes and the value the gate
             // actually compares against - see the note in the goodBlocks == 0 branch above.
             ctx->info(0, "60024 gate: scan: " + std::to_string(bufferScan) + " fileSize: " +
@@ -1468,6 +1471,13 @@ namespace OpenLogReplicator {
     void Reader::setFileName(const std::string& newFileName) {
         std::unique_lock const lck(fileNameMtx);
         fileNameSafe = newFileName;
+        // The sizes belong to the file that was open, and that file is about to be replaced: leaving them in
+        // place is what made a 60024 of the next archive report the previous one's size (measured 2026-10-28:
+        // 15207 reporting 52,630,528 while DISK trace showed its own stat as 4,484,096 - the message is emitted
+        // while the header block of the new archive is checked, before redoOpen() has stat'ed it). 0 means
+        // "not opened yet" and is rendered as such.
+        fileSizePublished = 0;
+        fileSizeStatPublished = 0;
     }
 
     std::string Reader::fileNameForDiagnostics() const {
@@ -1498,6 +1508,11 @@ namespace OpenLogReplicator {
 
     bool Reader::isSleeping() const {
         return status.load() == STATUS::SLEEPING;
+    }
+
+    std::string Reader::fileSizeText() const {
+        const uint64_t sz = fileSizePublished.load();
+        return sz == 0 ? std::string("unknown (the file is not opened yet)") : std::to_string(sz);
     }
 
     bool Reader::parkForResume(uint64_t timeoutUs) {
