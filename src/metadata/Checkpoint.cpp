@@ -136,21 +136,40 @@ namespace OpenLogReplicator {
             const rapidjson::Value& sourceJson = Ctx::getJsonFieldO(configFileName, sourceArrayJson, "source", j);
 
             if (!metadata->ctx->isDisableChecksSet(Ctx::DISABLE_CHECKS::JSON_TAGS)) {
+                // Kept in step with the list in OpenLogReplicator.cpp: a configuration that is reloaded by the
+                // checkpoint thread is checked against this copy, so a key that only exists in the main table
+                // makes a reload fail with 20003 even though the startup pass accepted it.
                 static const std::vector<std::string> sourceNames{
                     "alias",
                     "arch",
                     "arch-read-sleep-us",
                     "arch-read-tries",
+                    "arch-wait-warn-us",
+                    "watchdog-us",
+                    "handshake-timeout-us",
                     "debug",
                     "filter",
                     "flags",
                     "format",
+                    "idle-thread-release-us",
+                    "min-trans-rewind-max-archives",
+                    "debug-hold-scn",
+                    "debug-handshake-hold-us",
+                    "memory",
+                    "pending-commits-per-thread",
+                    "stall-yield-us",
                     "name",
                     "reader",
                     "redo-read-sleep-us",
                     "redo-verify-delay-us",
                     "refresh-interval-us",
+                    "ddl-filter",
+                    "schema-change-topic",
                     "skip-unreadable-archive",
+                    "slice-pending-commits",
+                    "state",
+                    "thread-inactive-us",
+                    "topic-prefix",
                     "transaction-max-mb"
                 };
                 Ctx::checkJsonFields(configFileName, sourceJson, sourceNames);

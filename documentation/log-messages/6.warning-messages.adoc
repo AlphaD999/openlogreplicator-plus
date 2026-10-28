@@ -297,6 +297,30 @@ The warning is repeated while the condition persists (first after about 200 * `r
 replication is stalled - the redo log mentioned in the message is the place to look at. Before this warning
 existed such a stall produced no log message at all.
 
+Since 2026-10-28 a repeated occurrence with the **reader side text only** (no matching "the parser is waiting
+for the reader" line) is the signature of a handshake deadlock, not of a slow archive: the parser asked the
+reader for a state change (warning 60067 reports it at the same time) and the reader can not answer because it
+is parked in this very wait. Production 2026-10-27 and 2026-10-28 spent 6 and 9 hours in exactly that state.
+
+==== code 60067: "the parser is waiting for the reader to serve: <checkRedoLog|updateRedoLog> for: <number> s - the reader is not serving it (status: <status>, buffer: <number>-<number>, limit: <number>, size: <number>, file: <file name>, reader thread: <context>/<reason>) ..." / "forcing the parser/reader handshake back to sleeping after: <number> s in: <...> (reset: <number> of 2, "handshake-timeout-us") ..."
+
+The parser asked the reader to change state (`checkRedoLog`: open the archive again, `updateRedoLog`: re-read
+its header and reset the window) and the reader did not serve the request within `handshake-timeout-us` (in the
+`source` element, default 30 s, 0 = no bound). The two messages come in pairs: the first when the limit is
+reached (at most once a minute while the wait lasts), the second when four times the limit is reached and the
+handshake is **forced back to sleeping** - both condition variables are notified, so a reader parked anywhere
+(including the "read buffer full" wait) is released and can serve the next request. The archive is opened again
+and the saved position is kept, so nothing is lost; only when two forced resets do not help does the parser give
+the archive back to the scheduler, which retries the open and reports 10009/10074 as usual.
+
+The message carries what the attempt itself can not see: the reader status, its read window and limit, the size
+of the file, the file name and the context/reason of the reader thread. Look there first: `status=SLEEPING` with
+`reader thread: wait/READER_NO_WORK` means the reader never got the request, `status=READ` with a full window
+means it is waiting for the parser to consume - the two ends of a handshake cycle.
+
+This is the last line of defence behind warning 60055: it makes a stalled handshake visible after 30 s instead of
+after hours, and it recovers without a restart.
+
 ==== code 60047: "no archived redo log was read for: <number> s, but <number> committed transaction(s) still wait for the low-water-mark (scn: <number>, thread watermarks: <text>, archives in the list: <number>, skipped: <number>, parked: <number>)"
 
 Reported in archives-only mode when a pass over the archive list did not read anything while committed
@@ -315,6 +339,12 @@ parsed and how many are parked waiting for a missing predecessor.
 Only reported when the parser progress watchdog is enabled (`watchdog-us` in the `source` element, or the
 environment variable `OLR_WATCHDOG` in seconds - it wins). It is meant to be switched on when a run has to be
 diagnosed; with the default (off) it does not cost more than a predictable branch per redo block.
+
+Since 2026-10-28 the line ends with `reader: status=... buffer=...-... size=... waiting=... s file=...`, a
+snapshot the reader thread publishes on every state change and on every tick of its buffer-full wait. It names
+whom the parser waits for - read it before the `layers:` fields: a parser stuck in a handshake (60067) shows
+`status=SLEEPING` and a reader thread in `wait/READER_NO_WORK`, one waiting for the reader to consume shows
+`status=READ` with `buffer` exactly `limit` apart.
 
 _Progress is a position, not a call_: the parser publishes its position once per redo block, and until 2026-10-20
 every one of those calls refreshed the watchdog timer. A parser that walked in circles over the same blocks

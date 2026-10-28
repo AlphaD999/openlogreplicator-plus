@@ -173,7 +173,38 @@ namespace OpenLogReplicator {
         // built on it ("did not advance", "delivery: idle") keeps working.
         ss << ", layers:" << layersLine();
 
+        // Invariant C: whom the parser waits for. Pushed by the reader thread on every state change and on every
+        // tick of the buffer-full wait, read here under its own lock - Ctx never touches Reader::mtx.
+        {
+            std::unique_lock const lck(snapshotMtx);
+            if (readerSnapshot.valid) {
+                ss << ", reader: status=" << readerSnapshot.statusName
+                   << " buffer=" << readerSnapshot.bufferStart << "-" << readerSnapshot.bufferEnd
+                   << " size=" << readerSnapshot.fileSize;
+                if (readerSnapshot.waitingSinceUs != 0 && now > readerSnapshot.waitingSinceUs)
+                    ss << " waiting=" << ((now - readerSnapshot.waitingSinceUs) / 1000000) << " s";
+                ss << " file=" << readerSnapshot.fileName;
+            } else {
+                ss << ", reader: no snapshot published yet";
+            }
+        }
+
         warning(60055, ss.str());
+    }
+
+    void Ctx::setReaderSnapshot(const char* statusName, uint64_t bufferStart, uint64_t bufferEnd, uint64_t fileSize,
+                                const std::string& fileName, uint64_t waitingSinceUs) {
+        std::unique_lock const lck(snapshotMtx);
+        std::memset(readerSnapshot.statusName, 0, sizeof(readerSnapshot.statusName));
+        std::memset(readerSnapshot.fileName, 0, sizeof(readerSnapshot.fileName));
+        if (statusName != nullptr)
+            std::string(statusName).copy(readerSnapshot.statusName, sizeof(readerSnapshot.statusName) - 1);
+        fileName.copy(readerSnapshot.fileName, sizeof(readerSnapshot.fileName) - 1);
+        readerSnapshot.bufferStart = bufferStart;
+        readerSnapshot.bufferEnd = bufferEnd;
+        readerSnapshot.fileSize = fileSize;
+        readerSnapshot.waitingSinceUs = waitingSinceUs;
+        readerSnapshot.valid = true;
     }
 
     std::string Ctx::layersLine() const {

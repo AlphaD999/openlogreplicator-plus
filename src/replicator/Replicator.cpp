@@ -402,6 +402,7 @@ namespace OpenLogReplicator {
             for (const std::string& path: reader->paths) {
                 reader->fileName = path;
                 applyMapping(reader->fileName);
+                reader->setFileName(reader->fileName);
                 if (reader->checkRedoLog()) {
                     foundPath = true;
                     auto* parser = new Parser(ctx, builder, metadata, transactionBuffer,
@@ -1068,12 +1069,25 @@ namespace OpenLogReplicator {
                 // the range) and made a pass parse foreign bytes as its own records.
                 archReader->setArchiveSequence(parser->sequence);
 
+                // Two copies on purpose: the bare member is what the reader thread uses internally, the locked
+                // one is what the diagnostics and the 60055 snapshot read (see Reader::fileNameForDiagnostics).
                 archReader->fileName = parser->path;
+                archReader->setFileName(parser->path);
                 uint retry = ctx->archReadTries;
                 // Set when the archive is dropped instead of read (see 10074): the retry loop below breaks
                 // either on a successful open or on this flag, and the parser must not be parsed in the
                 // second case.
                 bool archiveSkipped = false;
+
+                // TEST HOOK ("source.debug-handshake-hold-us"): hand the reader a head start, so that it fills its
+                // read window and parks in the "buffer full" wait before checkRedoLog() asks it to change state.
+                // Without this a rig whose archives are tiny and whose storage is fast always lets the reader
+                // finish first, and the deadlock of 2026-10-27/28 can not be reproduced on demand.
+                if (ctx->debugHandshakeHoldUs > 0) {
+                    contextSet(CONTEXT::SLEEP);
+                    ctx->usleepInt(ctx->debugHandshakeHoldUs);
+                    contextSet(CONTEXT::CPU);
+                }
 
                 while (true) {
                     if (ctx->softShutdown)

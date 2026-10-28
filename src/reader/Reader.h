@@ -102,6 +102,17 @@ namespace OpenLogReplicator {
         uint64_t sumRead{0};
         uint64_t sumTime{0};
         uint64_t bufferScan{0};
+        // Ticks spent in the "read buffer full" wait since it last had room again: the throttle of warning
+        // 60046 (first report after 200 ticks, then every 1200). It lives in the object and not in the waiting
+        // block, because the wait is one tick per pass through the read loop now - a local counter would be
+        // reset on every pass and the warning would only ever be produced on the first tick.
+        uint64_t bufferFullTicks{0};
+        // Handshake bound (see Ctx::handshakeTimeoutUs): when the wait for the reader to serve
+        // checkRedoLog/updateRedoLog started, when 60067 was last written and how many times the handshake has
+        // been forced back to sleeping since it last worked. All three are touched only by the parser thread.
+        uint64_t handshakeSinceUs{0};
+        uint64_t handshakeLastWarnUs{0};
+        uint32_t handshakeResets{0};
         uint lastRead{0};
         time_ut lastReadTime{0};
         time_ut readTime{0};
@@ -134,6 +145,11 @@ namespace OpenLogReplicator {
         bool read1();
         bool read2();
         void mainLoop();
+        // Reports a handshake the reader does not serve (warning 60067) and, at four times the limit, forces
+        // the handshake back to sleeping so the reader can not stay parked in the buffer-full wait of mainLoop
+        // while the parser waits for it. Returns true when the caller has to give up and return false.
+        bool handshakeWait(std::unique_lock<std::mutex>& lck, const char* what);
+        static const char* statusName(STATUS value);
         // Is the end of this archive real? The sizes this reader knows can both be wrong: the one from stat
         // (a filesystem bridge answers a stale, too small value and fileSize is only ever raised, so the
         // wrong value sticks - measured 131072 for a 242688 byte archive) and the one from the redo header
@@ -152,6 +168,15 @@ namespace OpenLogReplicator {
         uint8_t** redoBufferList{nullptr};
         std::vector<std::string> paths;
         std::string fileName;
+        // A copy of fileName kept under its own lock: the parser thread assigns the name
+        // (Replicator::processArchivedRedoLogs) while the reader thread prints it in every diagnostic, and a
+        // std::string copied during an assignment is undefined behaviour - that is why 60046 used to name the
+        // previous archive. The diagnostics and the 60055 snapshot use this copy; the bare member stays for the
+        // code that runs on the reader thread only.
+        mutable std::mutex fileNameMtx;
+        std::string fileNameSafe;
+        void setFileName(const std::string& newFileName);
+        [[nodiscard]] std::string fileNameForDiagnostics() const;
 
         Reader(Ctx* newCtx, std::string newAlias, std::string newDatabase, int newGroup, bool newConfiguredBlockSum);
         ~Reader() override;

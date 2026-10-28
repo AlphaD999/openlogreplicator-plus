@@ -705,6 +705,9 @@ namespace OpenLogReplicator {
                     if (unlikely(ctx->isTraceSet(Ctx::TRACE::SLEEP)))
                         ctx->logTrace(Ctx::TRACE::SLEEP, "Reader:mainLoop:sleep");
                     contextSet(CONTEXT::WAIT, REASON::READER_NO_WORK);
+                    // Idle reader: publish it once per pass, so 60055 does not keep showing a stale window.
+                    ctx->setReaderSnapshot(statusName(status.load()), bufferStart, bufferEnd, fileSize,
+                                           fileNameForDiagnostics(), 0);
                     // An unbounded wait here can deadlock with the scheduler: when the parser ends up in
                     // Reader::updateRedoLog (which waits for this reader to re-check the archive) while this
                     // reader waits for the parser to wake it up, both wait forever and the replication stops
@@ -833,34 +836,52 @@ namespace OpenLogReplicator {
                         break;
                     }
 
-                    // Buffer full?
-                    if (bufferStart + ctx->bufferSizeMax == bufferEnd) {
+                    // Buffer full? Wait one tick and go straight back to the top of the read loop: the top
+                    // re-checks `status`, so a state request from the parser (CHECK/UPDATE, both set by
+                    // Reader::checkRedoLog/updateRedoLog) can never be missed here.
+                    //
+                    // The nested loop that used to sit here only ever waited for buffer space. That is exactly
+                    // what deadlocked production on 2026-10-27 and 2026-10-28: the parser called checkRedoLog()
+                    // (status = CHECK) and waited for this reader to serve it, while this reader sat in that
+                    // loop waiting for the parser to consume and free space - a cycle neither side could break,
+                    // for 6 and 9 hours, with no error in the log.
+                    //
+                    // ">=" and not "==": the window can be overrun (bufferStart reset by updateRedoLog, the
+                    // size revised by reloadHeader/refreshFileSize) and reading on would overwrite data the
+                    // parser has not consumed yet.
+                    if (bufferStart + ctx->bufferSizeMax <= bufferEnd) {
                         contextSet(CONTEXT::MUTEX, REASON::READER_FULL);
                         std::unique_lock lck(mtx);
-                        uint64_t fullIterations = 0;
-                        while (!ctx->softShutdown && bufferStart + ctx->bufferSizeMax == bufferEnd) {
+                        if (!ctx->softShutdown && status == STATUS::READ &&
+                            bufferStart + ctx->bufferSizeMax <= bufferEnd) {
                             if (unlikely(ctx->isTraceSet(Ctx::TRACE::SLEEP)))
                                 ctx->logTrace(Ctx::TRACE::SLEEP, "Reader:mainLoop:bufferFull");
+                            // Invariant C: publish what the reader is doing, so 60055 names the file, the window
+                            // and the state instead of only "locks held: none, delivery: idle".
+                            ctx->setReaderSnapshot(statusName(status.load()), bufferStart, bufferEnd, fileSize,
+                                                   fileNameForDiagnostics(), ctx->clock->getTimeUt());
                             contextSet(CONTEXT::WAIT, REASON::READER_BUFFER_FULL);
                             condBufferFull.wait_for(lck, std::chrono::microseconds(ctx->redoReadSleepUs));
-                            contextSet(CONTEXT::MUTEX, REASON::READER_FULL);
-                            ++fullIterations;
-                            // Never wait here in silence: if the parser does not release the read buffer
-                            // (for example when it waits in Reader::checkFinished for this very reader),
-                            // the whole replication stops without a single message in the log.
-                            if (fullIterations == 200 || (fullIterations % 1200) == 0)
-                                ctx->warning(60046, "file: " + fileName + " - the reader is waiting for free read buffer space for: " +
-                                             std::to_string(fullIterations * ctx->redoReadSleepUs / 1000000) + " s (buffer: " +
-                                             std::to_string(bufferStart) + "-" + std::to_string(bufferEnd) + ", limit: " +
-                                             std::to_string(ctx->bufferSizeMax) + ", size: " + std::to_string(fileSize) +
-                                             ", status: " + std::to_string(static_cast<int>(status.load())) + ", ret: " +
-                                             REDO_MSG[static_cast<uint>(ret.load())] + ")");
                         }
+                        contextSet(CONTEXT::MUTEX, REASON::READER_FULL);
+                        ++bufferFullTicks;
+                        // Never wait here in silence: if the parser does not release the read buffer
+                        // (for example when it waits in Reader::checkRedoLog for this very reader),
+                        // the whole replication stops without a single message in the log.
+                        if (bufferFullTicks == 200 || (bufferFullTicks % 1200) == 0)
+                            ctx->warning(60046, "file: " + fileNameForDiagnostics() + " - the reader is waiting for free read buffer space for: " +
+                                         std::to_string(bufferFullTicks * ctx->redoReadSleepUs / 1000000) + " s (buffer: " +
+                                         std::to_string(bufferStart) + "-" + std::to_string(bufferEnd) + ", limit: " +
+                                         std::to_string(ctx->bufferSizeMax) + ", size: " + std::to_string(fileSize) +
+                                         ", status: " + std::to_string(static_cast<int>(status.load())) + ", ret: " +
+                                         REDO_MSG[static_cast<uint>(ret.load())] + ")");
                         contextSet(CONTEXT::CPU);
                         if (ctx->softShutdown)
                             break;
                         continue;
                     }
+                    // Not waiting for space: the next full window starts a new throttle period.
+                    bufferFullTicks = 0;
 
                     if (bufferEnd < bufferScan)
                         if (!read2())
@@ -1322,6 +1343,80 @@ namespace OpenLogReplicator {
         bufferEnd = newBufferEnd.getData();
     }
 
+    void Reader::setFileName(const std::string& newFileName) {
+        std::unique_lock const lck(fileNameMtx);
+        fileNameSafe = newFileName;
+    }
+
+    std::string Reader::fileNameForDiagnostics() const {
+        std::unique_lock const lck(fileNameMtx);
+        return fileNameSafe;
+    }
+
+    const char* Reader::statusName(STATUS value) {
+        switch (value) {
+            case STATUS::SLEEPING:
+                return "SLEEPING";
+            case STATUS::CHECK:
+                return "CHECK";
+            case STATUS::UPDATE:
+                return "UPDATE";
+            case STATUS::READ:
+                return "READ";
+            default:
+                return "?";
+        }
+    }
+
+    bool Reader::handshakeWait(std::unique_lock<std::mutex>& lck, const char* what) {
+        // Invariant B: a handshake wait has a total bound, is reported while it lasts and is eventually broken
+        // from the inside. Only one tick is bounded by the wait_for at the call sites - the loop around it is
+        // not, and that is what held production for 6 and 9 hours.
+        (void) lck;
+        if (ctx->handshakeTimeoutUs == 0)
+            return false;
+        const uint64_t now = ctx->clock->getTimeUt();
+        if (handshakeSinceUs == 0) {
+            handshakeSinceUs = now;
+            return false;
+        }
+        const uint64_t waited = now > handshakeSinceUs ? now - handshakeSinceUs : 0;
+        if (waited < ctx->handshakeTimeoutUs)
+            return false;
+        if (handshakeLastWarnUs == 0 || (now > handshakeLastWarnUs && now - handshakeLastWarnUs >= 60000000)) {
+            handshakeLastWarnUs = now;
+            ctx->warning(60067, "the parser is waiting for the reader to serve: " + std::string(what) + " for: " +
+                         std::to_string(waited / 1000000) + " s - the reader is not serving it (status: " +
+                         statusName(status.load()) + ", buffer: " + std::to_string(bufferStart) + "-" +
+                         std::to_string(bufferEnd) + ", limit: " + std::to_string(ctx->bufferSizeMax) + ", size: " +
+                         std::to_string(fileSize) + ", file: " + fileName + ", reader thread: " +
+                         Thread::contextName(curContext) + "/" + Thread::reasonName(curReason) +
+                         ") - this is not a slow archive: the reader waits for the parser itself or is stuck; "
+                         "at: " + std::to_string((ctx->handshakeTimeoutUs * 4) / 1000000) +
+                         " s the handshake is forced back to sleeping (\"handshake-timeout-us\")");
+        }
+        if (waited < ctx->handshakeTimeoutUs * 4)
+            return false;
+        ++handshakeResets;
+        ctx->warning(60067, "forcing the parser/reader handshake back to sleeping after: " +
+                     std::to_string(waited / 1000000) + " s in: " + std::string(what) + " (reset: " +
+                     std::to_string(handshakeResets) + " of 2, \"handshake-timeout-us\") - the reader is "
+                     "released, the archive is opened again and the saved position is kept");
+        status = STATUS::SLEEPING;
+        condBufferFull.notify_all();
+        condReaderSleeping.notify_all();
+        condParserSleeping.notify_all();
+        handshakeSinceUs = 0;
+        handshakeLastWarnUs = 0;
+        if (handshakeResets >= 2) {
+            // Two forced resets did not help: give the archive back to the scheduler, which retries the open
+            // (Replicator::processArchivedRedoLogs) and, if it keeps failing, reports 10009/10074 there.
+            ret = REDO_CODE::STOPPED;
+            return true;
+        }
+        return false;
+    }
+
     bool Reader::checkRedoLog() {
         contextSet(CONTEXT::MUTEX, REASON::READER_CHECK_REDO);
         std::unique_lock lck(mtx);
@@ -1337,6 +1432,11 @@ namespace OpenLogReplicator {
         nextScn = Scn::none();
         condBufferFull.notify_all();
         condReaderSleeping.notify_all();
+        // Every request starts a new measurement: the fields are kept in the object so that a request spanning
+        // many ticks can be bounded, and without this reset a later request would inherit the age of the last
+        // one (measured: 60067 reported "1 s" immediately after a restart).
+        handshakeSinceUs = 0;
+        handshakeLastWarnUs = 0;
 
         while (status == STATUS::CHECK) {
             if (ctx->softShutdown)
@@ -1344,14 +1444,21 @@ namespace OpenLogReplicator {
             if (unlikely(ctx->isTraceSet(Ctx::TRACE::SLEEP)))
                 ctx->logTrace(Ctx::TRACE::SLEEP, "Reader:checkRedoLog");
             contextSet(CONTEXT::WAIT, REASON::READER_CHECK);
-            // Bounded: see the mainLoop sleep - this wait and the reader's sleep must never deadlock.
+            // Bounded *and* reported. The wait_for below bounds one tick, not the loop: until 2026-10-28 the
+            // loop had no bound at all, so a reader parked in the buffer-full wait of mainLoop (which did not
+            // look at `status` either) held the parser here for 6 and 9 hours in production.
             condParserSleeping.wait_for(lck, std::chrono::microseconds(ctx->redoReadSleepUs));
+            if (handshakeWait(lck, "checkRedoLog"))
+                return false;
         }
         contextSet(CONTEXT::CPU);
+        handshakeResets = 0;
         return (ret == REDO_CODE::OK);
     }
 
     bool Reader::updateRedoLog() {
+        handshakeSinceUs = 0;
+        handshakeLastWarnUs = 0;
         for (;;) {
             contextSet(CONTEXT::MUTEX, REASON::READER_UPDATE_REDO1);
             std::unique_lock lck(mtx);
@@ -1365,21 +1472,26 @@ namespace OpenLogReplicator {
                 if (unlikely(ctx->isTraceSet(Ctx::TRACE::SLEEP)))
                     ctx->logTrace(Ctx::TRACE::SLEEP, "Reader:updateRedoLog");
                 contextSet(CONTEXT::WAIT);
-                // Bounded for the same reason as the mainLoop sleep below: this wait and the reader's sleep
-                // must never deadlock each other. The timeout only matters when the reader thread went to
-                // sleep without a notification - a regular update still wakes it up immediately.
+                // Bounded and reported, same as checkRedoLog: wait_for bounds one tick, handshakeWait bounds
+                // the whole request and eventually forces the handshake back to sleeping.
                 condParserSleeping.wait_for(lck, std::chrono::microseconds(ctx->redoReadSleepUs));
                 contextSet(CONTEXT::MUTEX, REASON::READER_UPDATE_REDO2);
+                if (handshakeWait(lck, "updateRedoLog"))
+                    return false;
             }
 
             if (ret == REDO_CODE::EMPTY) {
                 contextSet(CONTEXT::WAIT, REASON::READER_EMPTY);
                 condParserSleeping.wait_for(lck, std::chrono::microseconds(ctx->redoReadSleepUs));
                 contextSet(CONTEXT::MUTEX, REASON::READER_UPDATE_REDO3);
+                // An archive that reports EMPTY is reopened forever by the for(;;) above - bound it too.
+                if (handshakeWait(lck, "updateRedoLog (archive empty)"))
+                    return false;
                 continue;
             }
 
             contextSet(CONTEXT::CPU);
+            handshakeResets = 0;
             return (ret == REDO_CODE::OK);
         }
     }

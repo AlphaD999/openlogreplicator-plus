@@ -541,6 +541,7 @@ namespace OpenLogReplicator {
                     "arch-read-tries",
                     "arch-wait-warn-us",
                     "watchdog-us",
+                    "handshake-timeout-us",
                     "debug",
                     "filter",
                     "flags",
@@ -548,6 +549,7 @@ namespace OpenLogReplicator {
                     "idle-thread-release-us",
                     "min-trans-rewind-max-archives",
                     "debug-hold-scn",
+                    "debug-handshake-hold-us",
                     "memory",
                     "pending-commits-per-thread",
                     "stall-yield-us",
@@ -1177,6 +1179,25 @@ namespace OpenLogReplicator {
             if (sourceJson.HasMember("watchdog-us"))
                 ctx->watchdogUs = Ctx::getJsonFieldU64(configFileName, sourceJson, "watchdog-us");
 
+            // How long the parser may wait for the reader to serve a handshake request (checkRedoLog /
+            // updateRedoLog) before it reports (warning 60067) and, at four times this value, forces the
+            // handshake back to sleeping and retries. 0 keeps the old, unbounded wait; anything below one
+            // second is rejected as a typo. The two fields of 60055 do not make this visible: they say where
+            // the parser stands, not whom it waits for.
+            if (sourceJson.HasMember("handshake-timeout-us")) {
+                ctx->handshakeTimeoutUs = Ctx::getJsonFieldU64(configFileName, sourceJson, "handshake-timeout-us");
+                if (ctx->handshakeTimeoutUs != 0 && ctx->handshakeTimeoutUs < 1000000)
+                    throw ConfigurationException(30001, "bad JSON, invalid \"handshake-timeout-us\" value: " +
+                                                 std::to_string(ctx->handshakeTimeoutUs) +
+                                                 ", expected: 0 (off) or at least: 1000000");
+            }
+            ctx->info(0, "parser/reader handshake: a request the reader does not serve for " +
+                      (ctx->handshakeTimeoutUs == 0
+                           ? std::string("any length of time is only reported, the wait stays unbounded (\"handshake-timeout-us\" = 0)")
+                           : std::to_string(ctx->handshakeTimeoutUs / 1000000) + " s is reported (60067) and at: " +
+                                 std::to_string((ctx->handshakeTimeoutUs * 4) / 1000000) +
+                                 " s it is forced back to sleeping and retried (\"handshake-timeout-us\")"));
+
             // An archive that cannot be opened after "arch-read-tries" attempts is fatal (10009) by default.
             // With 1, the archive is skipped instead: 10074 reports the thread and the sequence that are not
             // delivered and the process keeps reading the other archives (see Ctx::skipUnreadableArchive).
@@ -1244,6 +1265,20 @@ namespace OpenLogReplicator {
                                  std::to_string(ctx->debugHoldScn) + " (\"debug-hold-scn\") - every commit above it is "
                                  "buffered until the credit stops the parser; this is for reproducing a stalled redo "
                                  "thread, NEVER set it in a production configuration");
+            }
+
+            // TEST HOOK - not a production option: the parser sleeps here, right before the archive is handed to
+            // the reader (the same place for the first open and for the re-open after a slice). The reader thread
+            // keeps reading and fills its window in the meantime, so the checkRedoLog() that follows lands with
+            // the reader parked in the "buffer full" wait - the parser/reader handshake deadlock of 2026-10-27/28,
+            // reproduced on demand. Loud on purpose: a configuration that carries this line stalls the parse.
+            if (sourceJson.HasMember("debug-handshake-hold-us")) {
+                ctx->debugHandshakeHoldUs = Ctx::getJsonFieldU64(configFileName, sourceJson, "debug-handshake-hold-us");
+                if (ctx->debugHandshakeHoldUs > 0)
+                    ctx->warning(0, "TEST HOOK: the parser sleeps for: " + std::to_string(ctx->debugHandshakeHoldUs) +
+                                 " us before it hands an archive to the reader (\"debug-handshake-hold-us\") - the "
+                                 "reader fills its window meanwhile and the handshake deadlock is reproduced on "
+                                 "purpose; NEVER set it in a production configuration");
             }
 
             // How a redo thread that can not advance is left out of the low-water-mark of the commit sorter.

@@ -339,6 +339,24 @@ namespace OpenLogReplicator {
         std::atomic<uint16_t> watchdogThread{0};
         std::atomic<uint64_t> watchdogOffset{0};
         std::atomic<uint64_t> watchdogPending{0};
+    // Snapshot of what the reader of the current archive is doing, pushed by the reader thread and read by
+    // warning 60055 (invariant C): without it the stall report says where the parser stands but not whom it
+    // waits for - production 2026-10-27/28 spent 6 and 9 hours with "locks held: none, delivery: idle".
+    // Fixed-size fields only, under their own lock: Ctx must not depend on Reader, and the reader must not
+    // take Reader::mtx here (it already holds it when it publishes).
+    struct ReaderSnapshot {
+        bool valid{false};
+        char statusName[16]{0};
+        uint64_t bufferStart{0};
+        uint64_t bufferEnd{0};
+        uint64_t fileSize{0};
+        uint64_t waitingSinceUs{0};
+        char fileName[512]{0};
+    };
+    mutable std::mutex snapshotMtx;
+    ReaderSnapshot readerSnapshot;
+    void setReaderSnapshot(const char* statusName, uint64_t bufferStart, uint64_t bufferEnd, uint64_t fileSize,
+                           const std::string& fileName, uint64_t waitingSinceUs);
         // Called from the parse loop and from the places that wait for archives: an expected wait must not look
         // like a stall. Cheap enough to be called per redo block while the watchdog is enabled. (Defined in
         // Ctx.cpp: this header only forward declares Clock.)
@@ -366,12 +384,24 @@ namespace OpenLogReplicator {
         // through the mount - otherwise stops *all* parsing, because the parse loop is a single thread.
         // 0 disables it (every archive is parsed to its end, or to its next backpressure stop, in one pass).
         uint64_t stallYieldUs{5000000};
+        // How long the parser may wait for the reader to serve a handshake request (Reader::checkRedoLog /
+        // Reader::updateRedoLog) before it reports (warning 60067) and, at four times this value, forces the
+        // handshake back to SLEEPING and retries. 0 disables the bound (the old behaviour: wait forever).
+        // Production 2026-10-27/28 stalled for 6 and 9 hours on a handshake that nobody bounded.
+        uint64_t handshakeTimeoutUs{30000000};
         // TEST HOOK (\"source.debug-hold-scn\", 0 = off): pins the low-water-mark of the commit sorter at a fixed SCN, so
         // that every commit above it waits in the sorter - the shape of 2026-10-23 (one redo thread crawling while the
         // others produce) without needing an artificially slow archive, which no rig can produce. It is the only way
         // to exercise the credit (warning 60064) on purpose; the startup line says so in capitals and it must never
         // be set in a production configuration.
         uint64_t debugHoldScn{0};
+        // TEST HOOK ("source.debug-handshake-hold-us", 0 = off): the parser sleeps right before it hands an
+        // archive to the reader (Replicator::processArchivedRedoLogs, both for the first open and for the re-open
+        // after a slice). The reader thread keeps reading meanwhile and fills its window, so by the time the parser
+        // calls Reader::checkRedoLog the reader is sitting in the "buffer full" wait of Reader::mainLoop - exactly
+        // the state of the production stall of 2026-10-27/28. Used to reproduce the parser/reader handshake
+        // deadlock on purpose; NEVER set it in a production configuration.
+        uint64_t debugHandshakeHoldUs{0};
         // A redo thread that does not advance its parsed SCN for this many microseconds stops holding back
         // the low-water-mark, so the transaction memory kept by the other threads stays bounded while one
         // instance is idle (no log switches for hours). 0 = disabled (default): the strict global SCN order
