@@ -1116,13 +1116,13 @@ namespace OpenLogReplicator {
                 // have ended with STOPPED and the archive identity must match; otherwise the old path runs.
                 bool resumedInPlace = false;
                 const uint64_t resumeOffset = archReader->sliceResumeOffset;
-                // Slice resume is DISABLED (2026-10-28): the first implementation let the pass of one redo
-                // thread consume the position recorded by another - one archReader serves every thread of the
-                // instance - and positioned thread 2's archive at thread 1's offset: both passes then reported
-                // 60024 while the other archive's size was still in place (rig, 20 resumes, 4 x 60024). It
-                // needs a per-thread resume record and a run of its own before it can be switched on; the
-                // reopening path below stays the proven one.
-                static constexpr bool sliceResumeEnabled = false;
+                // Slice resume (L4): continue on the same handle instead of closing and opening the archive.
+                // The first implementation was switched off because one archReader served every redo thread and
+                // a pass of thread 2 consumed the position recorded by thread 1 (rig, 20 resumes, 4 x 60024 with
+                // the other archive's size). Each thread now has its own reader (Replicator::archReaderFor), so
+                // the position and the sequence it is tagged with belong to one thread by construction; the tag
+                // check below stays as the cheap second line of defence.
+                static constexpr bool sliceResumeEnabled = true;
                 if (sliceResumeEnabled && resumeOffset != 0 && !archReader->resumeBlocked &&
                     archReader->sliceResumeSeq == parser->sequence.getData() &&
                     archReader->parkForResume(2000000)) {
