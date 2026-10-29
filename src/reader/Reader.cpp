@@ -783,6 +783,16 @@ namespace OpenLogReplicator {
             const uint64_t redoBufferPos = (bufferEnd + numBlock * blockSize) % ctx->memoryChunkSize;
             const uint64_t redoBufferNum = ((bufferEnd + numBlock * blockSize) / ctx->memoryChunkSize) % ctx->memoryChunksReadBufferMax;
 
+            // read2 does not allocate: it reads through the chunks read1() handed over. The slot can still be
+            // empty here - another reader of this instance may have freed it when the pool ran dry - and the
+            // very next line dereferences the pointer. A missing chunk has to end the pass, not the process
+            // (the same shape as the crash 8fb662c fixed in read1, Reader.cpp:111).
+            if (unlikely(redoBufferList[redoBufferNum] == nullptr)) {
+                ctx->error(10016, "file: " + fileName + " - no read buffer chunk available at: " +
+                           std::to_string(bufferEnd) + " (read buffer pool exhausted, read2)");
+                ret = REDO_CODE::ERROR;
+                return false;
+            }
             const auto* const readTimeP = reinterpret_cast<const time_ut*>(redoBufferList[redoBufferNum] + redoBufferPos);
             if (*readTimeP + static_cast<time_ut>(ctx->redoVerifyDelayUs) < loopTime) {
                 ++goodBlocks;
@@ -1257,7 +1267,12 @@ namespace OpenLogReplicator {
             contextSet(CONTEXT::MUTEX, REASON::READER_ALLOCATE2);
             std::unique_lock const lck(mtx);
             redoBufferList[num] = buffer;
-            --ctx->bufferSizeFree;
+            // Only a chunk that was actually handed over counts as taken: getMemoryChunk returns nullptr when
+            // the pool has nothing, and decrementing anyway made bufferSizeFree drift downwards for good -
+            // every such miss brought the next 10016 closer (measured 2026-10-29: read-buffer-max-mb 4096,
+            // 3826 restart-rereads, then a null chunk inside checkBlockHeader).
+            if (likely(buffer != nullptr))
+                --ctx->bufferSizeFree;
         }
         contextSet(CONTEXT::CPU);
         // Buffer ownership diagnosis (TRACE::CHECKPOINT): the buffers are shared by every reader of this
