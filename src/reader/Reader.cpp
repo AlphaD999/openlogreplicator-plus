@@ -837,6 +837,36 @@ namespace OpenLogReplicator {
                 currentRet = reloadHeader();
 
             if (currentRet != REDO_CODE::OK) {
+                if ((currentRet == REDO_CODE::ERROR_SEQUENCE || currentRet == REDO_CODE::ERROR_BLOCK) && group == 0) {
+                    // Same convergence as read1's branches: a block that is not this archive's ends the
+                    // pass, and three passes on the same archive give up on the tail and say so. read2 used
+                    // to return the raw code here, and the caller has no case for ERROR_SEQUENCE/ERROR_BLOCK -
+                    // so the 40002 that production logged 5,251 times in a day did nothing at all (measured
+                    // 2026-10-29: the same injection that makes read1 print "60024 gate ... attempts: 1/2"
+                    // printed nothing here).
+                    resumeBlocked = true;
+                    if (sequenceErrorSeq == sequence) {
+                        ++sequenceErrorCount;
+                    } else {
+                        sequenceErrorSeq = sequence;
+                        sequenceErrorOffset = bufferScan;
+                        sequenceErrorCount = 1;
+                    }
+                    ctx->info(0, "40002/60024 gate read2: scan: " + std::to_string(bufferScan) + " of size: " +
+                              fileSizeText() + " attempts: " + std::to_string(sequenceErrorCount));
+                    if (sequenceErrorCount < SEQUENCE_ERROR_MAX) {
+                        ret = REDO_CODE::STOPPED;
+                        return false;
+                    }
+                    ctx->warning(60024, "file: " + fileName + " - giving up on the tail behind position: " +
+                                 std::to_string(bufferScan) + " of size: " + fileSizeText() +
+                                 " after: " + std::to_string(sequenceErrorCount) +
+                                 " attempts - the rest of this archive is NOT parsed");
+                    ret = REDO_CODE::FINISHED;
+                    if (nextScnHeader != Scn::none())
+                        nextScn = nextScnHeader;
+                    return false;
+                }
                 ret = currentRet;
                 return false;
             }
