@@ -271,6 +271,17 @@ namespace OpenLogReplicator {
         // position can not spin forever.
         std::atomic<bool> resumeBlocked{false};
         void resumeAt(uint64_t offset);
+        // Park handshake (parkForResume): parkSeq is raised by the caller that wants the read loop to leave,
+        // parkAckSeq is written by the reader thread itself once it is at the top of mainLoop with the state
+        // SLEEPING - the only moment in which nothing of this reader is inside read1/read2.
+        // Without the acknowledgement the caller only saw the value it had written itself, so it freed the read
+        // chunks while read1() was still inside redoRead(): the next checkBlockHeader() dereferenced nullptr
+        // (segfault at 0, Reader.cpp:111, production 2026-10-29).
+        std::atomic<uint64_t> parkSeq{0};
+        std::atomic<uint64_t> parkAckSeq{0};
+        [[nodiscard]] bool parkAcknowledged(uint64_t request) const {
+            return parkAckSeq.load(std::memory_order_acquire) >= request;
+        }
         // Asks the reader to park *without* a CHECK request (which would close and open the archive): the read
         // loop leaves on its own because its condition includes status == READ. Returns false when the reader
         // is not reading (already parked, or being served elsewhere) or did not park in time - the caller then

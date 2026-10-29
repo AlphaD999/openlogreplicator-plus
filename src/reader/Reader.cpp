@@ -449,6 +449,18 @@ namespace OpenLogReplicator {
         }
 
         bufferAllocate(redoBufferNum);
+        // The chunk can be missing: bufferAllocate leaves the slot empty when the pool has nothing to hand out
+        // (Ctx::getMemoryChunk returns nullptr). Dereferencing it here crashed the process with a null pointer
+        // inside checkBlockHeader (segfault at 0, Reader.cpp:111, 2026-10-29); a missing chunk has to end this
+        // pass with an error instead of taking the whole instance down. The pointer is taken once: re-reading the
+        // slot after the read would see a chunk another thread has already been handed.
+        uint8_t* const redoChunk = redoBufferList[redoBufferNum];
+        if (unlikely(redoChunk == nullptr)) {
+            ctx->error(10016, "file: " + fileName + " - no read buffer chunk available for: " + std::to_string(toRead) +
+                       " bytes at position: " + std::to_string(bufferScan) + " (read buffer pool exhausted, see \"read-buffer-max-mb\")");
+            ret = REDO_CODE::ERROR;
+            return false;
+        }
         // Buffer/read diagnosis (TRACE::CHECKPOINT). Which buffer this read fills, for which archive, from which
         // offset, how much the file was supposed to hold - and, in the second line below, whether this read
         // *adopted* the sequence from the block header instead of checking it against its own (see
@@ -464,7 +476,7 @@ namespace OpenLogReplicator {
         if (unlikely(ctx->isTraceSet(Ctx::TRACE::DISK)))
             ctx->logTrace(Ctx::TRACE::DISK, "reading#1 " + fileName + " at (" + std::to_string(bufferStart) + "/" +
                           std::to_string(bufferEnd) + "/" + std::to_string(bufferScan) + ") bytes: " + std::to_string(toRead));
-        const int actualRead = redoRead(redoBufferList[redoBufferNum] + redoBufferPos, bufferScan, toRead);
+        const int actualRead = redoRead(redoChunk + redoBufferPos, bufferScan, toRead);
 
         if (unlikely(ctx->isTraceSet(Ctx::TRACE::DISK)))
             ctx->logTrace(Ctx::TRACE::DISK, "reading#1 " + fileName + " at (" + std::to_string(bufferStart) + "/" +
@@ -478,7 +490,7 @@ namespace OpenLogReplicator {
             ctx->metrics->emitBytesRead(actualRead);
 
         if (actualRead > 0 && fileCopyDes != -1 && (ctx->redoVerifyDelayUs == 0 || group == 0)) {
-            const int bytesWritten = pwrite(fileCopyDes, redoBufferList[redoBufferNum] + redoBufferPos, actualRead, bufferEnd);
+            const int bytesWritten = pwrite(fileCopyDes, redoChunk + redoBufferPos, actualRead, bufferEnd);
             if (bytesWritten != actualRead) {
                 ctx->error(10007, "file: " + fileNameWrite + " - " + std::to_string(bytesWritten) + " bytes written instead of " +
                            std::to_string(actualRead) + ", code returned: " + strerror(errno));
@@ -494,7 +506,7 @@ namespace OpenLogReplicator {
 
         // Check which blocks are good
         for (typeBlk numBlock = 0; numBlock < maxNumBlock; ++numBlock) {
-            currentRet = checkBlockHeader(redoBufferList[redoBufferNum] + redoBufferPos + (numBlock * blockSize), bufferScanBlock + numBlock,
+            currentRet = checkBlockHeader(redoChunk + redoBufferPos + (numBlock * blockSize), bufferScanBlock + numBlock,
                                           ctx->redoVerifyDelayUs == 0 || group == 0);
             if (unlikely(ctx->isTraceSet(Ctx::TRACE::DISK)))
                 ctx->logTrace(Ctx::TRACE::DISK, "block: " + std::to_string(bufferScanBlock + numBlock) + " check: " +
@@ -904,6 +916,11 @@ namespace OpenLogReplicator {
                 condParserSleeping.notify_all();
 
                 if (status == STATUS::SLEEPING && !ctx->softShutdown) {
+                    // Acknowledge a park request (Reader::parkForResume) from inside the reader thread: at this
+                    // point the read loop of this pass is over and read1/read2 are not running, which is exactly
+                    // the precondition for the caller to move the window and free the chunks. Written before the
+                    // wait below, so the acknowledgement is published even when the reader is already parked.
+                    parkAckSeq.store(parkSeq.load(std::memory_order_acquire), std::memory_order_release);
                     if (unlikely(ctx->isTraceSet(Ctx::TRACE::SLEEP)))
                         ctx->logTrace(Ctx::TRACE::SLEEP, "Reader:mainLoop:sleep");
                     contextSet(CONTEXT::WAIT, REASON::READER_NO_WORK);
@@ -1606,19 +1623,32 @@ namespace OpenLogReplicator {
         // Ask the reader to park without a CHECK request: the top of the read loop tests status == READ, so
         // setting SLEEPING makes it leave the loop on its own and wait in the SLEEPING branch - which does not
         // close or open anything. CHECK (Reader::checkRedoLog) is exactly what must not be asked here.
+        uint64_t request;
         {
             std::unique_lock lck(mtx);
-            if (status != STATUS::READ) {
-                // Already parked, or a request is in flight: do not interfere.
-                return status == STATUS::SLEEPING;
+            if (status == STATUS::READ) {
+                request = parkSeq.fetch_add(1, std::memory_order_release) + 1;
+                status = STATUS::SLEEPING;
+                condBufferFull.notify_all();
+                condReaderSleeping.notify_all();
+                condParserSleeping.notify_all();
+            } else if (status == STATUS::SLEEPING) {
+                // Already parked, or a park request is still in flight: wait for the same acknowledgement below.
+                request = parkSeq.load(std::memory_order_acquire);
+            } else {
+                // A CHECK/UPDATE request is being served: do not interfere.
+                return false;
             }
-            status = STATUS::SLEEPING;
-            condBufferFull.notify_all();
-            condReaderSleeping.notify_all();
-            condParserSleeping.notify_all();
         }
+
+        // Wait for the *reader thread* to acknowledge that it left the read loop. Testing "status == SLEEPING"
+        // instead is what broke production on 2026-10-29: parkForResume had just written that value, so the check
+        // passed immediately while read1() was still inside redoRead() - resumeAt() then freed every read chunk
+        // under it, and the next checkBlockHeader() read through nullptr (segfault at 0, Reader.cpp:111).
         for (uint64_t waited = 0; waited < timeoutUs; waited += 1000) {
-            if (status.load() == STATUS::SLEEPING)
+            if (status.load() != STATUS::SLEEPING)
+                return false;   // the reader was handed another request: its window must not be touched
+            if (parkAcknowledged(request))
                 return true;
             ctx->usleepInt(1000);
         }
