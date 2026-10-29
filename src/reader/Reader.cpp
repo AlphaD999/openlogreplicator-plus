@@ -1,4 +1,4 @@
-/* Base class for process which is reading from redo log files
+﻿/* Base class for process which is reading from redo log files
    Copyright (C) 2018-2026 Adam Leszczynski (aleszczynski@bersler.com)
 
 This file is part of OpenLogReplicator.
@@ -514,7 +514,7 @@ namespace OpenLogReplicator {
             // of the previous owner of a reused file number). The tail keeps the historical behaviour; the
             // middle ends the pass so the archive is read again from the saved position, and the same archive
             // doing that three times means the spot is really unreadable - give up on the tail and say so.
-            if (currentRet == REDO_CODE::ERROR_SEQUENCE) {
+            if (currentRet == REDO_CODE::ERROR_SEQUENCE || currentRet == REDO_CODE::ERROR_BLOCK) {
                 // A resume that lands on a foreign block must not be tried again: the next pass reopens the
                 // archive (close/open/re-read header), the only path that can recover from a stale buffer or
                 // from a file that changed underneath.
@@ -584,6 +584,29 @@ namespace OpenLogReplicator {
             // (see archiveEndConfirmed) - if it is not the end, stop instead: the position is saved and the
             // archive is read again on the next scheduler pass.
             if (!archiveEndConfirmed(this)) {
+                // A pass that read no good block, whose end could not be confirmed either: the file holds
+                // redo at this position (60044) but it did not belong to this archive, or the read came back
+                // empty. Retry once, twice, and on the third give up on the tail and say so - the same shape
+                // as the 60024 convergence. Without the counter this looped forever: production 2026-10-29
+                // logged 7,043 x 60044 on the same archive, alternating "the rest of the file stays empty"
+                // and "the file holds redo data at this position".
+                if (sequenceErrorSeq == sequence) {
+                    ++sequenceErrorCount;
+                } else {
+                    sequenceErrorSeq = sequence;
+                    sequenceErrorOffset = bufferScan;
+                    sequenceErrorCount = 1;
+                }
+                ctx->info(0, "60044 gate: scan: " + std::to_string(bufferScan) + " of size: " +
+                          fileSizeText() + " attempts: " + std::to_string(sequenceErrorCount));
+                if (sequenceErrorCount >= SEQUENCE_ERROR_MAX) {
+                    ctx->warning(60044, "file: " + fileName + " - giving up on the tail behind position: " +
+                                 std::to_string(bufferScan) + " of size: " + fileSizeText() +
+                                 " after: " + std::to_string(sequenceErrorCount) +
+                                 " attempts - the rest of this archive is NOT parsed");
+                    ret = REDO_CODE::FINISHED;
+                    return false;
+                }
                 ret = REDO_CODE::STOPPED;
                 return false;
             }
@@ -673,7 +696,7 @@ namespace OpenLogReplicator {
         // written (measured on a rig archive: header said 2 MB, the file was 51 MB), and a gate that trusts the
         // smaller one declares every mid-file hit to be the tail. The filesystem size is the better witness;
         // take the larger of the two.
-        if (currentRet == REDO_CODE::ERROR_SEQUENCE && group == 0) {
+        if ((currentRet == REDO_CODE::ERROR_SEQUENCE || currentRet == REDO_CODE::ERROR_BLOCK) && group == 0) {
             resumeBlocked = true;
             const uint64_t pubSize = fileSizePublished.load();
             const uint64_t pubStat = fileSizeStatPublished.load();
