@@ -22,7 +22,6 @@ If not, see <http://www.gnu.org/licenses/>. */
 
 #include <algorithm>
 #include <cstring>
-#include <execinfo.h>   // one-off diagnostic: who calls checkBlockHeader for a 40002 (see the report there)
 #include <dirent.h>
 #include <fcntl.h>
 #include <thread>
@@ -177,17 +176,6 @@ namespace OpenLogReplicator {
             // stderr on purpose: this is a one-off diagnostic to find which call site reports 40002 (the OLR
             // log framework swallowed the info() variant - measured 2026-10-29: the code appeared three times
             // and neither read1's nor read2's marker appeared at all).
-            {
-                // One-off diagnostic: the call site is not knowable from the log otherwise (measured
-                // 2026-10-29: 40002 appeared with expected=3 while both read1's and read2's markers stayed
-                // silent). backtrace_symbols_fd prints "./OpenLogReplicator(+0xADDR)" - feed 0xADDR to
-                // `nm -C` to get the function name.
-                void* frames[16];
-                const int n = backtrace(frames, 16);
-                fprintf(stderr, "DIAG 40002 at checkBlockHeader: expected=%u got=%u frames=%d\n",
-                        static_cast<unsigned>(blockNumber), static_cast<unsigned>(blockNumberHeader), n);
-                backtrace_symbols_fd(frames, n, 2);
-            }
             ctx->error(40002, "file: " + fileName + " - invalid header block number: " + std::to_string(blockNumberHeader) +
                        ", expected: " + std::to_string(blockNumber));
             return REDO_CODE::ERROR_BLOCK;
@@ -521,12 +509,6 @@ namespace OpenLogReplicator {
                 // Diagnostic for the two codes that have a convergence path below: without it there is no way
                 // to tell from a production log which branch a 40002 took (measured 2026-10-29: the log showed
                 // the code three times and no gate line at all, so the branch could not be identified).
-                if (currentRet == REDO_CODE::ERROR_SEQUENCE || currentRet == REDO_CODE::ERROR_BLOCK ||
-                    currentRet == REDO_CODE::ERROR_READ)
-                    fprintf(stderr, "DIAG read1: group=%d ret=%u goodBlocks=%u scanBlock=%u numBlock=%u scan=%llu\n",
-                            static_cast<int>(group), static_cast<unsigned>(currentRet),
-                            static_cast<unsigned>(goodBlocks), static_cast<unsigned>(bufferScanBlock),
-                            static_cast<unsigned>(numBlock), static_cast<unsigned long long>(bufferScan));
                 break;
             }
             ++goodBlocks;
@@ -565,12 +547,12 @@ namespace OpenLogReplicator {
                 // Diagnostic (info, one line per event, kept on purpose): the two sizes and the value the gate
                 // compares against - the only place that shows why a 60024 was taken as the end of the archive
                 // or as a foreign block in the middle of it.
-                // stderr on purpose (one-off): the OLR log framework did not print the info() form of this
-                // line while the same code path printed the fprintf() diagnostic (measured 2026-10-29).
-                fprintf(stderr, "DIAG gate 503: scan=%llu size=%llu stat=%llu gate=%llu nearEnd=%d attempts=%u\n",
-                        static_cast<unsigned long long>(bufferScan), static_cast<unsigned long long>(pubSize),
-                        static_cast<unsigned long long>(pubStat), static_cast<unsigned long long>(gateSize),
-                        nearEnd ? 1 : 0, static_cast<unsigned>(sequenceErrorCount));
+                // One line per event, kept on purpose: the two sizes and the value the gate compares against -
+                // the only place that shows why a 60024 was taken as the tail or as a block of a neighbour.
+                ctx->info(0, "60024 gate: scan: " + std::to_string(bufferScan) + " fileSize: " +
+                          std::to_string(pubSize) + " fileSizeStat: " + std::to_string(pubStat) +
+                          " gateSize: " + std::to_string(gateSize) + " nearEnd: " + (nearEnd ? "yes" : "no") +
+                          " attempts: " + std::to_string(sequenceErrorCount));
                 if (nearEnd) {
                     // The tail of the archive: keep the historical behaviour, and take the next SCN from the
                     // block header as before. Not counted - this is how an archive normally ends.
@@ -736,12 +718,12 @@ namespace OpenLogReplicator {
                 sequenceErrorOffset = bufferScan;
                 sequenceErrorCount = 1;
             }
-            // stderr on purpose (one-off): see the note in the goodBlocks == 0 branch.
-            fprintf(stderr, "DIAG gate 595: scan=%llu size=%llu stat=%llu gate=%llu nearEnd=%d attempts=%u seqErr=%s seq=%s\n",
-                    static_cast<unsigned long long>(bufferScan), static_cast<unsigned long long>(pubSize),
-                    static_cast<unsigned long long>(pubStat), static_cast<unsigned long long>(gateSize),
-                    nearEnd ? 1 : 0, static_cast<unsigned>(sequenceErrorCount),
-                    sequenceErrorSeq.toString().c_str(), sequence.toString().c_str());
+            // One line per event, kept on purpose - see the note in the goodBlocks == 0 branch.
+            ctx->info(0, "60024 gate: scan: " + std::to_string(bufferScan) + " fileSize: " +
+                      std::to_string(pubSize) + " fileSizeStat: " + std::to_string(pubStat) +
+                      " gateSize: " + std::to_string(gateSize) + " nearEnd: " + (nearEnd ? "yes" : "no") +
+                      " attempts: " + std::to_string(sequenceErrorCount) +
+                      " seqErr: " + sequenceErrorSeq.toString() + " seq: " + sequence.toString());
             if (nearEnd) {
                 sequenceErrorCount = 0;
                 if (nextScnHeader != Scn::none()) {
@@ -858,12 +840,6 @@ namespace OpenLogReplicator {
                 if (currentRet != REDO_CODE::OK) {
                     // Same diagnostic as read1's loop: which branch a 40002 took is not visible from the log
                     // otherwise (see the note there).
-                    if (currentRet == REDO_CODE::ERROR_SEQUENCE || currentRet == REDO_CODE::ERROR_BLOCK ||
-                        currentRet == REDO_CODE::ERROR_READ)
-                        fprintf(stderr, "DIAG read2: group=%d ret=%u goodBlocks=%u endBlock=%u numBlock=%u scan=%llu\n",
-                                static_cast<int>(group), static_cast<unsigned>(currentRet),
-                                static_cast<unsigned>(goodBlocks), static_cast<unsigned>(bufferEndBlock),
-                                static_cast<unsigned>(numBlock), static_cast<unsigned long long>(bufferScan));
                     break;
                 }
                 ++goodBlocks;
