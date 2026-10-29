@@ -22,6 +22,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 
 #include <algorithm>
 #include <cstring>
+#include <execinfo.h>   // one-off diagnostic: who calls checkBlockHeader for a 40002 (see the report there)
 #include <dirent.h>
 #include <fcntl.h>
 #include <thread>
@@ -176,8 +177,17 @@ namespace OpenLogReplicator {
             // stderr on purpose: this is a one-off diagnostic to find which call site reports 40002 (the OLR
             // log framework swallowed the info() variant - measured 2026-10-29: the code appeared three times
             // and neither read1's nor read2's marker appeared at all).
-            fprintf(stderr, "DIAG 40002 at checkBlockHeader: expected=%u got=%u\n",
-                    static_cast<unsigned>(blockNumber), static_cast<unsigned>(blockNumberHeader));
+            {
+                // One-off diagnostic: the call site is not knowable from the log otherwise (measured
+                // 2026-10-29: 40002 appeared with expected=3 while both read1's and read2's markers stayed
+                // silent). backtrace_symbols_fd prints "./OpenLogReplicator(+0xADDR)" - feed 0xADDR to
+                // `nm -C` to get the function name.
+                void* frames[16];
+                const int n = backtrace(frames, 16);
+                fprintf(stderr, "DIAG 40002 at checkBlockHeader: expected=%u got=%u frames=%d\n",
+                        static_cast<unsigned>(blockNumber), static_cast<unsigned>(blockNumberHeader), n);
+                backtrace_symbols_fd(frames, n, 2);
+            }
             ctx->error(40002, "file: " + fileName + " - invalid header block number: " + std::to_string(blockNumberHeader) +
                        ", expected: " + std::to_string(blockNumber));
             return REDO_CODE::ERROR_BLOCK;
