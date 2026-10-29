@@ -1,4 +1,4 @@
-/* Thread reading database redo Logs using offline mode
+﻿/* Thread reading database redo Logs using offline mode
    Copyright (C) 2018-2026 Adam Leszczynski (aleszczynski@bersler.com)
 
 This file is part of OpenLogReplicator.
@@ -1047,11 +1047,11 @@ namespace OpenLogReplicator {
                                          "low-water-mark, its transactions can be delivered after transactions with a higher SCN, "
                                          "sleeping " + std::to_string(ctx->archReadSleepUs) + " us");
                         } else
-                            ctx->warning(60027, "couldn't find archive log for thread: " + std::to_string(parser->thread) +
+                            ctx->info(60027, "couldn't find archive log for thread: " + std::to_string(parser->thread) +
                                          " seq: " + expectedSequence.toString() + ", found: " + parser->sequence.toString() +
                                          ", sleeping " + std::to_string(ctx->archReadSleepUs) + " us");
                     } else {
-                        ctx->warning(60027, "couldn't find archive log for seq: " + expectedSequence.toString() + ", found: " +
+                        ctx->info(60027, "couldn't find archive log for seq: " + expectedSequence.toString() + ", found: " +
                                      parser->sequence.toString() + ", sleeping " + std::to_string(ctx->archReadSleepUs) + " us");
                     }
                     // Park the archive instead of blocking here: another redo thread may still be parseable and
