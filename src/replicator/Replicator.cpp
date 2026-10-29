@@ -1166,9 +1166,13 @@ namespace OpenLogReplicator {
                         // other archive of this thread keeps being read.
                         ctx->error(10009, "file: " + parser->path + " - failed to open after " +
                                    std::to_string(ctx->archReadTries) + " tries");
+                        // The gap is what a replay has to cover: without it "its redo is NOT delivered" says that
+                        // something is missing but not where to resume from (2026-10-29: 12 archives skipped and
+                        // no way to tell which SCN range each of them carried).
                         ctx->error(10074, "file: " + parser->path + " - thread: " + std::to_string(parser->thread) +
                                    ", seq: " + parser->sequence.toString() + " - archive skipped (\"skip-unreadable-archive\"), "
-                                   "its redo is NOT delivered; reading continues with the next archived redo log of this thread");
+                                   "its redo is NOT delivered; the gap is scn: " + parser->firstScn.toString() + " - " +
+                                   parser->nextScn.toString() + "; reading continues with the next archived redo log of this thread");
                         metadata->setNextSequence(parser->thread);
                         metadata->saveFileOffset(parser->thread, parser->sequence, FileOffset::zero());
                         delete parser;

@@ -152,11 +152,13 @@ namespace OpenLogReplicator {
             if (sequence != expectedSequence)
                 sequence = expectedSequence;
             if (sequenceHeader != expectedSequence) {
-                ctx->warning(60024, "file: " + fileName + " - invalid header sequence, found: " + sequenceHeader.toString() +
-                             ", expected: " + expectedSequence.toString() + ", offset: " +
-                             std::to_string(static_cast<uint64_t>(blockNumber) * blockSize) + " of size: " +
-                             fileSizeText() + " (the tail of the file is the normal case, the middle is "
-                             "a block of another archive in a shared read buffer)");
+                // Trace only: a single pass may skip many of these in a row, and a warning per block is what
+                // turned 3,704 events into a log flood on 2026-10-29. read1() reports the first one of a run
+                // (with the file name, offset and size) and stays quiet for the rest.
+                if (unlikely(ctx->isTraceSet(Ctx::TRACE::DISK)))
+                    ctx->logTrace(Ctx::TRACE::DISK, "block: " + std::to_string(blockNumber) +
+                                  " belongs to seq: " + sequenceHeader.toString() +
+                                  ", expected: " + expectedSequence.toString() + " (skipped)");
                 return REDO_CODE::ERROR_SEQUENCE;
             }
         } else {
@@ -495,6 +497,11 @@ namespace OpenLogReplicator {
                 ctx->logTrace(Ctx::TRACE::DISK, "block: " + std::to_string(bufferScanBlock + numBlock) + " check: " +
                               std::to_string(static_cast<uint>(currentRet)));
 
+            // 60024 is NOT handled here: redo records run across blocks, so a block that belongs to a
+            // neighbour can not simply be skipped - removing it corrupts every record behind it (the parser
+            // then decodes a neighbour's bytes as a length, 50053 "too big redo log record, size: 42281852"
+            // on the rig 2026-10-29). The pass ends and is read again; the convergence is counted per archive
+            // in the goodBlocks == 0 branch below.
             if (currentRet != REDO_CODE::OK)
                 break;
             ++goodBlocks;
@@ -502,11 +509,11 @@ namespace OpenLogReplicator {
 
         // Partial online redo log file
         if (goodBlocks == 0 && group == 0) {
-            // The very first block at this position belongs to another archive (60024). At the end of the file
-            // that is how an archive ends; in the middle it is a block of a neighbour that landed in a shared
-            // read buffer (measured 2026-10-26, two archives that read a third one that was still growing).
-            // archiveEndConfirmed() probes the file and would confirm the end all the same, so the position gate
-            // has to decide first - otherwise the rest of the archive is skipped in silence.
+            // 60024 at this position: either the tail of the archive (an ASM extent handed to a neighbour, the
+            // 60052 family) or a block of somebody else in the middle (a shared read buffer, or the extent map
+            // of the previous owner of a reused file number). The tail keeps the historical behaviour; the
+            // middle ends the pass so the archive is read again from the saved position, and the same archive
+            // doing that three times means the spot is really unreadable - give up on the tail and say so.
             if (currentRet == REDO_CODE::ERROR_SEQUENCE) {
                 // A resume that lands on a foreign block must not be tried again: the next pass reopens the
                 // archive (close/open/re-read header), the only path that can recover from a stale buffer or
@@ -517,9 +524,19 @@ namespace OpenLogReplicator {
                 const uint64_t pubSize = fileSizePublished.load();
                 const uint64_t pubStat = fileSizeStatPublished.load();
                 const uint64_t gateSize = pubSize > pubStat ? pubSize : pubStat;
-                // gateSize == 0 means the file was not stat'ed yet (this message comes from the header block,
-                // before redoOpen): keep the historical behaviour instead of stopping on a size nobody measured.
-                const bool nearEnd = gateSize == 0 || bufferScan + SEQUENCE_ERROR_SLACK >= gateSize;
+                // gateSize == 0 means the file was not stat'ed yet: treat it as the middle, not as the tail.
+                // Treated as the tail it ended the archive on its first block and said nothing - measured
+                // 2026-10-29: 3,704 such ends in 1.5 hours, each one dropping the rest of its archive.
+                const bool nearEnd = gateSize != 0 && bufferScan + SEQUENCE_ERROR_SLACK >= gateSize;
+                // Counted per archive, not per offset: the offset moves on every retry (the pass re-reads the
+                // good blocks in front of it first), so an offset-keyed counter never reached three.
+                if (sequenceErrorSeq == sequence) {
+                    ++sequenceErrorCount;
+                } else {
+                    sequenceErrorSeq = sequence;
+                    sequenceErrorOffset = bufferScan;
+                    sequenceErrorCount = 1;
+                }
                 // Diagnostic (info, one line per event, kept on purpose): the two sizes and the value the gate
                 // compares against - the only place that shows why a 60024 was taken as the end of the archive
                 // or as a foreign block in the middle of it.
@@ -527,32 +544,36 @@ namespace OpenLogReplicator {
                           std::to_string(pubSize) + " fileSizeStat: " + std::to_string(pubStat) +
                           " gateSize: " + std::to_string(gateSize) + " nearEnd: " + (nearEnd ? "yes" : "no") +
                           " attempts: " + std::to_string(sequenceErrorCount));
-                if (!nearEnd) {
-                    const bool sameSpot = sequenceErrorCount > 0 && sequenceErrorOffset == bufferScan &&
-                                          sequenceErrorSeq == sequence;
-                    if (sameSpot) {
-                        ++sequenceErrorCount;
-                    } else {
-                        sequenceErrorOffset = bufferScan;
-                        sequenceErrorSeq = sequence;
-                        sequenceErrorCount = 1;
-                    }
-                    if (sequenceErrorCount < SEQUENCE_ERROR_MAX) {
-                        // Middle of the archive: stop the pass (the position is kept by the caller) and read the
-                        // archive again next time.
-                        ret = REDO_CODE::STOPPED;
-                        return false;
-                    }
-                    // Persistent: give up on the tail instead of stopping forever, but say so.
-                    ctx->warning(60024, "file: " + fileName + " - giving up on the tail behind position: " +
-                                 std::to_string(bufferScan) + " of size: " + std::to_string(gateSize) +
-                                 " after: " + std::to_string(sequenceErrorCount) +
-                                 " attempts - the rest of this archive is NOT parsed");
-                    ret = REDO_CODE::FINISHED;
-                    if (nextScnHeader != Scn::none())
+                if (nearEnd) {
+                    // The tail of the archive: keep the historical behaviour, and take the next SCN from the
+                    // block header as before. Not counted - this is how an archive normally ends.
+                    sequenceErrorCount = 0;
+                    if (nextScnHeader != Scn::none()) {
+                        ret = REDO_CODE::FINISHED;
                         nextScn = nextScnHeader;
+                    } else {
+                        ctx->warning(60023, "file: " + fileName + " - position: " + std::to_string(bufferScan) + " - unexpected end of file");
+                        ret = REDO_CODE::STOPPED;
+                    }
                     return false;
                 }
+                if (sequenceErrorCount < SEQUENCE_ERROR_MAX) {
+                    // Middle of the archive: end this pass (the position is kept by the caller) and read the
+                    // archive again next time. Do NOT take nextScn from a block that is not ours - that would
+                    // carry another archive's SCN into this one's chain.
+                    ret = REDO_CODE::STOPPED;
+                    return false;
+                }
+                // The same archive failed the same way three times: give up on the tail instead of stopping
+                // forever, but say so - the old code did exactly this and said nothing.
+                ctx->warning(60024, "file: " + fileName + " - giving up on the tail behind position: " +
+                             std::to_string(bufferScan) + " of size: " + fileSizeText() +
+                             " after: " + std::to_string(sequenceErrorCount) +
+                             " attempts - the rest of this archive is NOT parsed");
+                ret = REDO_CODE::FINISHED;
+                if (nextScnHeader != Scn::none())
+                    nextScn = nextScnHeader;
+                return false;
             }
 
             // Not a single good block was found although the archive may still hold data at this position: a
@@ -646,27 +667,32 @@ namespace OpenLogReplicator {
         //
         // The end verification used for the size driven decisions (archiveEndConfirmed) is still not applied:
         // it reads a non-empty block as data that was skipped, which by construction is always the case here.
+        // Same decision as in the goodBlocks == 0 branch above, for the case where the pass read some blocks of
+        // this archive and then ran into one of a neighbour. The size to judge "is this the tail" by: fileSize
+        // can be the block count the redo header declares, which lags behind while an archive is still being
+        // written (measured on a rig archive: header said 2 MB, the file was 51 MB), and a gate that trusts the
+        // smaller one declares every mid-file hit to be the tail. The filesystem size is the better witness;
+        // take the larger of the two.
         if (currentRet == REDO_CODE::ERROR_SEQUENCE && group == 0) {
-            // The size to judge "is this the tail" by: fileSize can be the block count the redo header
-            // declares, which lags behind while an archive is still being written (measured on a rig archive:
-            // header said 2 MB, the file was 51 MB), and a gate that trusts the smaller one declares every
-            // mid-file hit to be the tail - exactly what this branch is here to prevent. The filesystem size
-            // (fileSizeStat) is the better witness; take the larger of the two.
-            // The published copies, not the members - see the note in the goodBlocks == 0 branch above.
+            resumeBlocked = true;
             const uint64_t pubSize = fileSizePublished.load();
             const uint64_t pubStat = fileSizeStatPublished.load();
             const uint64_t gateSize = pubSize > pubStat ? pubSize : pubStat;
-            // gateSize == 0: not stat'ed yet, keep the historical behaviour (see the goodBlocks == 0 branch).
-            const bool nearEnd = gateSize == 0 || bufferScan + SEQUENCE_ERROR_SLACK >= gateSize;
-            // Diagnostic (info, one line per event, kept on purpose): the two sizes and the value the gate
-            // actually compares against - see the note in the goodBlocks == 0 branch above.
+            const bool nearEnd = gateSize != 0 && bufferScan + SEQUENCE_ERROR_SLACK >= gateSize;
+            if (sequenceErrorSeq == sequence) {
+                ++sequenceErrorCount;
+            } else {
+                sequenceErrorSeq = sequence;
+                sequenceErrorOffset = bufferScan;
+                sequenceErrorCount = 1;
+            }
             ctx->info(0, "60024 gate: scan: " + std::to_string(bufferScan) + " fileSize: " +
                       std::to_string(pubSize) + " fileSizeStat: " + std::to_string(pubStat) +
                       " gateSize: " + std::to_string(gateSize) + " nearEnd: " + (nearEnd ? "yes" : "no") +
-                      " attempts: " + std::to_string(sequenceErrorCount));
+                      " attempts: " + std::to_string(sequenceErrorCount) +
+                      " seqErr: " + sequenceErrorSeq.toString() + " seq: " + sequence.toString());
             if (nearEnd) {
-                // The tail of the archive: keep the historical behaviour, and take the next SCN from the block
-                // header as before.
+                sequenceErrorCount = 0;
                 if (nextScnHeader != Scn::none()) {
                     ret = REDO_CODE::FINISHED;
                     nextScn = nextScnHeader;
@@ -674,46 +700,32 @@ namespace OpenLogReplicator {
                     ctx->warning(60023, "file: " + fileName + " - position: " + std::to_string(bufferScan) + " - unexpected end of file");
                     ret = REDO_CODE::STOPPED;
                 }
-            } else {
-                const bool sameSpot = sequenceErrorCount > 0 && sequenceErrorOffset == bufferScan &&
-                                      sequenceErrorSeq == sequence;
-                if (sameSpot) {
-                    ++sequenceErrorCount;
-                } else {
-                    sequenceErrorOffset = bufferScan;
-                    sequenceErrorSeq = sequence;
-                    sequenceErrorCount = 1;
-                }
-
-                if (sequenceErrorCount < SEQUENCE_ERROR_MAX) {
-                    // Middle of the archive: stop the pass (the position is kept by the caller) and read the
-                    // archive again next time. Do NOT take nextScn from a block that is not ours - that would
-                    // carry another archive's SCN into this one's chain. checkBlockHeader already said which
-                    // block it was (60024 with position/size), so no second line is printed here.
-                    ret = REDO_CODE::STOPPED;
-                } else {
-                    // The same spot failed the same way too often: give up on the tail instead of stopping
-                    // forever, but say so - the old code did exactly this and said nothing.
-                    ctx->warning(60024, "file: " + fileName + " - giving up on the tail behind position: " +
-                                 std::to_string(bufferScan) + " of size: " + std::to_string(fileSize) +
-                                 " after: " + std::to_string(sequenceErrorCount) +
-                                 " attempts - the rest of this archive is NOT parsed");
-                    ret = REDO_CODE::FINISHED;
-                    if (nextScnHeader != Scn::none())
-                        nextScn = nextScnHeader;
-                }
+                return false;
             }
+            if (sequenceErrorCount < SEQUENCE_ERROR_MAX) {
+                ret = REDO_CODE::STOPPED;
+                return false;
+            }
+            ctx->warning(60024, "file: " + fileName + " - giving up on the tail behind position: " +
+                         std::to_string(bufferScan) + " of size: " + fileSizeText() +
+                         " after: " + std::to_string(sequenceErrorCount) +
+                         " attempts - the rest of this archive is NOT parsed");
+            ret = REDO_CODE::FINISHED;
+            if (nextScnHeader != Scn::none())
+                nextScn = nextScnHeader;
             return false;
         }
 
-        // Only a pass that gets *past* the position where the last 60024 stopped clears the counter: a spot
-        // that keeps failing is a spot. Clearing it on every pass that merely re-reads the good blocks in front
-        // of that position kept the counter at 1 for hours (measured on the rig: "attempts: 0" on every pass),
-        // so "give up on the tail after three attempts" never fired and the archive was stopped forever.
-        if (sequenceErrorOffset != 0 && bufferScan > sequenceErrorOffset)
-            sequenceErrorCount = 0;
         // Blocks of this archive were read: a resume from here on is safe again.
         resumeBlocked = false;
+        // Only a pass that gets *past* the position where the last 60024 stopped clears the counter: a spot
+        // that keeps failing is a spot. Clearing it whenever a pass merely re-read the good blocks in front of
+        // that position kept the counter at 1 on every pass (measured 2026-10-29: "attempts: 1" repeated 100
+        // times), so "give up after three" never fired.
+        if (sequenceErrorOffset != 0 && bufferScan > sequenceErrorOffset) {
+            sequenceErrorCount = 0;
+            sequenceErrorSeq = Seq::zero();
+        }
         return true;
     }
 
@@ -1491,6 +1503,15 @@ namespace OpenLogReplicator {
         // is deliberately not touched: it is the identity every block is checked against (60024/50049), and
         // the caller has already verified that it matches the archive it is about to parse.
         const uint64_t aligned = blockSize != 0 ? offset - (offset % blockSize) : offset;
+
+        // Return the chunks of the old window before the window moves: updateRedoLog() does exactly this on
+        // every reopen, and leaving it out leaked one window per resume until the global pool ran dry
+        // (measured 2026-10-29 on production: memory HWM pinned at read-buffer-max-mb, sporadic 60046 and
+        // delivery falling behind with nothing else in the log). bufferFree() takes mtx itself, so this has to
+        // run before the unique_lock below - the same order updateRedoLog uses.
+        for (uint num = 0; num < ctx->memoryChunksReadBufferMax; ++num)
+            bufferFree(this, num);
+
         std::unique_lock lck(mtx);
         bufferStart = aligned;
         bufferEnd = aligned;

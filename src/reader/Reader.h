@@ -127,6 +127,12 @@ namespace OpenLogReplicator {
         // silence, so the pass stops and comes back instead - unless the same spot keeps failing, which is
         // given up on with a message that says so. Touched only by the reader thread.
         static constexpr uint64_t SEQUENCE_ERROR_SLACK{1024 * 1024};
+        // How many times the SAME archive may report 60024 before the tail behind it is given up on. Counted
+        // per archive (sequence), not per offset: the offset of the offending block moves on every retry (the
+        // pass re-reads the good blocks in front of it first), and an offset-keyed counter therefore never
+        // reached three - measured on the rig and in production (10,092 x 60024 in 6 hours, then 10074 on 12
+        // archives). Skipping the block instead is not an option either: redo records run across blocks, so
+        // removing one block corrupts every record behind it (50053 "too big redo log record").
         static constexpr uint32_t SEQUENCE_ERROR_MAX{3};
         uint64_t sequenceErrorOffset{0};
         Seq sequenceErrorSeq{Seq::zero()};
