@@ -502,8 +502,20 @@ namespace OpenLogReplicator {
             // then decodes a neighbour's bytes as a length, 50053 "too big redo log record, size: 42281852"
             // on the rig 2026-10-29). The pass ends and is read again; the convergence is counted per archive
             // in the goodBlocks == 0 branch below.
-            if (currentRet != REDO_CODE::OK)
+            if (currentRet != REDO_CODE::OK) {
+                // Diagnostic for the two codes that have a convergence path below: without it there is no way
+                // to tell from a production log which branch a 40002 took (measured 2026-10-29: the log showed
+                // the code three times and no gate line at all, so the branch could not be identified).
+                if (currentRet == REDO_CODE::ERROR_SEQUENCE || currentRet == REDO_CODE::ERROR_BLOCK ||
+                    currentRet == REDO_CODE::ERROR_READ)
+                    ctx->info(0, "read1 bad block: group: " + std::to_string(group) + " ret: " +
+                              std::to_string(static_cast<uint>(currentRet)) + " goodBlocks: " +
+                              std::to_string(goodBlocks) + " bufferScanBlock: " +
+                              std::to_string(bufferScanBlock) + " numBlock: " +
+                              std::to_string(numBlock) + " scan: " + std::to_string(bufferScan) +
+                              " size: " + fileSizeText());
                 break;
+            }
             ++goodBlocks;
         }
 
@@ -827,8 +839,19 @@ namespace OpenLogReplicator {
                     ctx->logTrace(Ctx::TRACE::DISK, "block: " + std::to_string(bufferEndBlock + numBlock) + " check: " +
                                   std::to_string(static_cast<uint>(currentRet)));
 
-                if (currentRet != REDO_CODE::OK)
+                if (currentRet != REDO_CODE::OK) {
+                    // Same diagnostic as read1's loop: which branch a 40002 took is not visible from the log
+                    // otherwise (see the note there).
+                    if (currentRet == REDO_CODE::ERROR_SEQUENCE || currentRet == REDO_CODE::ERROR_BLOCK ||
+                        currentRet == REDO_CODE::ERROR_READ)
+                        ctx->info(0, "read2 bad block: group: " + std::to_string(group) + " ret: " +
+                                  std::to_string(static_cast<uint>(currentRet)) + " goodBlocks: " +
+                                  std::to_string(goodBlocks) + " bufferEndBlock: " +
+                                  std::to_string(bufferEndBlock) + " numBlock: " +
+                                  std::to_string(numBlock) + " scan: " + std::to_string(bufferScan) +
+                                  " size: " + fileSizeText());
                     break;
+                }
                 ++goodBlocks;
             }
 
