@@ -555,10 +555,12 @@ namespace OpenLogReplicator {
                 // Diagnostic (info, one line per event, kept on purpose): the two sizes and the value the gate
                 // compares against - the only place that shows why a 60024 was taken as the end of the archive
                 // or as a foreign block in the middle of it.
-                ctx->info(0, "60024 gate: scan: " + std::to_string(bufferScan) + " fileSize: " +
-                          std::to_string(pubSize) + " fileSizeStat: " + std::to_string(pubStat) +
-                          " gateSize: " + std::to_string(gateSize) + " nearEnd: " + (nearEnd ? "yes" : "no") +
-                          " attempts: " + std::to_string(sequenceErrorCount));
+                // stderr on purpose (one-off): the OLR log framework did not print the info() form of this
+                // line while the same code path printed the fprintf() diagnostic (measured 2026-10-29).
+                fprintf(stderr, "DIAG gate 503: scan=%llu size=%llu stat=%llu gate=%llu nearEnd=%d attempts=%u\n",
+                        static_cast<unsigned long long>(bufferScan), static_cast<unsigned long long>(pubSize),
+                        static_cast<unsigned long long>(pubStat), static_cast<unsigned long long>(gateSize),
+                        nearEnd ? 1 : 0, static_cast<unsigned>(sequenceErrorCount));
                 if (nearEnd) {
                     // The tail of the archive: keep the historical behaviour, and take the next SCN from the
                     // block header as before. Not counted - this is how an archive normally ends.
@@ -724,11 +726,12 @@ namespace OpenLogReplicator {
                 sequenceErrorOffset = bufferScan;
                 sequenceErrorCount = 1;
             }
-            ctx->info(0, "60024 gate: scan: " + std::to_string(bufferScan) + " fileSize: " +
-                      std::to_string(pubSize) + " fileSizeStat: " + std::to_string(pubStat) +
-                      " gateSize: " + std::to_string(gateSize) + " nearEnd: " + (nearEnd ? "yes" : "no") +
-                      " attempts: " + std::to_string(sequenceErrorCount) +
-                      " seqErr: " + sequenceErrorSeq.toString() + " seq: " + sequence.toString());
+            // stderr on purpose (one-off): see the note in the goodBlocks == 0 branch.
+            fprintf(stderr, "DIAG gate 595: scan=%llu size=%llu stat=%llu gate=%llu nearEnd=%d attempts=%u seqErr=%s seq=%s\n",
+                    static_cast<unsigned long long>(bufferScan), static_cast<unsigned long long>(pubSize),
+                    static_cast<unsigned long long>(pubStat), static_cast<unsigned long long>(gateSize),
+                    nearEnd ? 1 : 0, static_cast<unsigned>(sequenceErrorCount),
+                    sequenceErrorSeq.toString().c_str(), sequence.toString().c_str());
             if (nearEnd) {
                 sequenceErrorCount = 0;
                 if (nextScnHeader != Scn::none()) {
