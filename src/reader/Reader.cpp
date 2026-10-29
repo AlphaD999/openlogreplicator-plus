@@ -173,6 +173,11 @@ namespace OpenLogReplicator {
         }
 
         if (blockNumberHeader != blockNumber) {
+            // stderr on purpose: this is a one-off diagnostic to find which call site reports 40002 (the OLR
+            // log framework swallowed the info() variant - measured 2026-10-29: the code appeared three times
+            // and neither read1's nor read2's marker appeared at all).
+            fprintf(stderr, "DIAG 40002 at checkBlockHeader: expected=%u got=%u\n",
+                    static_cast<unsigned>(blockNumber), static_cast<unsigned>(blockNumberHeader));
             ctx->error(40002, "file: " + fileName + " - invalid header block number: " + std::to_string(blockNumberHeader) +
                        ", expected: " + std::to_string(blockNumber));
             return REDO_CODE::ERROR_BLOCK;
@@ -508,12 +513,10 @@ namespace OpenLogReplicator {
                 // the code three times and no gate line at all, so the branch could not be identified).
                 if (currentRet == REDO_CODE::ERROR_SEQUENCE || currentRet == REDO_CODE::ERROR_BLOCK ||
                     currentRet == REDO_CODE::ERROR_READ)
-                    ctx->info(0, "read1 bad block: group: " + std::to_string(group) + " ret: " +
-                              std::to_string(static_cast<uint>(currentRet)) + " goodBlocks: " +
-                              std::to_string(goodBlocks) + " bufferScanBlock: " +
-                              std::to_string(bufferScanBlock) + " numBlock: " +
-                              std::to_string(numBlock) + " scan: " + std::to_string(bufferScan) +
-                              " size: " + fileSizeText());
+                    fprintf(stderr, "DIAG read1: group=%d ret=%u goodBlocks=%u scanBlock=%u numBlock=%u scan=%llu\n",
+                            static_cast<int>(group), static_cast<unsigned>(currentRet),
+                            static_cast<unsigned>(goodBlocks), static_cast<unsigned>(bufferScanBlock),
+                            static_cast<unsigned>(numBlock), static_cast<unsigned long long>(bufferScan));
                 break;
             }
             ++goodBlocks;
@@ -844,12 +847,10 @@ namespace OpenLogReplicator {
                     // otherwise (see the note there).
                     if (currentRet == REDO_CODE::ERROR_SEQUENCE || currentRet == REDO_CODE::ERROR_BLOCK ||
                         currentRet == REDO_CODE::ERROR_READ)
-                        ctx->info(0, "read2 bad block: group: " + std::to_string(group) + " ret: " +
-                                  std::to_string(static_cast<uint>(currentRet)) + " goodBlocks: " +
-                                  std::to_string(goodBlocks) + " bufferEndBlock: " +
-                                  std::to_string(bufferEndBlock) + " numBlock: " +
-                                  std::to_string(numBlock) + " scan: " + std::to_string(bufferScan) +
-                                  " size: " + fileSizeText());
+                        fprintf(stderr, "DIAG read2: group=%d ret=%u goodBlocks=%u endBlock=%u numBlock=%u scan=%llu\n",
+                                static_cast<int>(group), static_cast<unsigned>(currentRet),
+                                static_cast<unsigned>(goodBlocks), static_cast<unsigned>(bufferEndBlock),
+                                static_cast<unsigned>(numBlock), static_cast<unsigned long long>(bufferScan));
                     break;
                 }
                 ++goodBlocks;
