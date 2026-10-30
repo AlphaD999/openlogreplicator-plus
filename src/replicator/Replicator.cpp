@@ -1123,9 +1123,25 @@ namespace OpenLogReplicator {
                 // the position and the sequence it is tagged with belong to one thread by construction; the tag
                 // check below stays as the cheap second line of defence.
                 static constexpr bool sliceResumeEnabled = true;
-                if (sliceResumeEnabled && resumeOffset != 0 && !archReader->resumeBlocked &&
-                    archReader->sliceResumeSeq == parser->sequence.getData() &&
-                    archReader->parkForResume(2000000)) {
+                // A slice resume reuses the open handle, so it skips open()/lookup() - the only two places
+                // that notice a removed archive, and the only two that compare the file's creation date.
+                // Without this check the reader keeps answering from the extent map it took while the
+                // archive still existed, and those allocation units may already hold another file's data
+                // (measured on production 2026-10-30: slice-resume at 02:13:18, then 50053 "too big redo
+                // log record, size: 524300" on the very next line, which shut the instance down).
+                // stat() the path first: a removed archive fails here and takes the reopen path (10003),
+                // and a file of a different size takes it too (open() then compares creation dates).
+                bool resumable = resumeOffset != 0 && !archReader->resumeBlocked &&
+                                 archReader->sliceResumeSeq == parser->sequence.getData();
+                if (resumable) {
+                    struct stat resumeStat{};
+                    const uint64_t published = archReader->getPublishedFileSize();
+                    if (stat(parser->path.c_str(), &resumeStat) != 0 || published == 0 ||
+                        static_cast<uint64_t>(resumeStat.st_size) != published) {
+                        resumable = false;
+                    }
+                }
+                if (sliceResumeEnabled && resumable && archReader->parkForResume(2000000)) {
                     archReader->sliceResumeOffset = 0;
                     archReader->sliceResumeSeq = 0;
                     archReader->resumeAt(resumeOffset);

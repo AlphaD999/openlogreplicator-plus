@@ -261,6 +261,13 @@ namespace OpenLogReplicator {
         // same file handle instead of closing and opening the archive keeps a slice out of the
         // checkRedoLog/updateRedoLog handshake - the request that deadlocked the two threads on 2026-10-27/28
         // - and spares the open/stat/re-read-header of every slice.
+        // The size the reader last published for the file it has open, readable from the parser side.
+        // 0 means "no file opened yet" (see setFileName); the Replicator compares it with a fresh stat()
+        // before a slice resume, because that path reuses the handle and skips open()/lookup().
+        uint64_t getPublishedFileSize() const {
+            return fileSizePublished.load(std::memory_order_relaxed);
+        }
+
         std::atomic<uint64_t> sliceResumeOffset{0};
         // The sequence that offset belongs to. One archReader serves every redo thread of the instance, so a
         // resume recorded for thread 1 must not be taken by the pass of thread 2 - measured on the rig: without

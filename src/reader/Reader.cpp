@@ -1580,6 +1580,15 @@ namespace OpenLogReplicator {
 
     void Reader::setFileName(const std::string& newFileName) {
         std::unique_lock const lck(fileNameMtx);
+        // Same file and its size is already known: this is a slice resume (or a retry) of the archive that
+        // is still open, and the sizes below still describe it. Zeroing them here is what made every pass
+        // of a sliced archive report gateSize: 0 -> nearEnd: no -> STOPPED (measured on production
+        // 2026-10-30: 685 x "60024 gate ... fileSize: 0 fileSizeStat: 0 gateSize: 0 nearEnd: no" on
+        // thread 2, and the repeated STOPPED/re-read that followed). The clearing exists for a NEW
+        // archive, whose sizes must not be inherited from the previous one - that is the 2026-10-28
+        // incident the comment below describes.
+        if (fileNameSafe == newFileName && fileSizePublished.load(std::memory_order_relaxed) != 0)
+            return;
         fileNameSafe = newFileName;
         // The sizes belong to the file that was open, and that file is about to be replaced: leaving them in
         // place is what made a 60024 of the next archive report the previous one's size (measured 2026-10-28:
