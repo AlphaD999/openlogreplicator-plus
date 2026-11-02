@@ -184,6 +184,14 @@ namespace OpenLogReplicator {
         // that were parsed after the restart (silently incomplete, and on a RAC database the oldest transaction is
         // usually not the only one: production 2026-10-21 had 38 open transactions at shutdown).
         std::map<uint16_t, ThreadPos> minTrans;
+        // Format version of the checkpoint file: bumped whenever a key is added, removed or retyped. The rollout
+        // rule is a three-way decision - format changed: clear the state directory and start from the current scn;
+        // format unchanged and the outage was short: restore the checkpoint; format unchanged but the outage was
+        // long: clear the state directory too, so that the replay stays bounded. Both sides can read the value:
+        // this binary prints it (main.cpp "binary:" line) and every file carries it ("state-format").
+        // 2: per-thread positions, min-trans, delivered-scn. 3: delivered-scn-by-thread.
+        static constexpr uint64_t CHECKPOINT_FORMAT{3};
+
         // Highest commit SCN handed to the writer, written to the checkpoint file as "delivered-scn": after a
         // restart the rewind window (min-trans) is read again, and every commit at or below this SCN is dropped
         // instead of being delivered a second time (see DeliveryExecutor::commitCommon).
