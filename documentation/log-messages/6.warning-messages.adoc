@@ -47,10 +47,19 @@ Remediation: Verify source character set configuration and mapping; supply corre
 
 See comment for warning 60002.
 
-==== code 60010: "no match found for transaction rollback, skipping, SLT: <number>, USN: <number>"
+==== code 60010: "no match found for transaction rollback, skipping, SLT: <number>, USN: <number> - <number> transaction(s) dropped since the last report (expected when an archive is read again: the records of the transactions that were already delivered are not in it any more)"
 
 Rollback record could not be matched to an open transaction.
-Remediation: Usually benign if rollback started before replication; confirm retention window.
+
+Reported **at most once a minute**, with the count of the transactions dropped since the previous report; the
+SLT/USN are those of the last one. It fired once per transaction until 2026-11-02, and a run that reads an archive
+a second time (60058, or a restart that replays the rewind window) has thousands of them - production 2026-10-30
+wrote 2,338 lines in 13 seconds and 2,375 in the whole run, at exactly the moment the log is the only evidence
+left.
+
+Remediation: usually benign if the rollback started before replication began; confirm the retention window. A burst
+of them right after "the saved position of this pass ... is not the head of an lwn record" (60058) is the expected
+consequence of that archive being read again.
 
 ==== code 60011: "skipping transaction with no beginning: <details>"
 

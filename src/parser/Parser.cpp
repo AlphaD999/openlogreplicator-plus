@@ -743,9 +743,7 @@ namespace OpenLogReplicator {
             const XidMap xidMap = TransactionBuffer::makeXidMap(xid, redoLogRecord1->conId, redoLogRecord1->thread);
             auto brokenXidMapListIt = transactionBuffer->brokenXidMapList.find(xidMap);
             if (brokenXidMapListIt == transactionBuffer->brokenXidMapList.end()) {
-                ctx->warning(60010, "no match found for transaction rollback, skipping, SLT: " +
-                             std::to_string(static_cast<uint>(redoLogRecord1->slt)) + ", USN: " +
-                             std::to_string(static_cast<uint>(redoLogRecord1->usn)));
+                reportBrokenXid(redoLogRecord1->slt, redoLogRecord1->usn);
                 transactionBuffer->brokenXidMapList.insert(xidMap);
             }
             return;
@@ -1023,6 +1021,23 @@ namespace OpenLogReplicator {
         transaction->add(metadata, transactionBuffer, redoLogRecord1, redoLogRecord2);
     }
 
+    void Parser::reportBrokenXid(uint32_t slt, uint32_t usn) {
+        // Counted and reported once a minute: one line per broken transaction is right for a stray record and
+        // wrong for an archive that is read a second time, where thousands of transactions have no rollback record
+        // left to match (measured 2026-10-30: 2,338 lines in 13 seconds, 2,375 in the run) - at exactly the moment
+        // the log is the only evidence left.
+        ++brokenXidCount;
+        const uint64_t nowMs = ctx->getTimeMs();
+        if (brokenXidWarnMs != 0 && nowMs > brokenXidWarnMs && nowMs - brokenXidWarnMs < 60000)
+            return;
+        ctx->warning(60010, "no match found for transaction rollback, skipping, SLT: " + std::to_string(slt) +
+                     ", USN: " + std::to_string(usn) + " - " + std::to_string(brokenXidCount) +
+                     " transaction(s) dropped since the last report (expected when an archive is read again: the records "
+                     "of the transactions that were already delivered are not in it any more)");
+        brokenXidWarnMs = nowMs;
+        brokenXidCount = 0;
+    }
+
     void Parser::appendToTransactionRollback(RedoLogRecord* redoLogRecord1, RedoLogRecord* redoLogRecord2) {
         // Skip other PDB vectors
         if (metadata->conId > 0 && redoLogRecord1->conId != metadata->conId)
@@ -1035,9 +1050,7 @@ namespace OpenLogReplicator {
             const XidMap xidMap = TransactionBuffer::makeXidMap(xid, redoLogRecord2->conId, redoLogRecord1->thread);
             auto brokenXidMapListIt = transactionBuffer->brokenXidMapList.find(xidMap);
             if (brokenXidMapListIt == transactionBuffer->brokenXidMapList.end()) {
-                ctx->warning(60010, "no match found for transaction rollback, skipping, SLT: " +
-                             std::to_string(static_cast<uint>(redoLogRecord2->slt)) + ", USN: " +
-                             std::to_string(static_cast<uint>(redoLogRecord2->usn)));
+                reportBrokenXid(redoLogRecord2->slt, redoLogRecord2->usn);
                 transactionBuffer->brokenXidMapList.insert(xidMap);
             }
             return;

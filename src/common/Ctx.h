@@ -333,12 +333,16 @@ namespace OpenLogReplicator {
         // while the delivery kept running, so it was indistinguishable from an idle run (measured in
         // production: 1,020 s with zero parse progress and zero messages).
         uint64_t watchdogUs{0};
-        std::atomic<uint64_t> watchdogProgressUt{0};
+        // Per redo thread: where the parser was when it last moved, and when that was. One global slot was
+        // refreshed by whichever thread the parser happened to be on, so the report could name thread 3 while
+        // quoting thread 2's offset, and the elapsed time belonged to the last thread that had moved at all -
+        // production 2026-10-30 produced 790 reports and every single one of them said "no progress for: 0 s".
+        static constexpr uint16_t WATCHDOG_THREADS{16};
+        std::array<std::atomic<uint64_t>, WATCHDOG_THREADS> watchdogProgressUt{};
+        std::array<std::atomic<uint64_t>, WATCHDOG_THREADS> watchdogOffset{};
+        std::array<std::atomic<uint64_t>, WATCHDOG_THREADS> watchdogPending{};
         std::atomic<uint64_t> watchdogWarnUt{0};
         std::atomic<uint64_t> watchdogWarnCount{0};
-        std::atomic<uint16_t> watchdogThread{0};
-        std::atomic<uint64_t> watchdogOffset{0};
-        std::atomic<uint64_t> watchdogPending{0};
     // Snapshot of what the reader of the current archive is doing, pushed by the reader thread and read by
     // warning 60055 (invariant C): without it the stall report says where the parser stands but not whom it
     // waits for - production 2026-10-27/28 spent 6 and 9 hours with "locks held: none, delivery: idle".
@@ -1173,6 +1177,9 @@ namespace OpenLogReplicator {
         bool wakeThreads();
         void spawnThread(Thread* t);
         void finishThread(Thread* t);
+        // Re-entry guard of the SIGUSR1 dump: the handler can fire on any thread, and a second signal while the
+        // table is being printed must not print it again (the mutex below is not recursive).
+        mutable std::atomic<bool> dumpActive{false};
         void signalDump() const;
         void usleepInt(uint64_t usec) const;
 

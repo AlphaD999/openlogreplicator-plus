@@ -560,10 +560,10 @@ namespace OpenLogReplicator {
             // The delivered watermark travels in the same file as the positions: a restart needs both, the rewind
             // target (min-trans) and the SCN below which the redo must not be delivered a second time.
             deliveredScn = ctx->deliveredUpToScn.load(std::memory_order_relaxed);
-            // The per-thread copy is what "state"."drop-delivered-per-thread" works with after a restart (see
-            // Ctx::deliveredDropLimit). Filled on every run but serialized only while the switch is on: the key is
-            // unknown to older binaries and Ctx::checkJsonFields() rejects unknown keys with 20003, which would
-            // make a rollback of the binary fail at startup.
+            // The per-thread copy is what the drop rule works with after a restart (see Ctx::deliveredDropLimit).
+            // Written whenever any thread has delivered something, so that the next run can deduplicate per thread
+            // instead of against one global watermark - and so that a run started from an empty state directory has
+            // a watermark from its very first checkpoint on.
             deliveredScnByThreadFull = false;
             for (size_t threadNumber = 0; threadNumber < deliveredScnByThread.size(); ++threadNumber) {
                 deliveredScnByThread[threadNumber] =

@@ -3,7 +3,7 @@
 本版换 `bin/OpenLogReplicator` 一枚；**配置一行不改**（开关有默认值）。
 `20261102b`（`cee0a395`）**未部署**，被本版取代；`20261102a`（`d785bfe7`）的说明仍然有效。
 
-本版：84,016,560 B，sha256 `08338c8ed697500b75a456bfb394773d574c8b2cb9c646f02203880acd29b255`
+本版：84,038,560 B，sha256 `944345ecc288593daf89a15e2cb07b0abf95d7dd1319408f551e94cffe459378`
 （同日更早的若干中间构建已归档为 `-superseded`，均未部署）
 
 ---
@@ -141,7 +141,7 @@ cd /opt/olr-build23/build && /usr/bin/cmake3 . && make -j2 OpenLogReplicator
 
 | 门槛 | 结果 |
 |---|---|
-| 尺寸 / sha256 | 84,016,560 B / `08338c8ed697500b75a456bfb394773d574c8b2cb9c646f02203880acd29b255` |
+| 尺寸 / sha256 | 84,038,560 B / `944345ecc288593daf89a15e2cb07b0abf95d7dd1319408f551e94cffe459378` |
 | `--version` 第 2 行 | `compiled: 2026-11-02 07:32`(UTC, 本地 15:32) |
 | GLIBC 上限 | `GLIBC_2.12` |
 | NEEDED 中的 rdkafka/zstd/prometheus | 0 |
@@ -238,3 +238,13 @@ service olr-zjsfrpt start
 |---|---|
 | 清 state + current scn 起步（回退 5000 SCN 制造工作量） | 冒烟 **PASS=11 FAIL=0**（A–K 全部） |
 | 不删 state 重启 | `restored from checkpoint thread 1/2`，无丢弃、无 10014 |
+
+## 9 诊断三项（排查可用性）
+
+| 项 | 改动 | 结果 |
+|---|---|---|
+| `kill -USR1` 线程转储 | 去掉"只有主线程才打表"的判断（信号由内核投给任意未屏蔽它的线程，rdkafka 线程屏蔽了它，所以落在我们的 worker 上是常态）；加一次性重入保护；**去掉给每个线程重发 SIGUSR1** | 装置实测：**每次信号 = 1 条 stacktrace + 1 份表**。此前若信号落在 worker 上，只有一条 stacktrace、没有表；而重发又让一份表伴随 10 条 stacktrace |
+| `60055` 的进度 | `watchdogProgressUt / Offset / Pending` 改成按线程；报告取"最久没动的那个线程"，用**它自己的** offset、pending 和 reader 快照；不足 1 s 用 ms 打印 | 线程号、偏移、快照、时长从此同源。此前 790 条报告全是 `no progress for: 0 s`，且 thread 与 file 会串 |
+| `60010` | 计数 + 每分钟一行（照 `60031` 的写法） | 一次重读最多 1 行/分钟，不再 2,338 行/13 秒 |
+
+**如实说明**：`60010` 与 `60055` 在装置上造不出来（需要坏 xid / 真停机），这两项只做了代码审阅 + 逻辑推演；`USR1` 是在装置上跑出来的（连发 3 次信号 → 3 条 stacktrace + 3 份表）。

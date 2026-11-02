@@ -95,6 +95,13 @@ namespace OpenLogReplicator {
             return MAX_LWN_CHUNKS * ctx->memoryChunksPerMb;
         }
 
+        // Warning 60010 is counted and reported once a minute: it fires once per broken transaction, and a run that
+        // reads an archive a second time has thousands of them (measured 2026-10-30: 2,338 lines in 13 seconds,
+        // 2,375 in the run) - at exactly the moment the log is the only evidence left.
+        void reportBrokenXid(uint32_t slt, uint32_t usn);
+        uint64_t brokenXidCount{0};
+        uint64_t brokenXidWarnMs{0};
+
         void freeLwn();
         void analyzeLwn(LwnMember* lwnMember);
         void appendToTransactionDdl(RedoLogRecord* redoLogRecord1);

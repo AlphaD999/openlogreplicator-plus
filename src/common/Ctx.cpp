@@ -87,20 +87,24 @@ namespace OpenLogReplicator {
         // that walks in circles over the same blocks calls it just as often as a healthy one. Refreshing the
         // timestamp on every call is what hid the production stall of 2026-10-20 (thread 2, archive 959664, 26
         // minutes without a single FINISHED, no warning 60055 at all, and the whole delivery frozen behind it).
-        const uint16_t lastThread = watchdogThread.load(std::memory_order_relaxed);
-        const uint64_t lastOffset = watchdogOffset.load(std::memory_order_relaxed);
-        const uint64_t lastPending = watchdogPending.load(std::memory_order_relaxed);
-        if (thread != lastThread || fileOffset != lastOffset || pendingCommits != lastPending)
-            watchdogProgressUt.store(clock->getTimeUt(), std::memory_order_relaxed);
-        watchdogThread.store(thread, std::memory_order_relaxed);
-        watchdogOffset.store(fileOffset, std::memory_order_relaxed);
-        watchdogPending.store(pendingCommits, std::memory_order_relaxed);
+        // Every thread keeps its own stamp: the report has to be able to say which thread stopped moving.
+        const uint16_t slot = thread < WATCHDOG_THREADS ? thread : 0;
+        const uint64_t lastOffset = watchdogOffset[slot].load(std::memory_order_relaxed);
+        const uint64_t lastPending = watchdogPending[slot].load(std::memory_order_relaxed);
+        if (watchdogProgressUt[slot].load(std::memory_order_relaxed) == 0 || fileOffset != lastOffset ||
+            pendingCommits != lastPending)
+            watchdogProgressUt[slot].store(clock->getTimeUt(), std::memory_order_relaxed);
+        watchdogOffset[slot].store(fileOffset, std::memory_order_relaxed);
+        watchdogPending[slot].store(pendingCommits, std::memory_order_relaxed);
     }
 
     void Ctx::watchdogNoteIdle() {
         if (watchdogUs == 0)
             return;
-        watchdogProgressUt.store(clock->getTimeUt(), std::memory_order_relaxed);
+        // Nothing to read at all: no thread can be blamed, so every thread is marked as "moved now".
+        const uint64_t now = clock->getTimeUt();
+        for (uint16_t threadNumber = 0; threadNumber < WATCHDOG_THREADS; ++threadNumber)
+            watchdogProgressUt[threadNumber].store(now, std::memory_order_relaxed);
     }
 
     void Ctx::watchdogCheck(const std::string& extraBusy) {
@@ -115,11 +119,25 @@ namespace OpenLogReplicator {
             return;
 
         const uint64_t now = clock->getTimeUt();
-        const uint64_t progress = watchdogProgressUt.load(std::memory_order_relaxed);
+
+        // The report is about the thread that has not moved for the longest time. A single global stamp (before
+        // this) could name thread 3 while quoting thread 2's position, and the elapsed time belonged to whichever
+        // thread had moved last, which is how "no progress for: 0 s" was printed 790 times in production.
+        uint16_t stalledThread = 0;
+        uint64_t stalledProgress = 0;
+        for (uint16_t threadNumber = 0; threadNumber < WATCHDOG_THREADS; ++threadNumber) {
+            const uint64_t progress = watchdogProgressUt[threadNumber].load(std::memory_order_relaxed);
+            if (progress == 0)
+                continue;
+            if (stalledProgress == 0 || progress < stalledProgress) {
+                stalledProgress = progress;
+                stalledThread = threadNumber;
+            }
+        }
         // "progress" is written by the parser thread and this is a second read of the same clock, so it can be a
         // moment newer than "now": without the "now <= progress" test the difference wraps around and the report
         // says "no progress for: 18446744073709 s" (measured in production, 3 times in 7 minutes).
-        if (progress == 0 || now <= progress || now - progress < watchdogUs)
+        if (stalledProgress == 0 || now <= stalledProgress || now - stalledProgress < watchdogUs)
             return;
 
         // Back off like the archive wait does: the first report at the threshold, then every doubling interval
@@ -138,9 +156,17 @@ namespace OpenLogReplicator {
         watchdogWarnCount.fetch_add(1, std::memory_order_relaxed);
 
         std::ostringstream ss;
-        ss << "the parser made no progress for: " << ((now - progress) / 1000000) << " s (thread: "
-           << watchdogThread.load(std::memory_order_relaxed) << ", file offset: " << watchdogOffset.load(std::memory_order_relaxed)
-           << ", pending commits: " << watchdogPending.load(std::memory_order_relaxed);
+        // Sub-second stalls exist (the archive list query alone can take that long), and "for: 0 s" reads like a
+        // bug in the report rather than a measurement: print milliseconds below one second.
+        const uint64_t stalledUs = now - stalledProgress;
+        ss << "the parser made no progress for: ";
+        if (stalledUs < 1000000)
+            ss << (stalledUs / 1000) << " ms";
+        else
+            ss << (stalledUs / 1000000) << " s";
+        ss << " (thread: " << stalledThread
+           << ", file offset: " << watchdogOffset[stalledThread].load(std::memory_order_relaxed)
+           << ", pending commits: " << watchdogPending[stalledThread].load(std::memory_order_relaxed);
 
         // Name the locks that are held right now - the whole point of the probe: it tells which of the three
         // waits that have no trace line of their own the parser is sitting in.
@@ -179,7 +205,7 @@ namespace OpenLogReplicator {
             // The snapshot belongs to the thread the report is about (the parser that stopped making
             // progress), not to whichever reader published last: with one reader per redo thread a single
             // slot mixed the file of one thread into the report of another.
-            const uint16_t snapThread = watchdogThread.load(std::memory_order_relaxed);
+            const uint16_t snapThread = stalledThread;
             std::unique_lock const lck(snapshotMtx);
             const ReaderSnapshot& snapshot = readerSnapshots[snapThread < READER_SNAPSHOTS ? snapThread : 0];
             if (snapshot.valid) {
@@ -1532,7 +1558,17 @@ namespace OpenLogReplicator {
     }
 
     void Ctx::signalDump() const {
-        if (mainThread != pthread_self())
+        // Any of our threads can receive SIGUSR1: the kernel picks one that does not block it, and the rdkafka
+        // threads do block it, so it is one of ours - but not the main thread with any certainty. The old test
+        // "mainThread != pthread_self() -> return" made the dump a lottery: measured on 2026-11-02, a signal that
+        // landed on a worker produced one stack trace and no table at all.
+        //
+        // No re-entry either: the old code re-sent SIGUSR1 to every thread to collect their stack traces, and with
+        // the test gone each of those would print the whole table (nested dumps). One signal now gives one stack
+        // trace of the receiving thread (main.cpp) and one table; a run with 11 threads printed 22 stack traces
+        // per signal before this.
+        bool expected = false;
+        if (!dumpActive.compare_exchange_strong(expected, true, std::memory_order_relaxed))
             return;
 
         std::unique_lock const lck(mtx);
@@ -1544,8 +1580,8 @@ namespace OpenLogReplicator {
                   " context: " + Thread::contextName(thread->curContext) +
                   " reason: " + Thread::reasonName(thread->curReason) +
                   " switches: " + std::to_string(thread->contextSwitches));
-            pthread_kill(thread->pthread, SIGUSR1);
         }
+        dumpActive.store(false, std::memory_order_relaxed);
     }
 
     void Ctx::usleepInt(uint64_t usec) const {
