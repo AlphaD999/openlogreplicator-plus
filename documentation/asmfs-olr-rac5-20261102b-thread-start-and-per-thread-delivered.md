@@ -115,8 +115,9 @@ make -j2 OpenLogReplicator
 发布：`/opt/dist/OpenLogReplicator` + `.sha256`；`d785bfe7-20261102a` 与 `cee0a395-20261102b` 均在
 `/opt/dist/archive/`。
 
-交付包：`asmfs-olr-rac5-delivery-20261102b`，61 文件 / 95,405,941 B，zip 31,105,520 B，
-sha256 `492e9f71d768d3aaa44a8d3bb23dce662e1482625996757b0172955966527421`（包内 `bin/SHA256SUMS` 已自检）。
+交付包：`asmfs-olr-rac5-delivery-20261102b`（包内 `bin/SHA256SUMS` 覆盖 `asmfs` 与 `OpenLogReplicator`
+两枚，出包时自检通过）。zip 的 sha256 记在交付邮件/交付记录里，**不写进包内文件**——否则修改包内文档
+就会改变 zip 的哈希，自己引用自己。
 
 > 说明：装置端到端用的是同一份源码的 `84005416`（仅 `compiled` 字符串不同）——构建时间戳变化不改变
 > 任何代码路径，交付件 `db08e10f` 与它逻辑等价。
