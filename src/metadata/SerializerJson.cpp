@@ -90,12 +90,13 @@ namespace OpenLogReplicator {
             // of being queued a second time (see DeliveryExecutor::commitCommon).
             ss << R"(,"delivered-scn":)" << std::dec << metadata->deliveredScn;
         }
-        if (metadata->ctx != nullptr && metadata->ctx->dropDeliveredPerThread) {
-            // The same watermark per redo thread, written ONLY while "state"."drop-delivered-per-thread" is on.
-            // Ctx::checkJsonFields() rejects an unknown key with 20003 and the check is on by default, so a
-            // checkpoint that carries this array can not be read back by an older binary - writing it always
-            // would make the rollback of the binary fail at startup. With the switch off nothing new is written
-            // and the file stays readable by 20261102a / 20261030f.
+        {
+            // The same watermark per redo thread, always written (the per-thread values are tracked whether
+            // "state"."drop-delivered-per-thread" is on or off, so a later run can use them). A deployment always
+            // starts from an empty state directory ("clear the directory, position from the current scn"), so
+            // there is no older checkpoint to stay compatible with - and Ctx::checkJsonFields() rejects an
+            // unknown key with 20003, which is exactly why the rollback of the binary is documented as "clear the
+            // state directory as well" instead of "make the file readable by the old binary".
             bool anyDeliveredByThread = false;
             for (const uint64_t delivered: metadata->deliveredScnByThread)
                 if (delivered > 0) {
@@ -883,13 +884,16 @@ namespace OpenLogReplicator {
                 // Only a *missing* per-thread breakdown of an existing delivery history is worth a warning: a run
                 // that never delivered anything (a start from the current scn that has already caught up, an idle
                 // source) writes neither "delivered-scn" nor the array, and nothing could be dropped anyway -
-                // warning there would fire on every restart of a quiet instance.
+                // warning there would fire on every restart of a quiet instance. What is left is the one case that
+                // does matter: a state directory written by an older binary, i.e. one that was not cleared before
+                // the deployment (see Ctx::deliveredDropLimit).
                 if (metadata->ctx != nullptr && metadata->ctx->dropDeliveredPerThread && !metadata->deliveredScnByThreadFull &&
                     metadata->deliveredScn > 0)
-                    metadata->ctx->warning(60069, "checkpoint has a delivered watermark (\"" "delivered-scn" "\": " +
-                                          std::to_string(metadata->deliveredScn) + ") but no per-thread one (\"" "delivered-scn-by-thread" "\"): "
-                                          "with \"drop-delivered-per-thread\" on, nothing is dropped as already delivered until "
-                                          "the next checkpoint file is written - the rewind window is delivered again instead");
+                    metadata->ctx->warning(60069, "the state directory was not written by this version: it has a delivered watermark "
+                                          "(\"" "delivered-scn" "\": " + std::to_string(metadata->deliveredScn) + ") but no per-thread one "
+                                          "(\"" "delivered-scn-by-thread" "\") - a deployment is expected to start from an EMPTY state "
+                                          "directory (position from the current scn); this run drops nothing as already delivered and "
+                                          "the rewind window is delivered again instead");
                 metadata->lastCheckpointScn = Scn::none();
                 metadata->lastSequence = Seq::none();
                 metadata->lastCheckpointFileOffset = FileOffset::zero();

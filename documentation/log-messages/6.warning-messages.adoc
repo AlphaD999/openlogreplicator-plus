@@ -618,17 +618,17 @@ What to do: this is a client-side stall, not a parser problem. Look at the write
 `queue.full`), at the broker and at the consumer group. `builder_out` in `backlog layers` shows the occupancy, and
 `60064` says whether the parser is waiting for the watermark, for the writer or for the client.
 
-==== code 60069: "checkpoint has no per-thread delivered watermark (\"delivered-scn-by-thread\"): with \"drop-delivered-per-thread\" on, nothing is dropped as already delivered until the next checkpoint file is written - the rewind window is delivered again instead"
+==== code 60069: "the state directory was not written by this version: it has a delivered watermark (\"delivered-scn\": <number>) but no per-thread one (\"delivered-scn-by-thread\") - a deployment is expected to start from an EMPTY state directory (position from the current scn); this run drops nothing as already delivered and the rewind window is delivered again instead"
 
-Reported once, while the checkpoint is restored, when `state."drop-delivered-per-thread": 1` is configured but the
-checkpoint file carries no `delivered-scn-by-thread` array (a file written before 2026-11-02, or a run that never
-delivered a single commit). The per-thread rule then has no watermark for any thread, and a watermark of 0 means
-"drop nothing": the rewind window of `min-trans` is delivered a second time after the restart instead of being
-skipped. The next checkpoint file written by that run carries the array, so the warning is a one-off.
+Reported once, while the checkpoint is restored, when the per-thread delivery watermark is missing while a global
+one exists - i.e. the state directory was written by an older binary or by a run that predates the per-thread rule.
+It means the deployment did not clear `state.path`, which is the documented rollout step.
 
-This is the safe side of the trade: with the switch on, a commit is only dropped when it is at or below the
-watermark of *its own* redo thread and that thread was never released from the low-water-mark (`60045`). Dropping
-against a watermark that is merely present in the file would be the behaviour of the switch being off.
+What happens in this run: no thread has a per-thread watermark, a watermark of 0 means "drop nothing", so the
+`min-trans` rewind window is delivered a second time instead of being skipped. That is the safe direction (a
+duplicate, not a lost commit) - dropping against the global watermark instead is what lost commits that were never
+delivered (measured on the rig 2026-11-02: 140 commits dropped, with `bytes_parsed_repeated = 0`).
 
-What to do: nothing if the run is expected to re-deliver after this restart (the consumer is required to be
-idempotent anyway); otherwise wait for the next checkpoint (default interval 60 s / 64 MB) and restart again.
+What to do: stop the instance, clear the state directory, and start again (the documented rollout: an empty state
+directory positioned from the current scn). The warning does not repeat once this version writes its own checkpoint,
+but leaving a stale directory in place keeps the run in the "drop nothing" mode.

@@ -3,7 +3,8 @@
 本版换 `bin/OpenLogReplicator` 一枚；**配置一行不改**（开关有默认值）。
 `20261102b`（`cee0a395`）**未部署**，被本版取代；`20261102a`（`d785bfe7`）的说明仍然有效。
 
-本版：84,017,176 B，sha256 `97fc0d9d7bb1d50a8a92ce603fcc4ac09259ac9d1af052edc19b685dd364b057`
+本版：84,016,560 B，sha256 `7d7243496b85a4930a00579aeaedba05e5cad669e1799ad0f74dee8b84e66914`
+（同日更早的两枚 `e9269a16` / `97fc0d9d` 是中间构建，已归档为 `-superseded`，未部署）
 
 ---
 
@@ -82,11 +83,17 @@ thread 2 **从未投递过**的提交，只因为 thread 1 早已把全局水位
 结论：ON 的失败方向是"多投一遍"，OFF 的失败方向是"少投且不报"——**丢数不能作为默认**，所以本版把默认
 翻成 ON，开关保留（置 0 即回到旧行为，用于对账/回滚）。
 
-### 2.3 代价（首次升级）
+### 2.3 与"清 state 上线"的关系（本版的简化依据）
 
-第一次用本版启动时，checkpoint 是旧件写的、没有 `delivered-scn-by-thread`，于是**这一轮不丢弃**：
-`min-trans` 回退窗口会整段重投一次（量级 = 停机时未完成事务的回退范围；10-23 那次是 3.7 万提交）。
-日志会打 `60069` 说明这件事；本版写出第一份 checkpoint 之后，逐线程水位就位，之后的重启恢复正常去重。
+上线流程固定为**先清 `state.path`、从 current scn 定位**，因此：
+
+* 本版**不为"旧件写的新格式 checkpoint"保留任何兼容路径**：`delivered-scn-by-thread` 现在**无条件写**
+  （不再挂在开关上）。旧二进制读不了这个键（`checkJsonFields` 抛 `20003`）是可接受的——回滚同样按
+  "停服务 + 清 state + 换件"走。
+* **不存在"首次升级要重投一次"的代价**：没有旧 checkpoint 可继承，第一份 checkpoint 就带逐线程水位，
+  从第一次重启起就是逐线程去重。
+* `60069` 只有在**忘记清 state**（目录里有旧件写的全局水位、但没有逐线程数组）时才出现，
+  它现在直接给出处理方式："a deployment is expected to start from an EMPTY state directory"。
 
 ## 3 测试矩阵（全部在 podman 复现台 racstb1 上跑）
 
@@ -114,20 +121,17 @@ service olr-zjsfrpt stop; service olr-zjsfrpt start
 
 升级后第一轮预期：`60069` 一次；`restart_reread_drops` 可能因为"回退窗口重投"而升高（**不是丢数**）。
 
-**回滚**（默认 ON 之后 checkpoint 一定带 `delivered-scn-by-thread`，而旧件读它会抛 `20003`，所以要删键）：
+**回滚**（与上线同一条规则：清 state，不跟旧格式纠缠）：
 
 ```bash
 service olr-zjsfrpt stop
-# 1) 删掉最新 checkpoint 里的键（路径取 config 的 state.path）
-f=$(ls -t /var/lib/olr/checkpoint/*.json | head -1); echo "patching $f"
-sed -i 's/,"delivered-scn-by-thread":\[[^]]*\]//' "$f"
-# 2) 换回旧件
+rm -f /var/lib/olr/checkpoint/*.json          # state.path 取 config 里的值
 cp -p /opt/olr/OpenLogReplicator.bak-66443011 /opt/olr/OpenLogReplicator
-service olr-zjsfrpt start
+service olr-zjsfrpt start                      # 从配置里的 start-scn 重新定位
 ```
 
-只改"最新的那份"就够：加载的是 `*-chkpt-<scn>.json` 里 SCN 最大的那份（`ZJSF-chkpt.json` 指向它）。
-若不确定，`grep -l delivered-scn-by-thread` 把带键的全部删掉即可。
+不需要删 key、也不需要挑"最新那份"：清空即回到"全量重放"，与上线完全同一套动作。
+代价是从 `start-scn` 起到现在重新投递一遍（重复，不是丢数）。
 
 ## 5 构建
 
@@ -137,7 +141,7 @@ cd /opt/olr-build23/build && /usr/bin/cmake3 . && make -j2 OpenLogReplicator
 
 | 门槛 | 结果 |
 |---|---|
-| 尺寸 / sha256 | 84,017,176 B / `97fc0d9d7bb1d50a8a92ce603fcc4ac09259ac9d1af052edc19b685dd364b057` |
+| 尺寸 / sha256 | 84,016,560 B / `7d7243496b85a4930a00579aeaedba05e5cad669e1799ad0f74dee8b84e66914` |
 | `--version` 第 2 行 | `compiled: 2026-11-02 07:32`(UTC, 本地 15:32) |
 | GLIBC 上限 | `GLIBC_2.12` |
 | NEEDED 中的 rdkafka/zstd/prometheus | 0 |
@@ -185,4 +189,28 @@ sh smoke-current-scn.sh <二进制> <基配置> [回退SCN数]
 
 **本轮冒烟修掉的一个误报**：起初 `60069` 在"从未投递过任何东西"的运行上也会打（该运行既没有
 `delivered-scn` 也没有逐线程数组，本来就没有可丢的东西）。现在只在"有全局水位、但缺逐线程数组"时提示，
-即真正的"从旧件升级"场景。空闲源不再每次重启都喊一次。
+也就是**忘记清 state** 的那一种情况——空闲源不再每次重启都喊一次。
+
+## 7 上线/回滚的唯一流程（本版按此简化）
+
+```bash
+# 上线
+service olr-zjsfrpt stop
+rm -f <state.path>/*.json                      # 清空，不做任何格式迁移
+cp -p bin/OpenLogReplicator /opt/olr/OpenLogReplicator && chmod 755 /opt/olr/OpenLogReplicator
+sha256sum -c SHA256SUMS
+service olr-zjsfrpt start                      # 从配置的 start-scn（= current scn）定位
+
+# 回滚
+service olr-zjsfrpt stop
+rm -f <state.path>/*.json
+cp -p /opt/olr/OpenLogReplicator.bak-<旧sha8> /opt/olr/OpenLogReplicator
+service olr-zjsfrpt start
+```
+
+**为什么不为旧 checkpoint 做兼容**：旧件读新键会抛 `20003`（`checkJsonFields` 对未知键是致命错误），
+而为它留空间就意味着"数组要不要写、缺失时用什么兜底"这类分支长期留在热路径上——这正是 10-26
+（`ad5fe8d` × `0cd17ce` 三分钟内互斥）那类 bug 的温床。清 state 把这个问题从代码里删掉，而不是在代码里绕。
+
+**这条流程下唯一必须记住的**：清完 state 之后，`start-scn` 决定"从哪里开始"——设成 current scn 就是
+"历史不要"，设成一个更早的值就是"从那里补"。两者都不影响本版的正确性，只影响重投多少。
