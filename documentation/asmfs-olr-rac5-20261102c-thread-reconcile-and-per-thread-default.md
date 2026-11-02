@@ -3,7 +3,7 @@
 本版换 `bin/OpenLogReplicator` 一枚；**配置一行不改**（开关有默认值）。
 `20261102b`（`cee0a395`）**未部署**，被本版取代；`20261102a`（`d785bfe7`）的说明仍然有效。
 
-本版：84,015,920 B，sha256 `e9269a1648de8cb644b6717f50cd89782da13a56e2d69261bad09b45242cec1e`
+本版：84,017,176 B，sha256 `97fc0d9d7bb1d50a8a92ce603fcc4ac09259ac9d1af052edc19b685dd364b057`
 
 ---
 
@@ -137,7 +137,7 @@ cd /opt/olr-build23/build && /usr/bin/cmake3 . && make -j2 OpenLogReplicator
 
 | 门槛 | 结果 |
 |---|---|
-| 尺寸 / sha256 | 84,015,920 B / `e9269a1648de8cb644b6717f50cd89782da13a56e2d69261bad09b45242cec1e` |
+| 尺寸 / sha256 | 84,017,176 B / `97fc0d9d7bb1d50a8a92ce603fcc4ac09259ac9d1af052edc19b685dd364b057` |
 | `--version` 第 2 行 | `compiled: 2026-11-02 07:32`(UTC, 本地 15:32) |
 | GLIBC 上限 | `GLIBC_2.12` |
 | NEEDED 中的 rdkafka/zstd/prometheus | 0 |
@@ -146,3 +146,43 @@ cd /opt/olr-build23/build && /usr/bin/cmake3 . && make -j2 OpenLogReplicator
 
 发布：`/opt/dist/OpenLogReplicator` + `.sha256`；`d785bfe7-20261102a`、`cee0a395-20261102b`、
 `e9269a16-20261102c` 都在 `/opt/dist/archive/`。
+
+---
+
+## 6 冒烟：清空 state + 从 CURRENT SCN 起步（现场流程）
+
+现场是"历史数据不要、从 current scn 起步、先清 state 目录"。这套流程**已在本版验证通过**——
+清不掉数据不是问题，问题是产品的丢弃判据在"从 start-scn 全量重放"时用错了（见 §2），现在按线程了。
+
+脚本：`repro1014/smoke-current-scn.sh`（依赖同目录两个 .sql），在 racstb1 上跑完一轮约 60 s：
+
+```
+sh smoke-current-scn.sh <二进制> <基配置> [回退SCN数]
+```
+
+判据与结果（`PASS=11 FAIL=0`，回退 5000 SCN 以制造真实解析/投递工作量）：
+
+| 编号 | 判据 | 结果 |
+|---|---|---|
+| A | `starting sequence for thread: N` 行数 == 有归档的线程数 | 2 == 2 |
+| B | 运行期无 `dropping a commit` | 0 |
+| C | 无 `60069` | 0 |
+| D | checkpoint 带 `delivered-scn-by-thread`（逐线程值不同） | `[{1,42622638},{2,42621876}]` |
+| E | `50049/50058/10014/10016/10047` 全 0 | 0 |
+| E2 | 无 `ERROR` 行 | 0 |
+| F | 不删 state 重启，按线程恢复 | 2 == 2 |
+| G | 重启无 `60069` | 0 |
+| H | 重启无 `10014` | 0 |
+| J | 重启无丢弃 | 0 |
+| I | 每线程一个 reader 实例 | `-reader-arch-1`、`-reader-arch-2` |
+
+**注意两点（都不是缺陷）**：
+
+1. **从"恰好 current SCN"起步时通常没有工作量**：线程会被定位到最后一个归档之后的 sequence，
+   一段时间内没有新归档可读 → 不解析、不投递、**不写 checkpoint**、也不创建 reader 线程。
+   此时只有 A/B/C/E 有意义；D/F/I 需要"有归档可解析"才有得看（脚本用回退 SCN 制造工作量）。
+2. reader 是**懒创建**的：没有归档要读的那一轮，转储里不会出现 `-reader-arch-*`。
+
+**本轮冒烟修掉的一个误报**：起初 `60069` 在"从未投递过任何东西"的运行上也会打（该运行既没有
+`delivered-scn` 也没有逐线程数组，本来就没有可丢的东西）。现在只在"有全局水位、但缺逐线程数组"时提示，
+即真正的"从旧件升级"场景。空闲源不再每次重启都喊一次。

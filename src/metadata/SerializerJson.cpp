@@ -880,8 +880,14 @@ namespace OpenLogReplicator {
                                             std::to_string(threadNumber) + " (\"delivered-scn-by-thread\")");
                     }
                 }
-                if (metadata->ctx != nullptr && metadata->ctx->dropDeliveredPerThread && !metadata->deliveredScnByThreadFull)
-                    metadata->ctx->warning(60069, "checkpoint has no per-thread delivered watermark (\"" "delivered-scn-by-thread" "\"): "
+                // Only a *missing* per-thread breakdown of an existing delivery history is worth a warning: a run
+                // that never delivered anything (a start from the current scn that has already caught up, an idle
+                // source) writes neither "delivered-scn" nor the array, and nothing could be dropped anyway -
+                // warning there would fire on every restart of a quiet instance.
+                if (metadata->ctx != nullptr && metadata->ctx->dropDeliveredPerThread && !metadata->deliveredScnByThreadFull &&
+                    metadata->deliveredScn > 0)
+                    metadata->ctx->warning(60069, "checkpoint has a delivered watermark (\"" "delivered-scn" "\": " +
+                                          std::to_string(metadata->deliveredScn) + ") but no per-thread one (\"" "delivered-scn-by-thread" "\"): "
                                           "with \"drop-delivered-per-thread\" on, nothing is dropped as already delivered until "
                                           "the next checkpoint file is written - the rewind window is delivered again instead");
                 metadata->lastCheckpointScn = Scn::none();
