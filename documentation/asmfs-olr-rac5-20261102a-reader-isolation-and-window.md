@@ -193,3 +193,30 @@ make -j2 OpenLogReplicator
 
 发布：`/opt/dist/OpenLogReplicator` + `.sha256`；旧件 `66443011` 与新件 `d785bfe7` 均归档在
 `/opt/dist/archive/OpenLogReplicator-<sha8>-<日期>`。
+
+---
+
+## 9 装置验证（2026-11-02，podman 复现台 racstb1）
+
+环境：`ORCLCDB` 单备库 + `slice-pending-commits: 64`、`arch-source: asm`、`start-scn 42547587`；
+新件直接跑在容器里（`LD_LIBRARY_PATH=<ORACLE_HOME>/lib:/opt/el6rt`），走独立的 state 目录
+`/var/lib/olr/checkpoint-g1`，不动装置原有状态。
+
+| 判据 | 结果 |
+|---|---|
+| 启动 | 正常，`compiled: 2026-11-02 05:56`，全日志 **0 ERROR** |
+| 解析/切片 | `processing redo` 46 趟；**切片 2 次 + `slice-resume` 2 次**，之后 `FINISHED 12689408 / 12720128` |
+| P0-3（续读） | `50049=0`、`60058=0`、`60024 gate=0` —— 续读路径被真实走到，未再解出坏的 LWN 头 |
+| P0-1（关机） | `SIGTERM` 后 **2 s 退出**，`10014=0`、`10017=0`、无 stacktrace |
+| P0-2（隔离） | 关机线程转储出现 `thread: SRC-reader-arch-1`（新命名与工厂生效） |
+| 回归 | `Kafka producer exit code: 0`、`writer hwm queue size: 1`、`60045` 正常（no-work / timeout 各一次） |
+
+**限制（如实记录）**：该装置上 OLR 只起了 thread 1（`starting sequence for thread: 1 is: 20041`），
+thread 2 的 45 份归档虽然 `resetlogs` 相同却没有出现在清单里。用装置自带二进制
+（`OpenLogReplicator-r3`，即 20261030f 那条线）做 A/B，**同样只起 thread 1** ⇒ 不是本版引入的回归；
+但"多个 reader 并存"这一形态在本装置上无法验证，需在生产（4 线程）或清单里能看到 thread 2 的装置上确认。
+
+**附带发现**：容器里 `kill -USR1 <pid>` 不会产生线程转储 —— `Ctx::signalDump()` 开头有
+`if (mainThread != pthread_self()) return;`，而信号由内核投给任意一个未屏蔽它的线程，多数不是主线程。
+现场"转储恒为 0/0"除了 `acb5f8f` 修的那一半（发行版里计数被优化掉），还有这一半。建议去掉该判断
+（转储只在 Ctx 锁下输出，不依赖调用线程）。
