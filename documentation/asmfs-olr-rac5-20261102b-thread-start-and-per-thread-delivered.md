@@ -112,8 +112,11 @@ make -j2 OpenLogReplicator
 | 新增告警 | 0（编译日志里只有既有的 `unused variable '_'` 结构绑定告警） |
 | cfgcheck | `/root/olr-zjsfrpt.json`、`/root/olr-zjpvsrpt.json`：`20003/30001/12001` 各 0 |
 
-发布：`/opt/dist/OpenLogReplicator` + `.sha256`；`d785bfe7-20261102a` 与 `db08e10f-20261102b` 均在
+发布：`/opt/dist/OpenLogReplicator` + `.sha256`；`d785bfe7-20261102a` 与 `cee0a395-20261102b` 均在
 `/opt/dist/archive/`。
+
+交付包：`asmfs-olr-rac5-delivery-20261102b`，61 文件 / 95,405,941 B，zip 31,105,520 B，
+sha256 `492e9f71d768d3aaa44a8d3bb23dce662e1482625996757b0172955966527421`（包内 `bin/SHA256SUMS` 已自检）。
 
 > 说明：装置端到端用的是同一份源码的 `84005416`（仅 `compiled` 字符串不同）——构建时间戳变化不改变
 > 任何代码路径，交付件 `db08e10f` 与它逻辑等价。
