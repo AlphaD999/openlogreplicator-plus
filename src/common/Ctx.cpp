@@ -176,14 +176,19 @@ namespace OpenLogReplicator {
         // Invariant C: whom the parser waits for. Pushed by the reader thread on every state change and on every
         // tick of the buffer-full wait, read here under its own lock - Ctx never touches Reader::mtx.
         {
+            // The snapshot belongs to the thread the report is about (the parser that stopped making
+            // progress), not to whichever reader published last: with one reader per redo thread a single
+            // slot mixed the file of one thread into the report of another.
+            const uint16_t snapThread = watchdogThread.load(std::memory_order_relaxed);
             std::unique_lock const lck(snapshotMtx);
-            if (readerSnapshot.valid) {
-                ss << ", reader: status=" << readerSnapshot.statusName
-                   << " buffer=" << readerSnapshot.bufferStart << "-" << readerSnapshot.bufferEnd
-                   << " size=" << readerSnapshot.fileSize;
-                if (readerSnapshot.waitingSinceUs != 0 && now > readerSnapshot.waitingSinceUs)
-                    ss << " waiting=" << ((now - readerSnapshot.waitingSinceUs) / 1000000) << " s";
-                ss << " file=" << readerSnapshot.fileName;
+            const ReaderSnapshot& snapshot = readerSnapshots[snapThread < READER_SNAPSHOTS ? snapThread : 0];
+            if (snapshot.valid) {
+                ss << ", reader: status=" << snapshot.statusName
+                   << " buffer=" << snapshot.bufferStart << "-" << snapshot.bufferEnd
+                   << " size=" << snapshot.fileSize;
+                if (snapshot.waitingSinceUs != 0 && now > snapshot.waitingSinceUs)
+                    ss << " waiting=" << ((now - snapshot.waitingSinceUs) / 1000000) << " s";
+                ss << " file=" << snapshot.fileName;
             } else {
                 ss << ", reader: no snapshot published yet";
             }
@@ -192,19 +197,20 @@ namespace OpenLogReplicator {
         warning(60055, ss.str());
     }
 
-    void Ctx::setReaderSnapshot(const char* statusName, uint64_t bufferStart, uint64_t bufferEnd, uint64_t fileSize,
-                                const std::string& fileName, uint64_t waitingSinceUs) {
+    void Ctx::setReaderSnapshot(uint16_t thread, const char* statusName, uint64_t bufferStart, uint64_t bufferEnd,
+                                uint64_t fileSize, const std::string& fileName, uint64_t waitingSinceUs) {
         std::unique_lock const lck(snapshotMtx);
-        std::memset(readerSnapshot.statusName, 0, sizeof(readerSnapshot.statusName));
-        std::memset(readerSnapshot.fileName, 0, sizeof(readerSnapshot.fileName));
+        ReaderSnapshot& snapshot = readerSnapshots[thread < READER_SNAPSHOTS ? thread : 0];
+        std::memset(snapshot.statusName, 0, sizeof(snapshot.statusName));
+        std::memset(snapshot.fileName, 0, sizeof(snapshot.fileName));
         if (statusName != nullptr)
-            std::string(statusName).copy(readerSnapshot.statusName, sizeof(readerSnapshot.statusName) - 1);
-        fileName.copy(readerSnapshot.fileName, sizeof(readerSnapshot.fileName) - 1);
-        readerSnapshot.bufferStart = bufferStart;
-        readerSnapshot.bufferEnd = bufferEnd;
-        readerSnapshot.fileSize = fileSize;
-        readerSnapshot.waitingSinceUs = waitingSinceUs;
-        readerSnapshot.valid = true;
+            std::string(statusName).copy(snapshot.statusName, sizeof(snapshot.statusName) - 1);
+        fileName.copy(snapshot.fileName, sizeof(snapshot.fileName) - 1);
+        snapshot.bufferStart = bufferStart;
+        snapshot.bufferEnd = bufferEnd;
+        snapshot.fileSize = fileSize;
+        snapshot.waitingSinceUs = waitingSinceUs;
+        snapshot.valid = true;
     }
 
     std::string Ctx::layersLine() const {

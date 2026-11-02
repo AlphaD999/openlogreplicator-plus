@@ -296,7 +296,15 @@ namespace OpenLogReplicator {
         bool parkForResume(uint64_t timeoutUs);
 
         void setRet(REDO_CODE newRet);
-        void setBufferStartEnd(FileOffset newBufferStart, FileOffset newBufferEnd);
+        // Move the window of the pass that is about to start to "start": bufferStart, bufferEnd and bufferScan
+        // move together. That is the invariant the parser relies on - it decodes up to bufferEnd and bufferScan
+        // is where this reader will read next - and moving bufferEnd on its own, before the reader has read
+        // that far, is what let the parser decode a chunk that had not been filled yet: production 2026-10-30
+        // 20:26:29 ended with 50049 "invalid lwn scn" on the first block of a slice resume, at the resume offset
+        // plus 24 KB, i.e. inside the first chunk whose first 512 bytes were all that had been read.
+        // Precondition: the reader is parked (SLEEPING); the caller is the parser between the handshake and
+        // setStatusRead(). bufferScan is not atomic, so it must not move while the read loop runs.
+        void resetWindow(uint64_t start);
         bool checkRedoLog();
         bool updateRedoLog();
         void setStatusRead();

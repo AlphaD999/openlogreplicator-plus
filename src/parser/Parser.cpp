@@ -1353,8 +1353,13 @@ namespace OpenLogReplicator {
                 reader->ensureArchiveSequence();
             }
         }
-        reader->setBufferStartEnd(FileOffset(lwnConfirmedBlock, reader->getBlockSize()),
-                                  FileOffset(lwnConfirmedBlock, reader->getBlockSize()));
+        // The window moves to the position this pass starts from, and all three positions move together: the
+        // parser decodes up to bufferEnd, so an end that covers bytes this reader has not read is decoded as
+        // redo. That is what happened when the parser moved bufferEnd on its own (the old
+        // setBufferStartEnd) while a slice resume had already put the read loop back to work at the previous
+        // window start - production 2026-10-30 20:26:29, 50049 on garbage LWN fields 24 KB into an unfilled
+        // chunk. See Reader::resetWindow.
+        reader->resetWindow(static_cast<uint64_t>(lwnConfirmedBlock) * reader->getBlockSize());
         // Start of this parsing pass: the slice boundary below must not cut a shorter piece than
         // Ctx::SLICE_MIN_BYTES, otherwise a busy archive gets shredded into tiny slices.
         const typeBlk sliceStartBlock = lwnConfirmedBlock;
@@ -1463,7 +1468,12 @@ namespace OpenLogReplicator {
 
         while (!ctx->softShutdown) {
             // There is some work to do
-            while (confirmedBufferStart < reader->getBufferEnd()) {
+            // Both halves say "there is a byte this parser may decode": confirmedBufferStart tracks currentBlock
+            // block for block, and the second one is the invariant itself - never decode at or beyond what this
+            // reader has read. They agreed as long as nothing moved the window past the read frontier; a slice
+            // resume did (production 2026-10-30 20:26:29), so the invariant is asked directly here.
+            while (confirmedBufferStart < reader->getBufferEnd() &&
+                   static_cast<uint64_t>(currentBlock) * reader->getBlockSize() < reader->getBufferEnd().getData()) {
                 uint64_t redoBufferPos = (static_cast<uint64_t>(currentBlock) * reader->getBlockSize()) % ctx->memoryChunkSize;
                 const uint64_t redoBufferNum =
                         ((static_cast<uint64_t>(currentBlock) * reader->getBlockSize()) / ctx->memoryChunkSize) % ctx->memoryChunksReadBufferMax;
@@ -1498,12 +1508,37 @@ namespace OpenLogReplicator {
                             lwnCheckpointBlock = currentBlock;
                             lwnNumMax = ctx->read16(redoBlock + blockOffset + 26U);
                             // Verify LWN header start
-                            if (unlikely(lwnScn < reader->getFirstScn() || (lwnScn > reader->getNextScn() && reader->getNextScn() != Scn::none())))
+                            if (unlikely(lwnScn < reader->getFirstScn() || (lwnScn > reader->getNextScn() && reader->getNextScn() != Scn::none()))) {
+                                // The first block of a *resumed* pass is where a saved position is checked, and a
+                                // saved position is a hint, not a promise: ending the run over it (50049) turned
+                                // one wrong position into an outage. Same answer as 60058 below - the pass is
+                                // over, the archive is read again from its beginning, the records of the
+                                // transactions that were already delivered are dropped by the tombstone and the
+                                // open ones are read again. A bad head in the *middle* of a pass stays fatal:
+                                // the parser reached it by walking its own records, so that is the archive and
+                                // not the position.
+                                if (unlikely(resumedFromOffset && currentBlock == passStartBlock)) {
+                                    ctx->statResumeFallbacks.fetch_add(1, std::memory_order_relaxed);
+                                    ctx->warning(60058, "the saved position of this pass (block " +
+                                                 std::to_string(passStartBlock) + ") is not the head of an lwn record in: " +
+                                                 reader->fileName + " (lwn scn: " + lwnScn.toString() +
+                                                 ", lwnEndBlock: " + std::to_string(lwnEndBlock) + ", reader scn: " +
+                                                 reader->getFirstScn().toString() + " - " +
+                                                 (reader->getNextScn() == Scn::none() ? std::string("none")
+                                                                                     : reader->getNextScn().toString()) +
+                                                 ") - the pass restarts at the beginning of this archive (the records of the "
+                                                 "transactions that were already delivered are dropped, the open ones are read again)");
+                                    lwnConfirmedBlock = 2;
+                                    reader->setRet(Reader::REDO_CODE::STOPPED);
+                                    confirmedBufferStart = reader->getBufferEnd();
+                                    break;
+                                }
                                 throw RedoLogException(50049, "invalid lwn scn: " + lwnScn.toString() + " (block: " +
                                                        std::to_string(currentBlock) + ", lwnEndBlock: " +
                                                        std::to_string(lwnEndBlock) + ", passStartBlock: " +
                                                        std::to_string(passStartBlock) + ", resumed: " +
                                                        (resumedFromOffset ? "yes" : "no") + ")");
+                            }
                         } else {
                             const typeLwn lwnNumCur = ctx->read16(redoBlock + blockOffset + 26U);
                             if (unlikely(lwnNumCur != lwnNumMax)) {

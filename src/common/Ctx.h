@@ -353,10 +353,14 @@ namespace OpenLogReplicator {
         uint64_t waitingSinceUs{0};
         char fileName[512]{0};
     };
+    // One snapshot per redo thread: every redo thread has its own archive reader (Replicator::archReaderFor),
+    // so a single slot was published by whichever reader ran last and the 60055 line named the file of another
+    // thread (measured 2026-10-30 20:26:26: "thread: 3, file offset: 54477312 ... file=thread_2_seq_965484").
+    static constexpr uint16_t READER_SNAPSHOTS{16};
     mutable std::mutex snapshotMtx;
-    ReaderSnapshot readerSnapshot;
-    void setReaderSnapshot(const char* statusName, uint64_t bufferStart, uint64_t bufferEnd, uint64_t fileSize,
-                           const std::string& fileName, uint64_t waitingSinceUs);
+    std::array<ReaderSnapshot, READER_SNAPSHOTS> readerSnapshots;
+    void setReaderSnapshot(uint16_t thread, const char* statusName, uint64_t bufferStart, uint64_t bufferEnd,
+                           uint64_t fileSize, const std::string& fileName, uint64_t waitingSinceUs);
         // Called from the parse loop and from the places that wait for archives: an expected wait must not look
         // like a stall. Cheap enough to be called per redo block while the watchdog is enabled. (Defined in
         // Ctx.cpp: this header only forward declares Clock.)

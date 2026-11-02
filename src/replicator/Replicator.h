@@ -145,6 +145,9 @@ namespace OpenLogReplicator {
         [[nodiscard]] size_t bestArchiveIndex() const;
         void updateOnlineLogs() const;
         void readerDropAll();
+        // Archive Reader for one redo thread: a dedicated instance, not looked up by group (see the
+        // implementation and Replicator::archReaderFor).
+        Reader* readerCreateArch(uint16_t thread);
         static Seq getSequenceFromFileName(const Replicator* replicator, const std::string& file, uint16_t& thread);
         virtual std::string getModeName() const;
         virtual bool checkConnection();

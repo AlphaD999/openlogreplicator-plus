@@ -161,6 +161,12 @@ namespace OpenLogReplicator {
                     wakingUp = true;
                 }
             }
+            for (Reader* reader: archReaders) {
+                if (reader != nullptr && !reader->finished) {
+                    reader->wakeUp();
+                    wakingUp = true;
+                }
+            }
             if (!wakingUp)
                 break;
             contextSet(CONTEXT::SLEEP);
@@ -168,18 +174,28 @@ namespace OpenLogReplicator {
             contextSet(CONTEXT::CPU);
         }
 
+        // Every instance is deleted exactly once. The archive readers are created by readerCreateArch(), which
+        // deliberately does *not* register them in "readers" - that is what makes these two loops disjoint.
+        // Before that change the same object sat in both containers, and because the archive factory also
+        // deduped by redo group (0 for every archive reader) several slots of archReaders pointed at it too, so
+        // shutdown deleted it two to five times: the process died with a signal right after "Kafka producer
+        // exit code: 0" (ERROR 10014 stacktrace, production 2026-10-30 20:26:29 and on every clean stop before
+        // it). "dropped" is a set of pointers, never dereferenced, so a stale entry can not be used.
+        std::set<Reader*> dropped;
         while (!readers.empty()) {
             Reader* reader = *(readers.begin());
-            ctx->finishThread(reader);
             readers.erase(reader);
+            if (!dropped.insert(reader).second)
+                continue;
+            ctx->finishThread(reader);
             delete reader;
         }
 
         for (Reader* reader : archReaders) {
-            if (reader != nullptr) {
-                ctx->finishThread(reader);
-                delete reader;
-            }
+            if (reader == nullptr || !dropped.insert(reader).second)
+                continue;
+            ctx->finishThread(reader);
+            delete reader;
         }
         archReaders.clear();
         readers.clear();
@@ -192,7 +208,7 @@ namespace OpenLogReplicator {
         if (thread >= archReaders.size())
             archReaders.resize(thread + 1, nullptr);
         if (archReaders[thread] == nullptr)
-            archReaders[thread] = readerCreate(0);
+            archReaders[thread] = readerCreateArch(thread);
         return archReaders[thread];
     }
 
@@ -401,6 +417,26 @@ namespace OpenLogReplicator {
         readers.insert(readerFS);
         readerFS->initialize();
 
+        ctx->spawnThread(readerFS);
+        return readerFS;
+    }
+
+    Reader* Replicator::readerCreateArch(uint16_t thread) {
+        // A dedicated instance (and reader thread) per redo thread. readerCreate() must not be used for this:
+        // it looks an instance up by redo group, and an archive reader's group is always 0, so the first thread
+        // created the object and every other thread got the same pointer back. The "one reader per redo
+        // thread" of 2026-10-28 therefore never existed - measured 2026-10-30: one "-reader-0" thread serving
+        // four redo threads, one fileName/fileSize/sequence shared by all of them (60024 gate reporting another
+        // archive's size, 60055 naming thread 2's file in thread 3's report) and four slots of archReaders
+        // pointing at one object, which shutdown then deleted four times.
+        // The group stays 0: the archive/online distinction and the block checks are keyed on it
+        // (Reader::checkBlockHeader, Reader::checkRedoLog, Replicator::checkOnlineRedoLogs).
+        auto* readerFS = new ReaderFilesystem(ctx, alias + "-reader-arch-" + std::to_string(thread), database, 0,
+                                              metadata->dbBlockChecksum != "OFF" && metadata->dbBlockChecksum != "FALSE");
+        // Not inserted into "readers": that set is the online redo log path (keyed by redo group) and it is
+        // what readerDropAll() walks first. Keeping the archive readers out of it is what makes the release
+        // unambiguous - an object in both containers was deleted twice.
+        readerFS->initialize();
         ctx->spawnThread(readerFS);
         return readerFS;
     }

@@ -456,9 +456,14 @@ namespace OpenLogReplicator {
         // slot after the read would see a chunk another thread has already been handed.
         uint8_t* const redoChunk = redoBufferList[redoBufferNum];
         if (unlikely(redoChunk == nullptr)) {
-            ctx->error(10016, "file: " + fileName + " - no read buffer chunk available for: " + std::to_string(toRead) +
-                       " bytes at position: " + std::to_string(bufferScan) + " (read buffer pool exhausted, see \"read-buffer-max-mb\")");
-            ret = REDO_CODE::ERROR;
+            // The pool has nothing to hand out right now. With one reader per redo thread the last free chunk
+            // can be taken by another reader between bufferIsFree() and this allocation, so the answer is a
+            // retry and not a failure: the pass ends as STOPPED and the scheduler comes back for it.
+            // REDO_CODE::ERROR would leave Replicator::processArchivedRedoLogs as 10047 and stop the instance.
+            ctx->warning(10016, "file: " + fileName + " - no read buffer chunk available for: " + std::to_string(toRead) +
+                          " bytes at position: " + std::to_string(bufferScan) +
+                          " (read buffer pool exhausted, see \"read-buffer-max-mb\") - the pass stops and is retried");
+            ret = REDO_CODE::STOPPED;
             return false;
         }
         // Buffer/read diagnosis (TRACE::CHECKPOINT). Which buffer this read fills, for which archive, from which
@@ -788,9 +793,11 @@ namespace OpenLogReplicator {
             // very next line dereferences the pointer. A missing chunk has to end the pass, not the process
             // (the same shape as the crash 8fb662c fixed in read1, Reader.cpp:111).
             if (unlikely(redoBufferList[redoBufferNum] == nullptr)) {
-                ctx->error(10016, "file: " + fileName + " - no read buffer chunk available at: " +
-                           std::to_string(bufferEnd) + " (read buffer pool exhausted, read2)");
-                ret = REDO_CODE::ERROR;
+                // Same answer as in read1(): a missing chunk is a retry, not the end of the instance.
+                ctx->warning(10016, "file: " + fileName + " - no read buffer chunk available at: " +
+                              std::to_string(bufferEnd) +
+                              " (read buffer pool exhausted, read2) - the pass stops and is retried");
+                ret = REDO_CODE::STOPPED;
                 return false;
             }
             const auto* const readTimeP = reinterpret_cast<const time_ut*>(redoBufferList[redoBufferNum] + redoBufferPos);
@@ -935,7 +942,7 @@ namespace OpenLogReplicator {
                         ctx->logTrace(Ctx::TRACE::SLEEP, "Reader:mainLoop:sleep");
                     contextSet(CONTEXT::WAIT, REASON::READER_NO_WORK);
                     // Idle reader: publish it once per pass, so 60055 does not keep showing a stale window.
-                    ctx->setReaderSnapshot(statusName(status.load()), bufferStart, bufferEnd, fileSize,
+                    ctx->setReaderSnapshot(thread, statusName(status.load()), bufferStart, bufferEnd, fileSize,
                                            fileNameForDiagnostics(), 0);
                     // An unbounded wait here can deadlock with the scheduler: when the parser ends up in
                     // Reader::updateRedoLog (which waits for this reader to re-check the archive) while this
@@ -1088,7 +1095,7 @@ namespace OpenLogReplicator {
                                 ctx->logTrace(Ctx::TRACE::SLEEP, "Reader:mainLoop:bufferFull");
                             // Invariant C: publish what the reader is doing, so 60055 names the file, the window
                             // and the state instead of only "locks held: none, delivery: idle".
-                            ctx->setReaderSnapshot(statusName(status.load()), bufferStart, bufferEnd, fileSize,
+                            ctx->setReaderSnapshot(thread, statusName(status.load()), bufferStart, bufferEnd, fileSize,
                                                    fileNameForDiagnostics(), ctx->clock->getTimeUt());
                             contextSet(CONTEXT::WAIT, REASON::READER_BUFFER_FULL);
                             condBufferFull.wait_for(lck, std::chrono::microseconds(ctx->redoReadSleepUs));
@@ -1573,9 +1580,17 @@ namespace OpenLogReplicator {
         ret = newRet;
     }
 
-    void Reader::setBufferStartEnd(FileOffset newBufferStart, FileOffset newBufferEnd) {
-        bufferStart = newBufferStart.getData();
-        bufferEnd = newBufferEnd.getData();
+    void Reader::resetWindow(uint64_t start) {
+        // The three positions are one value: a window whose end is ahead of what the reader has read makes the
+        // parser decode bytes that are still uninitialized (or still hold a previous window's data), which is
+        // exactly the shape of the 50049 of 2026-10-30. The chunks of the previous window are released by
+        // whoever reopened the archive (updateRedoLog) or by resumeAt(); freeing them here would have to happen
+        // before the lock is taken (bufferFree takes it itself) and this method is called on every pass.
+        const uint64_t aligned = blockSize != 0 ? start - (start % blockSize) : start;
+        std::unique_lock lck(mtx);
+        bufferStart = aligned;
+        bufferEnd = aligned;
+        bufferScan = aligned;
     }
 
     void Reader::setFileName(const std::string& newFileName) {
@@ -1606,9 +1621,17 @@ namespace OpenLogReplicator {
 
     void Reader::resumeAt(uint64_t offset) {
         // Precondition (guaranteed by the caller): the reader is SLEEPING - it parked itself after the last
-        // pass, so nothing is inside the read loop and the three positions can be set in one go. The sequence
-        // is deliberately not touched: it is the identity every block is checked against (60024/50049), and
-        // the caller has already verified that it matches the archive it is about to parse.
+        // pass, so nothing is inside the read loop and the positions can be set. The sequence is deliberately
+        // not touched: it is the identity every block is checked against (60024/50049), and the caller has
+        // already verified that it matches the archive it is about to parse.
+        //
+        // The pass is *not* started here (no STATUS::READ, no notify): the parser is the one that knows where
+        // it resumes - it saved that position itself - so it re-bases the window with resetWindow() and only
+        // then calls setStatusRead(). Starting the read loop here opened a window between this call and that
+        // re-base: the reader had already read a few hundred bytes from "aligned" when the parser moved
+        // bufferEnd forward to its own saved position, and every byte in between stayed unread while bufferEnd
+        // claimed it (production 2026-10-30 20:26:29: the parser decoded that gap, got 50049 from garbage LWN
+        // fields and the instance stopped; on 20:24:13 the same gap produced 60058 instead).
         const uint64_t aligned = blockSize != 0 ? offset - (offset % blockSize) : offset;
 
         // Return the chunks of the old window before the window moves: updateRedoLog() does exactly this on
@@ -1628,10 +1651,6 @@ namespace OpenLogReplicator {
         readTime = 0;
         loopTime = 0;
         ret = REDO_CODE::OK;
-        status = STATUS::READ;
-        condBufferFull.notify_all();
-        condReaderSleeping.notify_all();
-        condParserSleeping.notify_all();
     }
 
     bool Reader::isSleeping() const {

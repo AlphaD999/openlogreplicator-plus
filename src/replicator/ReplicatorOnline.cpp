@@ -141,9 +141,10 @@ namespace OpenLogReplicator {
             }
         }
 
-        // The archives path creates one reader per redo thread (see Replicator::archReaderFor); the online redo
-        // log reader is a single thread, so it takes slot 1.
-        archReaderFor(1);
+        // The archive readers are created on the first archive of their redo thread (Replicator::archReaderFor ->
+        // readerCreateArch) and are not part of "readers", so there is nothing to pre-create here: a call to
+        // archReaderFor(1) would only spawn the reader of redo thread 1 before it has anything to read, and the
+        // position/online path uses the readers of readerCreate() (keyed by redo group) instead.
 
         {
             DatabaseStatement stmt(conn);
