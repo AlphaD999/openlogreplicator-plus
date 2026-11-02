@@ -561,8 +561,9 @@ namespace OpenLogReplicator {
             // target (min-trans) and the SCN below which the redo must not be delivered a second time.
             deliveredScn = ctx->deliveredUpToScn.load(std::memory_order_relaxed);
             // The per-thread copy is what "state"."drop-delivered-per-thread" works with after a restart (see
-            // Ctx::deliveredDropLimit). Written unconditionally: turning the switch on later must not have to wait
-            // for a delivery cycle to rebuild the state.
+            // Ctx::deliveredDropLimit). Filled on every run but serialized only while the switch is on: the key is
+            // unknown to older binaries and Ctx::checkJsonFields() rejects unknown keys with 20003, which would
+            // make a rollback of the binary fail at startup.
             deliveredScnByThreadFull = false;
             for (size_t threadNumber = 0; threadNumber < deliveredScnByThread.size(); ++threadNumber) {
                 deliveredScnByThread[threadNumber] =

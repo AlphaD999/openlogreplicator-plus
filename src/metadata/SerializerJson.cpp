@@ -90,9 +90,12 @@ namespace OpenLogReplicator {
             // of being queued a second time (see DeliveryExecutor::commitCommon).
             ss << R"(,"delivered-scn":)" << std::dec << metadata->deliveredScn;
         }
-        {
-            // The same watermark per redo thread. Written by every run (also while "drop-delivered-per-thread" is
-            // off) so that turning that switch on does not have to wait for a delivery cycle to rebuild the state.
+        if (metadata->ctx != nullptr && metadata->ctx->dropDeliveredPerThread) {
+            // The same watermark per redo thread, written ONLY while "state"."drop-delivered-per-thread" is on.
+            // Ctx::checkJsonFields() rejects an unknown key with 20003 and the check is on by default, so a
+            // checkpoint that carries this array can not be read back by an older binary - writing it always
+            // would make the rollback of the binary fail at startup. With the switch off nothing new is written
+            // and the file stays readable by 20261102a / 20261030f.
             bool anyDeliveredByThread = false;
             for (const uint64_t delivered: metadata->deliveredScnByThread)
                 if (delivered > 0) {
