@@ -39,10 +39,16 @@ namespace OpenLogReplicator {
             // read again (the rewind to min-trans, see Metadata::minTrans), and that window is otherwise delivered a
             // second time - production 2026-10-23 queued 37,000 commits again and delivery_lag_ms never came down.
             // The checkpoint carries the highest commit SCN that was handed to the writer ("delivered-scn"); every
-            // commit at or below it is a duplicate and is dropped here. Commits are flushed in SCN order, so one
-            // watermark covers all redo threads, and the Xid/sq_n of the tombstone set are not needed.
+            // commit at or below it is a duplicate and is dropped here. The Xid/sq_n of the tombstone set are not
+            // needed.
+            //
+            // Which watermark applies is Ctx::deliveredDropLimit: by default the single global one (a commit is
+            // flushed in SCN order, so it covers every thread), with "state"."drop-delivered-per-thread" the one of
+            // the commit's own thread - and nothing at all for a thread that was ever released from the low-water
+            // mark, because that thread is delivered out of the global order on purpose and its late redo would
+            // otherwise be discarded as "already delivered".
             if (ctx->dropDeliveredOnRestart && transaction->commitScn != Scn::none() &&
-                transaction->commitScn.getData() <= ctx->deliveredUpToScn.load(std::memory_order_relaxed)) {
+                transaction->commitScn.getData() <= ctx->deliveredDropLimit(transaction->thread)) {
                 ctx->statRestartRereadDrops.fetch_add(1, std::memory_order_relaxed);
                 if (unlikely(ctx->isTraceSet(Ctx::TRACE::TRANSACTION)))
                     ctx->logTrace(Ctx::TRACE::TRANSACTION, "dropping a commit delivered before the restart: " +
@@ -59,11 +65,17 @@ namespace OpenLogReplicator {
                     transaction->flush(metadata, builder);
                     ctx->thread()->contextSet(Thread::CONTEXT::CPU);
                     // Handed to the writer: this is the delivered watermark that survives the restart (see the drop
-                    // at the head of this function). Only the delivery thread writes it.
+                    // at the head of this function). Only the delivery thread writes it - both the global maximum
+                    // (the checkpoint value, and the rule the default switch uses) and the per-thread one.
                     ctx->statDeliveredCommits.fetch_add(1, std::memory_order_relaxed);
                     const uint64_t commitScnData = transaction->commitScn.getData();
                     if (commitScnData > ctx->deliveredUpToScn.load(std::memory_order_relaxed))
                         ctx->deliveredUpToScn.store(commitScnData, std::memory_order_relaxed);
+                    {
+                        const uint16_t slot = transaction->thread < 16 ? transaction->thread : 0;
+                        if (commitScnData > ctx->deliveredUpToScnByThread[slot].load(std::memory_order_relaxed))
+                            ctx->deliveredUpToScnByThread[slot].store(commitScnData, std::memory_order_relaxed);
+                    }
                     if (ctx->metrics != nullptr) {
                         if (transaction->rollback)
                             ctx->metrics->emitTransactionsRollbackOut(1);

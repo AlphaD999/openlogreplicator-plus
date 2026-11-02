@@ -390,10 +390,15 @@ namespace OpenLogReplicator {
                 // until it has caught up. Its events up to the water-mark are still delivered right away - the
                 // order of that window was given up when the thread was released.
                 unalignedThreads.insert(thread);
-                if (ctx != nullptr)
+                if (ctx != nullptr) {
+                    // Out of the global SCN order from here on: its redo may carry SCNs below the delivered
+                    // watermark of the other threads (see Ctx::deliveredDropLimit), so it must never be treated as
+                    // "already delivered". Sticky for the whole run - being unaligned again is always possible.
+                    ctx->threadReleased[thread < 16 ? thread : 0].store(true, std::memory_order_relaxed);
                     ctx->info(0, "redo thread: " + std::to_string(thread) + " is behind the low-water-mark (scn: " +
                               parsedCeiling.toString() + " < " + watermark.toString() + ") - it does not hold it back until "
                               "it has caught up");
+                }
             }
             if (watermark != Scn::none() && parsedCeiling >= watermark)
                 unalignedThreads.erase(thread);
@@ -453,11 +458,15 @@ namespace OpenLogReplicator {
                 continue;
             if (currentTime > lastAdvance && currentTime - lastAdvance > idleReleaseUs) {
                 idleThreads.insert(idleThread);
-                if (ctx != nullptr)
+                if (ctx != nullptr) {
+                    // Released: its transactions are delivered after transactions with a higher SCN (see the
+                    // message below), so its redo must not be dropped against the global delivered watermark.
+                    ctx->threadReleased[idleThread < 16 ? idleThread : 0].store(true, std::memory_order_relaxed);
                     ctx->warning(60045, "redo thread: " + std::to_string(idleThread) + " did not advance for: " +
                                  std::to_string((currentTime - lastAdvance) / 1000000) + " s - it stops holding back the "
                                  "low-water-mark (reason: timeout, \"idle-thread-release-us\"); its transactions can now "
                                  "be delivered after transactions with a higher SCN");
+                }
             }
         }
     }
@@ -497,11 +506,16 @@ namespace OpenLogReplicator {
             // state every pass, several times a minute).
             if (!noWorkThreads.insert(thread).second)
                 return;
-            if (ctx != nullptr)
+            if (ctx != nullptr) {
+                // Released here too: the boundary between what was delivered and what the other threads are
+                // delivering is given up when this thread stops holding the low-water-mark (see 60045 and
+                // Ctx::deliveredDropLimit - the redo it reads when it comes back may be below the watermark).
+                ctx->threadReleased[thread < 16 ? thread : 0].store(true, std::memory_order_relaxed);
                 ctx->warning(60045, "redo thread: " + std::to_string(thread) + " has no archived redo log left to read "
                              "(expected seq: " + expectedSeq.toString() + ", highest known seq: " + highestSeq.toString() +
                              ") - it stops holding back the low-water-mark (reason: no-work); its transactions can now be "
                              "delivered after transactions with a higher SCN");
+            }
         } else {
             if (noWorkThreads.erase(thread) == 0)
                 return;

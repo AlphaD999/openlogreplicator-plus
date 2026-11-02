@@ -478,6 +478,7 @@ namespace OpenLogReplicator {
             if (!ctx->isDisableChecksSet(Ctx::DISABLE_CHECKS::JSON_TAGS)) {
                 static const std::vector<std::string> stateNames{
                     "drop-delivered-on-restart",
+                    "drop-delivered-per-thread",
                     "interval-mb",
                     "interval-s",
                     "keep-checkpoints",
@@ -518,6 +519,18 @@ namespace OpenLogReplicator {
                           " when the rewind window is read (\"" + "drop-delivered-on-restart" + "\": " +
                           std::to_string(ctx->dropDeliveredOnRestart ? 1 : 0) + ")");
             }
+
+            // Which watermark the "already delivered" drop compares against: the single global maximum (the default,
+            // the behaviour up to 2026-11-02) or the one of the commit's own redo thread, and never for a thread
+            // that was released from the low-water-mark - see Ctx::deliveredDropLimit and the 2026-10-30 analysis
+            // (48,003,797 drops in ten hours, most of them in the first minutes of a run without a checkpoint).
+            if (stateJson.HasMember("drop-delivered-per-thread"))
+                ctx->dropDeliveredPerThread = Ctx::getJsonFieldU64(configFileName, stateJson, "drop-delivered-per-thread") != 0;
+            ctx->info(0, "checkpoint: a commit is dropped as already delivered by " +
+                      std::string(ctx->dropDeliveredPerThread
+                                          ? "the watermark of its own redo thread (and never for a thread that was released from the low-water-mark)"
+                                          : "the global delivered watermark (all redo threads)") +
+                      " (\"" "drop-delivered-per-thread" "\": " + std::to_string(ctx->dropDeliveredPerThread ? 1 : 0) + ")");
 
             if (stateJson.HasMember("schema-force-interval"))
                 ctx->schemaForceInterval = Ctx::getJsonFieldU64(configFileName, stateJson, "schema-force-interval");

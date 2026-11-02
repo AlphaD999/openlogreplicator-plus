@@ -440,22 +440,28 @@ namespace OpenLogReplicator {
                     ctx->logTrace(Ctx::TRACE::SQL, "PARAM1: " + metadata->firstDataScn.toString());
                     ctx->logTrace(Ctx::TRACE::SQL, "PARAM2: " + metadata->firstDataScn.toString());
                     ctx->logTrace(Ctx::TRACE::SQL, "PARAM3: " + std::to_string(metadata->resetlogs));
+                    ctx->logTrace(Ctx::TRACE::SQL, "PARAM4: " + std::to_string(metadata->resetlogs));
                 }
                 stmt.createStatement(SQL_GET_SEQUENCE_FROM_SCN_STANDBY);
                 stmt.bindUInt(1, metadata->firstDataScn);
                 stmt.bindUInt(2, metadata->firstDataScn);
                 stmt.bindUInt(3, metadata->resetlogs);
+                // 4th placeholder: the same resetlogs, for the branch that gives a thread whose archives do not
+                // cover the start SCN its oldest sequence (see SQL_GET_SEQUENCE_FROM_SCN_STANDBY).
+                stmt.bindUInt(4, metadata->resetlogs);
             } else {
                 if (unlikely(ctx->isTraceSet(Ctx::TRACE::SQL))) {
                     ctx->logTrace(Ctx::TRACE::SQL, std::string(SQL_GET_SEQUENCE_FROM_SCN));
                     ctx->logTrace(Ctx::TRACE::SQL, "PARAM1: " + metadata->firstDataScn.toString());
                     ctx->logTrace(Ctx::TRACE::SQL, "PARAM2: " + metadata->firstDataScn.toString());
                     ctx->logTrace(Ctx::TRACE::SQL, "PARAM3: " + std::to_string(metadata->resetlogs));
+                    ctx->logTrace(Ctx::TRACE::SQL, "PARAM4: " + std::to_string(metadata->resetlogs));
                 }
                 stmt.createStatement(SQL_GET_SEQUENCE_FROM_SCN);
                 stmt.bindUInt(1, metadata->firstDataScn);
                 stmt.bindUInt(2, metadata->firstDataScn);
                 stmt.bindUInt(3, metadata->resetlogs);
+                stmt.bindUInt(4, metadata->resetlogs);
             }
             uint32_t thread;
             stmt.defineUInt(1, thread);

@@ -90,6 +90,30 @@ namespace OpenLogReplicator {
             // of being queued a second time (see DeliveryExecutor::commitCommon).
             ss << R"(,"delivered-scn":)" << std::dec << metadata->deliveredScn;
         }
+        {
+            // The same watermark per redo thread. Written by every run (also while "drop-delivered-per-thread" is
+            // off) so that turning that switch on does not have to wait for a delivery cycle to rebuild the state.
+            bool anyDeliveredByThread = false;
+            for (const uint64_t delivered: metadata->deliveredScnByThread)
+                if (delivered > 0) {
+                    anyDeliveredByThread = true;
+                    break;
+                }
+            if (anyDeliveredByThread) {
+                ss << R"(,"delivered-scn-by-thread":[)";
+                bool firstDelivered = true;
+                for (size_t threadNumber = 0; threadNumber < metadata->deliveredScnByThread.size(); ++threadNumber) {
+                    if (metadata->deliveredScnByThread[threadNumber] == 0)
+                        continue;
+                    if (!firstDelivered)
+                        ss << ",";
+                    firstDelivered = false;
+                    ss << R"({"thread":)" << std::dec << static_cast<uint32_t>(threadNumber) << R"(,"scn":)"
+                       << metadata->deliveredScnByThread[threadNumber] << "}";
+                }
+                ss << "]";
+            }
+        }
         if (!metadata->minTrans.empty()) {
             // Every thread that has an unfinished transaction, not only the oldest one: after a restart each of them
             // has to be re-read from its own position, or the transaction commits with only the rows that were
@@ -606,6 +630,7 @@ namespace OpenLogReplicator {
                     "log-archive-dest",
                     "log-archive-format",
                     "delivered-scn",
+                    "delivered-scn-by-thread",
                     "min-tran",
                     "min-trans",
                     "nls-character-set",
@@ -826,6 +851,36 @@ namespace OpenLogReplicator {
                                             " (\"delivered-scn\") - the redo before it is not delivered again after the rewind");
                     }
                 }
+                for (auto& slot: metadata->deliveredScnByThread)
+                    slot = 0;
+                metadata->deliveredScnByThreadFull = false;
+                if (metadata->ctx != nullptr && document.HasMember("delivered-scn-by-thread")) {
+                    // The per-thread watermarks the "state"."drop-delivered-per-thread" rule works with. A checkpoint
+                    // written before this key existed has none: every thread stays at 0, i.e. nothing is dropped -
+                    // the conservative answer, which is why the switch has to be turned on deliberately.
+                    const rapidjson::Value& deliveredArray = Ctx::getJsonFieldA(fileName, document, "delivered-scn-by-thread");
+                    if (!metadata->ctx->isDisableChecksSet(Ctx::DISABLE_CHECKS::JSON_TAGS)) {
+                        static const std::vector<std::string> deliveredChildNames{"scn", "thread"};
+                        for (rapidjson::SizeType i = 0; i < deliveredArray.Size(); ++i)
+                            Ctx::checkJsonFields(fileName, deliveredArray[i], deliveredChildNames);
+                    }
+                    for (rapidjson::SizeType i = 0; i < deliveredArray.Size(); ++i) {
+                        const uint16_t threadNumber =
+                                static_cast<uint16_t>(Ctx::getJsonFieldU32(fileName, deliveredArray[i], "thread"));
+                        const uint64_t scn = Ctx::getJsonFieldU64(fileName, deliveredArray[i], "scn");
+                        if (static_cast<size_t>(threadNumber) >= metadata->deliveredScnByThread.size())
+                            continue;
+                        metadata->deliveredScnByThread[threadNumber] = scn;
+                        metadata->deliveredScnByThreadFull = true;
+                        metadata->ctx->deliveredUpToScnByThread[threadNumber].store(scn, std::memory_order_relaxed);
+                        metadata->ctx->info(0, "checkpoint: delivered up to scn: " + std::to_string(scn) + " for thread: " +
+                                            std::to_string(threadNumber) + " (\"delivered-scn-by-thread\")");
+                    }
+                }
+                if (metadata->ctx != nullptr && metadata->ctx->dropDeliveredPerThread && !metadata->deliveredScnByThreadFull)
+                    metadata->ctx->warning(60069, "checkpoint has no per-thread delivered watermark (\"" "delivered-scn-by-thread" "\"): "
+                                          "with \"drop-delivered-per-thread\" on, nothing is dropped as already delivered until "
+                                          "the next checkpoint file is written - the rewind window is delivered again instead");
                 metadata->lastCheckpointScn = Scn::none();
                 metadata->lastSequence = Seq::none();
                 metadata->lastCheckpointFileOffset = FileOffset::zero();

@@ -150,6 +150,15 @@ namespace OpenLogReplicator {
 
         static constexpr std::string_view SQL_GET_SEQUENCE_FROM_SCN
         {
+            // One row per redo thread: the highest sequence of the log/archive that covers the requested SCN,
+            // plus - for a thread that has archives but none of them covering it - that thread's OLDEST archived
+            // sequence (the last UNION branch). Without that branch such a thread gets no position at all, and
+            // because the archive list is bound by the lowest expected sequence of the *known* threads every
+            // later archive of that thread is filtered out by SEQUENCE# >= that bound: the instance is never
+            // parsed and nothing is logged about it (measured on the reproduction rig 2026-11-02: thread 2's
+            // oldest archive begins 3 SCN after the configured start-scn, OLR started thread 1 only and the 45
+            // archives of thread 2 were never read). MAX over the union keeps the old answer whenever an
+            // archive covers the SCN - the covering maximum is >= the thread's oldest sequence.
             "SELECT THREAD#, MAX(SEQUENCE#) FROM ("
             "  SELECT"
             "     THREAD#"
@@ -168,12 +177,24 @@ namespace OpenLogReplicator {
             "   WHERE"
             "     FIRST_CHANGE# - 1 <= :i"
             "     AND SEQUENCE# > 0"
-            "     AND RESETLOGS_ID = :j)"
+            "     AND RESETLOGS_ID = :j"
+            " UNION"
+            "  SELECT"
+            "     THREAD#"
+            "   ,  MIN(SEQUENCE#)"
+            "   FROM"
+            "     SYS.V_$ARCHIVED_LOG"
+            "   WHERE"
+            "     SEQUENCE# > 0"
+            "     AND RESETLOGS_ID = :j"
+            "   GROUP BY THREAD#)"
             " GROUP BY THREAD#"
         };
 
         static constexpr std::string_view SQL_GET_SEQUENCE_FROM_SCN_STANDBY
         {
+            // Same query as SQL_GET_SEQUENCE_FROM_SCN, with V$STANDBY_LOG for the online logs (see the note
+            // there for the last UNION branch).
             "SELECT THREAD#, MAX(SEQUENCE#) FROM ("
             "  SELECT"
             "     THREAD#"
@@ -192,7 +213,17 @@ namespace OpenLogReplicator {
             "   WHERE"
             "     FIRST_CHANGE# - 1 <= :i"
             "     AND SEQUENCE# > 0"
-            "     AND RESETLOGS_ID = :j)"
+            "     AND RESETLOGS_ID = :j"
+            " UNION"
+            "  SELECT"
+            "     THREAD#"
+            "   ,  MIN(SEQUENCE#)"
+            "   FROM"
+            "     SYS.V_$ARCHIVED_LOG"
+            "   WHERE"
+            "     SEQUENCE# > 0"
+            "     AND RESETLOGS_ID = :j"
+            "   GROUP BY THREAD#)"
             " GROUP BY THREAD#"
         };
 

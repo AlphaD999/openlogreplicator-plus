@@ -614,6 +614,29 @@ namespace OpenLogReplicator {
         // re-delivers everything already delivered in that window. Production 2026-10-23: 37,000 commits queued
         // again, 20 minutes of delivery_lag_ms that never came down.
         std::atomic<uint64_t> deliveredUpToScn{0};
+        // The same watermark per redo thread, plus "this thread was ever released from the low-water-mark".
+        // Dropping a commit because its SCN is at or below the *global* watermark is only sound while the delivery
+        // follows one global SCN order. A thread released by 60045 (no work / idle timeout) or one that came back
+        // while still behind ("unaligned") is delivered outside that order by design: its late archives carry SCNs
+        // below the watermark the other threads have reached although nobody ever delivered them, and the global
+        // rule discards exactly those. Production 2026-10-30: 48,003,797 commits dropped in ten hours - 997,907 of
+        // them in the first four minutes of a fresh start that had no checkpoint at all, i.e. with no restart
+        // window in which anything could have been delivered before.
+        std::array<std::atomic<uint64_t>, 16> deliveredUpToScnByThread{};
+        std::array<std::atomic<bool>, 16> threadReleased{};
+        // "state"."drop-delivered-per-thread" (default 0 = the old global rule): drop only against the watermark of
+        // the commit's own thread, and never for a thread that was ever released (its redo may arrive out of order).
+        bool dropDeliveredPerThread{false};
+        // The SCN at or below which a commit of this thread is a duplicate already handed to the writer.
+        // 0 = drop nothing.
+        [[nodiscard]] uint64_t deliveredDropLimit(uint16_t thread) const {
+            if (!dropDeliveredPerThread)
+                return deliveredUpToScn.load(std::memory_order_relaxed);
+            const uint16_t slot = thread < 16 ? thread : 0;
+            if (threadReleased[slot].load(std::memory_order_relaxed))
+                return 0;
+            return deliveredUpToScnByThread[slot].load(std::memory_order_relaxed);
+        }
         // Commits dropped because they were delivered before the restart (the rewind window), commits handed to
         // the writer, the delivery rate over the report interval, and the time the delivery spent waiting for a
         // swapped chunk to come back - the four numbers that tell "the queue is deep" from "the disk is slow".

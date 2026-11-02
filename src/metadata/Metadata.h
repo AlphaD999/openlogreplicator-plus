@@ -20,6 +20,7 @@ If not, see <http://www.gnu.org/licenses/>. */
 #ifndef METADATA_H_
 #define METADATA_H_
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -187,6 +188,11 @@ namespace OpenLogReplicator {
         // restart the rewind window (min-trans) is read again, and every commit at or below this SCN is dropped
         // instead of being delivered a second time (see DeliveryExecutor::commitCommon).
         uint64_t deliveredScn{0};
+        // The same watermark per redo thread ("delivered-scn-by-thread"), used by "state"."drop-delivered-per-thread"
+        // (see Ctx::deliveredDropLimit). "deliveredScnByThreadFull" is set when the file carried the array at all:
+        // a checkpoint written before it existed has none, and then no thread has a watermark.
+        std::array<uint64_t, 16> deliveredScnByThread{};
+        bool deliveredScnByThreadFull{false};
         uint64_t schemaInterval{0};
         std::set<Scn> checkpointScnList;
         std::unordered_map<Scn, bool> checkpointSchemaMap;
