@@ -191,6 +191,15 @@ namespace OpenLogReplicator {
             " GROUP BY THREAD#"
         };
 
+        // One row per redo thread that has archived redo logs: the oldest sequence of the current incarnation.
+        // Used once per start to give a thread that the checkpoint does not know a position (see
+        // Replicator::archGetLogOnline) - without it such a thread stays invisible to the archive list.
+        static constexpr std::string_view SQL_GET_OLDEST_SEQUENCE_PER_THREAD
+        {
+            "SELECT THREAD#, MIN(SEQUENCE#) FROM SYS.V_$ARCHIVED_LOG"
+            " WHERE SEQUENCE# > 0 AND RESETLOGS_ID = :i GROUP BY THREAD#"
+        };
+
         static constexpr std::string_view SQL_GET_SEQUENCE_FROM_SCN_STANDBY
         {
             // Same query as SQL_GET_SEQUENCE_FROM_SCN, with V$STANDBY_LOG for the online logs (see the note

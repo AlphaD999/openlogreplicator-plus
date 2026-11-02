@@ -624,9 +624,17 @@ namespace OpenLogReplicator {
         // window in which anything could have been delivered before.
         std::array<std::atomic<uint64_t>, 16> deliveredUpToScnByThread{};
         std::array<std::atomic<bool>, 16> threadReleased{};
-        // "state"."drop-delivered-per-thread" (default 0 = the old global rule): drop only against the watermark of
-        // the commit's own thread, and never for a thread that was ever released (its redo may arrive out of order).
-        bool dropDeliveredPerThread{false};
+        // "state"."drop-delivered-per-thread" (default 1): drop only against the watermark of the commit's own
+        // thread, and never for a thread that was ever released (its redo may arrive out of order).
+        //
+        // On by default because the global rule was measured to drop commits that were never delivered: on the
+        // reproduction rig (2026-11-02) a checkpoint that carries only thread 1 (the shape every upgrade from a
+        // binary that never parsed one thread produces) had 140 commits of thread 2 discarded with
+        // bytes_parsed_repeated = 0 - nothing was re-read, so nothing there was a duplicate. With the per-thread
+        // rule the same state drops none. The cost of the switch is on the other side and bounded: a checkpoint
+        // that predates the "delivered-scn-by-thread" array has no watermark at all, so the first restart after the
+        // upgrade re-delivers the rewind window once (60069 says so).
+        bool dropDeliveredPerThread{true};
         // The SCN at or below which a commit of this thread is a duplicate already handed to the writer.
         // 0 = drop nothing.
         [[nodiscard]] uint64_t deliveredDropLimit(uint16_t thread) const {

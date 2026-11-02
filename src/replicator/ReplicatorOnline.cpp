@@ -1810,6 +1810,40 @@ namespace OpenLogReplicator {
         if (!replicatorOnline->checkConnection())
             return;
 
+        // A thread that has archived redo logs but no saved position is invisible to the bound below and would stay
+        // that way for good: the list is bound by the lowest sequence of the *known* threads, and the sequences of
+        // the unknown one are numerically lower. That is the normal case when a checkpoint comes from a run that
+        // never parsed one of the threads (the instance had no archived redo at the time, or the thread was hidden
+        // by this very bound) - see the reproduction of 2026-11-02: "restored from checkpoint thread 1" only, and
+        // 45 archives of thread 2 never read. positionReader() does not run in that case (the scn and the sequence
+        // come from the checkpoint), so the positions are reconciled here, once per start, with a single cheap
+        // query. Threads that already have a position keep it.
+        if (!replicator->archThreadsReconciled) {
+            replicator->archThreadsReconciled = true;
+            DatabaseStatement minStmt(replicatorOnline->getArchivesConnection());
+            if (unlikely(replicator->ctx->isTraceSet(Ctx::TRACE::SQL))) {
+                replicator->ctx->logTrace(Ctx::TRACE::SQL, std::string(SQL_GET_OLDEST_SEQUENCE_PER_THREAD));
+                replicator->ctx->logTrace(Ctx::TRACE::SQL, "PARAM1: " + std::to_string(replicator->metadata->resetlogs));
+            }
+            minStmt.createStatement(SQL_GET_OLDEST_SEQUENCE_PER_THREAD);
+            minStmt.bindUInt(1, replicator->metadata->resetlogs);
+            uint32_t minThread;
+            minStmt.defineUInt(1, minThread);
+            Seq minSequence;
+            minStmt.defineUInt(2, minSequence);
+            int minRet = minStmt.executeQuery();
+            while (minRet != 0) {
+                const auto threadNumber = static_cast<uint16_t>(minThread);
+                if (replicator->metadata->threadSequence(threadNumber) == Seq::zero()) {
+                    replicator->metadata->setSeqFileOffset(minSequence, FileOffset::zero(), threadNumber);
+                    replicator->ctx->info(0, "redo thread: " + std::to_string(threadNumber) +
+                                          " has no saved position - starting at its oldest archived redo log, seq: " +
+                                          minSequence.toString() + " (the checkpoint does not carry it)");
+                }
+                minRet = minStmt.next();
+            }
+        }
+
         // Bind the minimum expected sequence across all threads (single instance: thread 1 only)
         Seq sequenceStart = Seq::zero();
         for (const auto& [_, pos]: replicator->metadata->threadPos) {

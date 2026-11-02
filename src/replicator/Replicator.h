@@ -179,6 +179,9 @@ namespace OpenLogReplicator {
         // archives listed - the log then says "no archived redo log to read" without telling why. These five
         // numbers are what tells the three cases apart: the bind values were rejected (rows=0, err set), the
         // resetlogs id does not match (rows=0, err empty), or the query itself failed (rows=0, err set).
+        // Set after the first archive list pass has given a position to every redo thread that has archived redo
+        // logs but no saved one (see ReplicatorOnline::archGetLogOnline).
+        bool archThreadsReconciled{false};
         Seq archListStart;
         uint64_t archListResetlogs{0};
         uint64_t archListRows{0};
