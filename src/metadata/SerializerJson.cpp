@@ -53,10 +53,7 @@ namespace OpenLogReplicator {
         // Assuming the caller holds all locks
         ss << R"({"database":")";
         Data::writeEscapeValue(ss, metadata->database);
-        // Format version of this file (Metadata::CHECKPOINT_FORMAT): the deployment decides from it whether the
-        // state directory may be restored at all.
-        ss << "\",\"state-format\":" << std::dec << Metadata::CHECKPOINT_FORMAT;
-        ss << ",\"scn\":" << metadata->checkpointScn.toString() <<
+        ss << "\",\"scn\":" << metadata->checkpointScn.toString() <<
                 R"(,"resetlogs":)" << std::dec << metadata->resetlogs <<
                 R"(,"activation":)" << std::dec << metadata->activation <<
                 R"(,"time":)" << std::dec << metadata->checkpointTime.getVal() << // not read
@@ -636,7 +633,6 @@ namespace OpenLogReplicator {
                     "incarnations",
                     "log-archive-dest",
                     "log-archive-format",
-                    "state-format",
                     "delivered-scn",
                     "delivered-scn-by-thread",
                     "min-tran",
@@ -843,32 +839,6 @@ namespace OpenLogReplicator {
                     throw DataException(20006, "file: " + fileName + " - invalid offset: " + metadata->fileOffset.toString() +
                                         " is not a multiplication of " + std::to_string(Ctx::MIN_BLOCK_SIZE));
 
-                // Format version of this file against the one this binary writes. A newer file is refused: this
-                // binary would ignore keys it does not know and then write the file without them. An older one is
-                // continued with a warning - only the operator knows how long the outage was, and the rollout rule
-                // is "clear the state directory and start from the current scn" once the replay would be too long.
-                {
-                    const uint64_t stateFormat = document.HasMember("state-format")
-                                                 ? Ctx::getJsonFieldU64(fileName, document, "state-format")
-                                                 : 0;
-                    if (unlikely(stateFormat > Metadata::CHECKPOINT_FORMAT))
-                        throw DataException(20003, "file: " + fileName + " - checkpoint format: " +
-                                            std::to_string(stateFormat) + " was written by a newer version than this binary: " +
-                                            std::to_string(Metadata::CHECKPOINT_FORMAT) + " - clear the state directory "
-                                            "and start from the current scn");
-                    if (metadata->ctx != nullptr) {
-                        if (stateFormat == 0)
-                            metadata->ctx->warning(60070, "checkpoint has no format version (written before " + std::to_string(
-                                                    Metadata::CHECKPOINT_FORMAT) + "): this run continues on the compatibility "
-                                                    "path; if the outage is long, clear the state directory and start from the current scn "
-                                                    "instead of replaying the backlog");
-                        else if (stateFormat < Metadata::CHECKPOINT_FORMAT)
-                            metadata->ctx->warning(60070, "checkpoint format: " + std::to_string(stateFormat) +
-                                                    " is older than this binary: " + std::to_string(Metadata::CHECKPOINT_FORMAT) +
-                                                    " - this run continues on the compatibility path; if the outage is long, clear the "
-                                                    "state directory and start from the current scn instead of replaying the backlog");
-                    }
-                }
                 metadata->minSequence = Seq::none();
                 metadata->minFileOffset = FileOffset::zero();
                 metadata->minXid = Xid::zero();

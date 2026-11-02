@@ -3,8 +3,8 @@
 本版换 `bin/OpenLogReplicator` 一枚；**配置一行不改**（开关有默认值）。
 `20261102b`（`cee0a395`）**未部署**，被本版取代；`20261102a`（`d785bfe7`）的说明仍然有效。
 
-本版：84,047,880 B，sha256 `b260db57b66c703ae85e5babc1a16eb712c635d0ddb9ab8cb6eed1f93b7b0534`
-（同日更早的 `e9269a16` / `97fc0d9d` / `7d724349` / `dc8eb819` 等为中间构建，已归档为 `-superseded`，均未部署）
+本版：84,016,560 B，sha256 `08338c8ed697500b75a456bfb394773d574c8b2cb9c646f02203880acd29b255`
+（同日更早的若干中间构建已归档为 `-superseded`，均未部署）
 
 ---
 
@@ -141,7 +141,7 @@ cd /opt/olr-build23/build && /usr/bin/cmake3 . && make -j2 OpenLogReplicator
 
 | 门槛 | 结果 |
 |---|---|
-| 尺寸 / sha256 | 84,047,880 B / `b260db57b66c703ae85e5babc1a16eb712c635d0ddb9ab8cb6eed1f93b7b0534` |
+| 尺寸 / sha256 | 84,016,560 B / `08338c8ed697500b75a456bfb394773d574c8b2cb9c646f02203880acd29b255` |
 | `--version` 第 2 行 | `compiled: 2026-11-02 07:32`(UTC, 本地 15:32) |
 | GLIBC 上限 | `GLIBC_2.12` |
 | NEEDED 中的 rdkafka/zstd/prometheus | 0 |
@@ -215,43 +215,26 @@ service olr-zjsfrpt start
 **这条流程下唯一必须记住的**：清完 state 之后，`start-scn` 决定"从哪里开始"——设成 current scn 就是
 "历史不要"，设成一个更早的值就是"从那里补"。两者都不影响本版的正确性，只影响重投多少。
 
-## 8 checkpoint 格式版本：让"要不要清 state"变成可判定
+## 8 checkpoint 目录的处置：由人判断，代码不参与
 
-现场规则是三分法，但"格式有没有动过"以前只能靠人记。本版把它做成机制：
+"该不该清 state"是**运维判断**，代码不猜、也不自动清。三条规则：
 
-* **checkpoint 文件里带 `"state-format": 3`**，二进制的 `binary:` 启动行也打印 `state-format: 3`；
-* 加载时比较：**文件比二进制新** → 拒绝（`20003`，否则本二进制会把不认识的键写掉）；
-  **文件比二进制旧 / 没有这个键** → 60070 警告并继续（读侧兼容，缺的键取默认）；
-* 于是上线前一条命令就能判定：
+| 情况 | 动作 |
+|---|---|
+| 本版动过 checkpoint 内容（例如本版新增 `delivered-scn-by-thread`） | 清 state，从 current scn 起步 |
+| 没动过、停机时间短（积压可接受） | 直接恢复 checkpoint，不重投、不丢段 |
+| 没动过、停机时间长（积压过大） | 也清 state，从 current scn 起步，避免无谓重放 |
 
-```bash
-grep -o 'state-format: [0-9]*' <(./OpenLogReplicator --version)      # 二进制写哪个版本
-grep -o '"state-format":[0-9]*' <state.path>/<最新>.json              # 目录里是哪个版本
-```
+"长短"是数据量判断（归档里等着多少 redo、追不追得上），不是正确性判断。
 
-### 三分法（本版之后的固定规则）
+代码侧只保证一件事：**读到什么就用什么**——文件里有 `delivered-scn-by-thread` 就按逐线程水位去重，
+没有就当"没有水位"（不丢弃，宁可重投）。所以清与不清都不会导致静默丢数，只会影响重投量。
 
-| 格式 | 停机时长 | 动作 |
-|---|---|---|
-| **变了**（两个数字不等，或目录里没有这个键） | 任意 | 清 state，从 current scn 起步 |
-| 未变 | 短（积压可接受） | 直接恢复 checkpoint，不重投、不丢段 |
-| 未变 | 长（积压过大） | 清 state，从 current scn 起步，避免无谓重放 |
-
-"长/短"是**数据量判断**（归档里等着多少 redo、Slave 追得上追不上），不是正确性判断——两种情况都不会丢数。
-
-### 20261102c 属于哪一类
-
-**格式变更**（新增 `delivered-scn-by-thread` 与 `state-format`，`2 → 3`）⇒ **上线必须清 state，
-从 current scn 起步**。之后同格式的版本才能走"短停机直接恢复"那条路。
-
-版本沿革：`2` = per-thread positions + `min-trans` + `delivered-scn`；`3` = 增加 `delivered-scn-by-thread`
-和 `state-format` 本身。
+**本版属于第一种**（新增 `delivered-scn-by-thread` 键）⇒ 上线清 state、从 current scn 起步。
 
 ### 装置实测（2026-11-02，2 线程复现台）
 
 | 场景 | 结果 |
 |---|---|
 | 清 state + current scn 起步（回退 5000 SCN 制造工作量） | 冒烟 **PASS=11 FAIL=0**（A–K 全部） |
-| 不删 state 重启（同格式 3） | `restored from checkpoint thread 1/2`，无 60070，无丢弃 |
-| 把 checkpoint 的 `state-format` 改成 2 再重启 | **60070 告警一次**（"format: 2 is older than this binary: 3 … clear the state directory"），随后仍按兼容路径恢复 |
-| `--version` 第 3 行 | `... compiled 2026-11-02 08:33, state-format: 3) - the deployment check ...` |
+| 不删 state 重启 | `restored from checkpoint thread 1/2`，无丢弃、无 10014 |

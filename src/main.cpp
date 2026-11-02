@@ -142,12 +142,8 @@ namespace {
                 std::string sizeText("size unknown");
                 if (stat(exePath, &exeStat) == 0)
                     sizeText = std::to_string(static_cast<uint64_t>(exeStat.st_size)) + " bytes";
-                // The checkpoint format of this binary belongs next to the build stamp: the deployment has to decide
-                // from it whether the state directory may be restored or has to be cleared first (a file written
-                // with another value carries keys this binary does not know, or misses keys it needs).
                 mainCtx->welcome("binary: " + std::string(exePath) + " (" + sizeText + ", compiled " +
-                                 OpenLogReplicator_CMAKE_BUILD_TIMESTAMP + ", state-format: " +
-                                 std::to_string(OpenLogReplicator::Metadata::CHECKPOINT_FORMAT) +
+                                 OpenLogReplicator_CMAKE_BUILD_TIMESTAMP +
                                  ") - the deployment check verifies this file against /opt/olr/SHA256SUMS");
             }
         }

@@ -633,22 +633,3 @@ What to do: stop the instance, clear the state directory, and start again (the d
 directory positioned from the current scn). The warning does not repeat once this version writes its own checkpoint,
 but leaving a stale directory in place keeps the run in the "drop nothing" mode.
 
-==== code 60070: "checkpoint format: <number> is older than this binary: <number> - this run continues on the compatibility path; if the outage is long, clear the state directory and start from the current scn instead of replaying the backlog" (the same text with "checkpoint has no format version (written before <number>)" when the file predates the key)
-
-Reported once, while the checkpoint is restored, when the `state-format` of the file is lower than
-`Metadata::CHECKPOINT_FORMAT` of the binary (or the key is absent). The run continues: the reader understands the
-older keys, and the missing ones are filled with their defaults.
-
-The rollout decision is a three-way one, and only the operator knows the second half of it:
-
-* **format changed** (binary's `state-format` differs from the file's): clear the state directory and start from
-  the current scn. The file carries keys this binary would drop on its next write, or misses keys it needs;
-* **format unchanged, outage short**: restore the checkpoint - no re-delivery, no gap;
-* **format unchanged, outage long**: clear the state directory as well, so that the replay stays bounded. This is a
-  data-volume decision (how much redo is waiting in the archives), not a correctness one.
-
-A checkpoint written by a *newer* binary (format greater than the binary's) is refused with `20003` instead of being
-opened read-write: this binary would ignore keys it does not know and then write the file without them.
-
-What to do: usually nothing (a short outage continues on the compatibility path). When the backlog is large, stop,
-clear the state directory, and start from the current scn.
