@@ -1021,6 +1021,44 @@ namespace OpenLogReplicator {
         transaction->add(metadata, transactionBuffer, redoLogRecord1, redoLogRecord2);
     }
 
+    void Parser::dumpBadBlock(const Reader* reader, const uint8_t* block, typeBlk blockNumber, bool resumed, typeBlk passStart,
+                              const std::string& reason) const {
+        // Error 50080, emitted right before the throw of 50049/50051. Everything needed to tell "the archive is
+        // wrong" from "we read the wrong bytes" is in this one line: the bytes that were decoded (hex, so they can
+        // be compared against the file with dd), the values the parser expected out of them, where the pass
+        // started, and the two sizes the reader published. Without it the log says only "invalid lwn scn" and the
+        // question can not be answered after the fact - the file may already be gone (5-hour retention deleted the
+        // archives of 2026-11-03 while the list still named them).
+        const uint blockSize = reader->getBlockSize();
+        static const char hexDigits[] = "0123456789abcdef";
+        std::string raw;
+        raw.reserve(48 * 2);
+        for (uint i = 0; i < 48; ++i) {
+            raw += hexDigits[(block[i] >> 4) & 0x0f];
+            raw += hexDigits[block[i] & 0x0f];
+        }
+
+        std::ostringstream ss;
+        ss << "bad block header - file: " << reader->fileName
+           << ", block: " << blockNumber
+           << ", offset: " << static_cast<uint64_t>(blockNumber) * blockSize
+           << ", blockSize: " << blockSize
+           << ", thread: " << thread
+           << ", seq: " << sequence.toString()
+           << ", reason: " << reason
+           << ", resumed: " << (resumed ? "yes" : "no")
+           << ", passStartBlock: " << passStart
+           << ", reader scn: " << reader->getFirstScn().toString() << " - "
+           << (reader->getNextScn() == Scn::none() ? std::string("none") : reader->getNextScn().toString())
+           << ", header: vld=0x" << std::hex << static_cast<uint>(block[4]) << std::dec
+           << " lwnNum=" << ctx->read16(block + 24U) << "/" << ctx->read16(block + 26U)
+           << " lwnSize=" << ctx->read32(block + 28U)
+           << " lwnScn=" << ctx->readScn(block + 40U).toString()
+           << ", file size: " << reader->getFileSizePublished() << " (stat: " << reader->getFileSizeStatPublished() << ")"
+           << ", raw[0..48]: " << raw;
+        ctx->error(50080, ss.str());
+    }
+
     void Parser::reportBrokenXid(uint32_t slt, uint32_t usn) {
         // Counted and reported once a minute: one line per broken transaction is right for a stray record and
         // wrong for an archive that is read a second time, where thousands of transactions have no rollback record
@@ -1546,6 +1584,9 @@ namespace OpenLogReplicator {
                                     confirmedBufferStart = reader->getBufferEnd();
                                     break;
                                 }
+                                dumpBadBlock(reader, redoBlock + blockOffset, currentBlock, resumedFromOffset, passStartBlock,
+                                             "invalid lwn scn: " + lwnScn.toString() + ", lwnEndBlock: " +
+                                             std::to_string(lwnEndBlock));
                                 throw RedoLogException(50049, "invalid lwn scn: " + lwnScn.toString() + " (block: " +
                                                        std::to_string(currentBlock) + ", lwnEndBlock: " +
                                                        std::to_string(lwnEndBlock) + ", passStartBlock: " +
@@ -1704,11 +1745,15 @@ namespace OpenLogReplicator {
                         // the reader is repositioned by the next pass from the saved offset.
                         confirmedBufferStart = reader->getBufferEnd();
                         break;
-                    } else
+                    } else {
+                        dumpBadBlock(reader, redoBlock + blockOffset, currentBlock, resumedFromOffset, passStartBlock,
+                                     "did not find lwn at offset: " + confirmedBufferStart.toString() + ", lwnEndBlock: " +
+                                     std::to_string(lwnEndBlock));
                         throw RedoLogException(50051, "did not find lwn at offset: " + confirmedBufferStart.toString() + " (block: " +
                                                std::to_string(currentBlock) + ", lwnEndBlock: " + std::to_string(lwnEndBlock) +
                                                ", passStartBlock: " + std::to_string(passStartBlock) + ", resumed: " +
                                                (resumedFromOffset ? "yes" : "no") + ")");
+                    }
                 }
 
                 while (blockOffset < reader->getBlockSize()) {

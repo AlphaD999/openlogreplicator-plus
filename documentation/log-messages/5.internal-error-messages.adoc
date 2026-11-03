@@ -159,3 +159,28 @@ To recreate schema checkpoint files: stop replication, clear the checkpoint dire
 ==== code 50072: "swap file: <file> - <message>"
 
 ==== code 50073: "table: <table>: missmatch in column details: <number> < <number>"
+
+==== code 50080: "bad block header - file: <path>, block: <number>, offset: <number>, blockSize: <number>, thread: <number>, seq: <number>, reason: <text>, resumed: <yes|no>, passStartBlock: <number>, reader scn: <scn> - <scn>, header: vld=0x<hex> lwnNum=<number>/<number> lwnSize=<number> lwnScn=<scn>, file size: <number> (stat: <number>), raw[0..48]: <hex>"
+
+Printed immediately before error `50049` (invalid lwn scn) or `50051` (did not find lwn at offset) ends the run: it is
+the block the parser was looking at, decoded and in hex.
+
+It answers the only question that matters after such a stop - **is the archive wrong or did we read the wrong
+bytes** - without having to reproduce the run (the archive may be gone by then: on 2026-11-03 the 5-hour retention
+deleted the archives while `V$ARCHIVED_LOG` still listed them):
+
+* `offset` is `block * blockSize`, i.e. directly usable with `dd`;
+* `raw[0..48]` are the bytes that were decoded, so a manual read of the same file at the same offset can be
+  compared byte for byte;
+* `header:` are the values the parser read out of those bytes (`vld` bit 0x04 = this block claims to be an LWN
+  head; `lwnNum/lwnNumMax` = member index; `lwnSize` = how far the record claims to reach; `lwnScn` = what it
+  claims to contain);
+* `reader scn` is the range the parser expects (`FIRST_CHANGE#-1 .. NEXT_CHANGE#` of the archive from the list),
+  `file size`/`stat` are the two sizes the reader published (they differ when the file was still being written or
+  when the filesystem bridge reported a stale size);
+* `resumed` and `passStartBlock` say whether this was the position a sliced pass saved (`resumed: yes`, and then
+  `60058` handles it instead of stopping) or a block the parser reached by walking its own records.
+
+How to read it: dump the same offset from the file with `dd` and compare against `raw`. Identical bytes and
+`vld` without 0x04 (or an `lwnScn` outside `reader scn`) = the archive itself; a valid head in the file where the
+log shows garbage = the read path (window/offset), which is what `0b9c982` fixed for the resumed case.

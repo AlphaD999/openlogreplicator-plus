@@ -102,6 +102,12 @@ namespace OpenLogReplicator {
         uint64_t brokenXidCount{0};
         uint64_t brokenXidWarnMs{0};
 
+        // Error 50080: one line that makes "is this the archive or our own reading of it" answerable from the
+        // log. Emitted right before the throw of 50049/50051 - the bytes that were actually decoded, the values
+        // the parser expected out of them, and where the pass started.
+        void dumpBadBlock(const Reader* reader, const uint8_t* block, typeBlk blockNumber, bool resumed, typeBlk passStart,
+                          const std::string& reason) const;
+
         void freeLwn();
         void analyzeLwn(LwnMember* lwnMember);
         void appendToTransactionDdl(RedoLogRecord* redoLogRecord1);

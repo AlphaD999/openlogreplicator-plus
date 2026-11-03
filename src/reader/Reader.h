@@ -247,6 +247,14 @@ namespace OpenLogReplicator {
         [[nodiscard]] typeActivation getActivation() const;
         [[nodiscard]] uint64_t getSumRead() const;
         [[nodiscard]] uint64_t getSumTime() const;
+        // The two sizes the reader thread published (see fileSizePublished/fileSizeStatPublished): the bad block
+        // dump (50073) runs on the parser thread and must not read the plain members that thread writes.
+        [[nodiscard]] uint64_t getFileSizePublished() const {
+            return fileSizePublished.load(std::memory_order_relaxed);
+        }
+        [[nodiscard]] uint64_t getFileSizeStatPublished() const {
+            return fileSizeStatPublished.load(std::memory_order_relaxed);
+        }
         [[nodiscard]] uint16_t getThread() const;
         // True when the reader is parked (nothing is inside its read loop), which is the precondition of
         // resumeAt(); STATUS itself stays protected - the scheduler has no business switching states.
