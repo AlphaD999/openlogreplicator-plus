@@ -1587,6 +1587,30 @@ namespace OpenLogReplicator {
                                 dumpBadBlock(reader, redoBlock + blockOffset, currentBlock, resumedFromOffset, passStartBlock,
                                              "invalid lwn scn: " + lwnScn.toString() + ", lwnEndBlock: " +
                                              std::to_string(lwnEndBlock));
+                                // A bad head in the *middle* of a pass: the parser reached it by walking its own
+                                // records, so this is the archive and not the position - the answer cannot be
+                                // "read it again". It stays fatal by default. With "skip-unreadable-archive" the
+                                // archive is dropped instead, through the very path that already handles a read
+                                // error of an archive (Replicator: 10074 + next sequence of the thread): one
+                                // damaged archive must not have two fates depending on whether it fails on open
+                                // or in the middle.
+                                if (unlikely(ctx->skipUnreadableArchive)) {
+                                    ctx->statBadBlockSkips.fetch_add(1, std::memory_order_relaxed);
+                                    ctx->error(50049, "invalid lwn scn: " + lwnScn.toString() + " (block: " +
+                                               std::to_string(currentBlock) + ", lwnEndBlock: " +
+                                               std::to_string(lwnEndBlock) + ", passStartBlock: " +
+                                               std::to_string(passStartBlock) + ", resumed: " +
+                                               (resumedFromOffset ? "yes" : "no") +
+                                               ") - archive skipped (\"skip-unreadable-archive\"), its redo is NOT "
+                                               "delivered; the gap is scn: " +
+                                               (passMaxRecordScn == Scn::none() ? reader->getFirstScn().toString()
+                                                                                : passMaxRecordScn.toString()) +
+                                               " - " + (reader->getNextScn() == Scn::none() ? std::string("none")
+                                                                                            : reader->getNextScn().toString()));
+                                    reader->setRet(Reader::REDO_CODE::ERROR_BAD_DATA);
+                                    confirmedBufferStart = reader->getBufferEnd();
+                                    break;
+                                }
                                 throw RedoLogException(50049, "invalid lwn scn: " + lwnScn.toString() + " (block: " +
                                                        std::to_string(currentBlock) + ", lwnEndBlock: " +
                                                        std::to_string(lwnEndBlock) + ", passStartBlock: " +
@@ -1749,6 +1773,24 @@ namespace OpenLogReplicator {
                         dumpBadBlock(reader, redoBlock + blockOffset, currentBlock, resumedFromOffset, passStartBlock,
                                      "did not find lwn at offset: " + confirmedBufferStart.toString() + ", lwnEndBlock: " +
                                      std::to_string(lwnEndBlock));
+                        // Same as the 50049 site above: fatal by default, dropped with "skip-unreadable-archive"
+                        // through the path that already reports 10074 and advances the thread.
+                        if (unlikely(ctx->skipUnreadableArchive)) {
+                            ctx->statBadBlockSkips.fetch_add(1, std::memory_order_relaxed);
+                            ctx->error(50051, "did not find lwn at offset: " + confirmedBufferStart.toString() + " (block: " +
+                                       std::to_string(currentBlock) + ", lwnEndBlock: " + std::to_string(lwnEndBlock) +
+                                       ", passStartBlock: " + std::to_string(passStartBlock) + ", resumed: " +
+                                       (resumedFromOffset ? "yes" : "no") +
+                                       ") - archive skipped (\"skip-unreadable-archive\"), its redo is NOT delivered; "
+                                       "the gap is scn: " +
+                                       (passMaxRecordScn == Scn::none() ? reader->getFirstScn().toString()
+                                                                        : passMaxRecordScn.toString()) +
+                                       " - " + (reader->getNextScn() == Scn::none() ? std::string("none")
+                                                                                    : reader->getNextScn().toString()));
+                            reader->setRet(Reader::REDO_CODE::ERROR_BAD_DATA);
+                            confirmedBufferStart = reader->getBufferEnd();
+                            break;
+                        }
                         throw RedoLogException(50051, "did not find lwn at offset: " + confirmedBufferStart.toString() + " (block: " +
                                                std::to_string(currentBlock) + ", lwnEndBlock: " + std::to_string(lwnEndBlock) +
                                                ", passStartBlock: " + std::to_string(passStartBlock) + ", resumed: " +

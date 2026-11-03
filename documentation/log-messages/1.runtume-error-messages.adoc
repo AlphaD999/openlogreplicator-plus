@@ -413,3 +413,18 @@ The archive could not be opened after `arch-read-tries` attempts (or was damaged
 The redo of this archive is not delivered: the transactions it contains are missing downstream.
 Either repair the archive (an unreadable header is what a file that is not a redo log at all looks like - a stale entry of the archive list, a file that was overwritten, a wrong `path-mapping`) and read it again by moving the source position back, or note the thread and sequence pair as an accepted gap.
 The read error form of this message names the reason instead of the retry count.
+
+Three ways reach it, and with 2026-11-03 all three mean the same thing: redo that is not delivered.
+
+* the archive could not be opened (`10003` before it, once per minute per file, escalating to `60072`);
+* the archive failed while being read (`ERROR_BAD_DATA` / `ERROR_CRC` / `ERROR_READ` / `ERROR_BLOCK`);
+* **a block in the middle of the archive is not an lwn head** or its scn is outside the archive (`50049` / `50051`,
+  with the block dumped by `50080` right before). This one used to stop the process even with
+  `skip-unreadable-archive` set - the switch only covered the two paths above - so one damaged archive had two
+  different fates depending on whether it failed on open or in the middle. That form of the message carries the
+  exact scn range that is not delivered ("the gap is scn: <from> - <to>") and increments `bad_block_skips` in the
+  parse statistics line.
+
+Without `skip-unreadable-archive` all three stop the process instead (that is the default, and it is deliberate:
+a block that the parser walked to and that is not a head is either a damaged archive or a defect in the walk, and
+re-reading it would hide the second one).

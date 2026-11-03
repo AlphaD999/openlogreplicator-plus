@@ -550,6 +550,9 @@ namespace OpenLogReplicator {
         // from its beginning instead of ending the run (warning 60058). Counted to see how often the saved
         // position is not usable - it is a cost (the archive is read again), not a fault.
         std::atomic<uint64_t> statResumeFallbacks{0};
+        // Archives dropped in the middle ("skip-unreadable-archive" + a block that is not an lwn head, 50049/50051):
+        // each one is redo that was not delivered, and the count existing at all means the path is live.
+        std::atomic<uint64_t> statBadBlockSkips{0};
         // Counters of the silent wait of the delivery: a transaction that was swapped out is read back chunk by
         // chunk (Ctx::swappedMemoryGet), and that wait has no trace line and no warning of its own - which is why
         // the production stall of 2026-10-15 looked like a lock problem (60055 reported "deliveryMtx swapMtx" and
