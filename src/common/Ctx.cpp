@@ -96,15 +96,19 @@ namespace OpenLogReplicator {
             watchdogProgressUt[slot].store(clock->getTimeUt(), std::memory_order_relaxed);
         watchdogOffset[slot].store(fileOffset, std::memory_order_relaxed);
         watchdogPending[slot].store(pendingCommits, std::memory_order_relaxed);
+        watchdogActive[slot].store(true, std::memory_order_relaxed);
     }
 
     void Ctx::watchdogNoteIdle() {
         if (watchdogUs == 0)
             return;
-        // Nothing to read at all: no thread can be blamed, so every thread is marked as "moved now".
+        // Nothing to read at all: no thread can be blamed, so every thread that has been noted is marked as
+        // "moved now". Slots that were never noted stay out of the report (see watchdogActive).
         const uint64_t now = clock->getTimeUt();
-        for (uint16_t threadNumber = 0; threadNumber < WATCHDOG_THREADS; ++threadNumber)
-            watchdogProgressUt[threadNumber].store(now, std::memory_order_relaxed);
+        for (uint16_t threadNumber = 0; threadNumber < WATCHDOG_THREADS; ++threadNumber) {
+            if (watchdogActive[threadNumber].load(std::memory_order_relaxed))
+                watchdogProgressUt[threadNumber].store(now, std::memory_order_relaxed);
+        }
     }
 
     void Ctx::watchdogCheck(const std::string& extraBusy) {
@@ -120,12 +124,18 @@ namespace OpenLogReplicator {
 
         const uint64_t now = clock->getTimeUt();
 
-        // The report is about the thread that has not moved for the longest time. A single global stamp (before
-        // this) could name thread 3 while quoting thread 2's position, and the elapsed time belonged to whichever
-        // thread had moved last, which is how "no progress for: 0 s" was printed 790 times in production.
+        // Two questions, two numbers - mixing them up is what made this report useless in both directions:
+        //  * "is anything still moving?" The parser is one thread, so the stall signal is the *newest* stamp of
+        //    any redo thread. Gating on the oldest one reports a redo thread that simply has no archive to read
+        //    (a quiet instance, 60045 released it) as a stall - hours of it.
+        //  * "which thread do I name?" The oldest one, with its own offset, its own pending count and its own
+        //    reader snapshot. A single global stamp could name thread 3 while quoting thread 2's position.
         uint16_t stalledThread = 0;
         uint64_t stalledProgress = 0;
+        uint64_t newestProgress = 0;
         for (uint16_t threadNumber = 0; threadNumber < WATCHDOG_THREADS; ++threadNumber) {
+            if (!watchdogActive[threadNumber].load(std::memory_order_relaxed))
+                continue;
             const uint64_t progress = watchdogProgressUt[threadNumber].load(std::memory_order_relaxed);
             if (progress == 0)
                 continue;
@@ -133,11 +143,13 @@ namespace OpenLogReplicator {
                 stalledProgress = progress;
                 stalledThread = threadNumber;
             }
+            if (progress > newestProgress)
+                newestProgress = progress;
         }
         // "progress" is written by the parser thread and this is a second read of the same clock, so it can be a
-        // moment newer than "now": without the "now <= progress" test the difference wraps around and the report
-        // says "no progress for: 18446744073709 s" (measured in production, 3 times in 7 minutes).
-        if (stalledProgress == 0 || now <= stalledProgress || now - stalledProgress < watchdogUs)
+        // moment newer than "now": without the "now <= ..." test the difference wraps around and the report says
+        // "no progress for: 18446744073709 s" (measured in production, 3 times in 7 minutes).
+        if (stalledProgress == 0 || newestProgress == 0 || now <= newestProgress || now - newestProgress < watchdogUs)
             return;
 
         // Back off like the archive wait does: the first report at the threshold, then every doubling interval

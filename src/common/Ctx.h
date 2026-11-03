@@ -341,6 +341,11 @@ namespace OpenLogReplicator {
         std::array<std::atomic<uint64_t>, WATCHDOG_THREADS> watchdogProgressUt{};
         std::array<std::atomic<uint64_t>, WATCHDOG_THREADS> watchdogOffset{};
         std::array<std::atomic<uint64_t>, WATCHDOG_THREADS> watchdogPending{};
+        // Set by the first watchdogNote() of a thread. Only these take part in the report: a slot that was never
+        // noted (a redo thread this run has not parsed, or an index below the first thread number) would otherwise
+        // be the "oldest" entry forever and every report would name a thread that does not exist -
+        // production 2026-11-03: "no progress for: 8891 s (thread: 0, file offset: 0)" every 2.4 s for hours.
+        std::array<std::atomic<bool>, WATCHDOG_THREADS> watchdogActive{};
         std::atomic<uint64_t> watchdogWarnUt{0};
         std::atomic<uint64_t> watchdogWarnCount{0};
     // Snapshot of what the reader of the current archive is doing, pushed by the reader thread and read by
