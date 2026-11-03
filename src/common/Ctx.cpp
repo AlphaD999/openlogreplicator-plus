@@ -235,6 +235,135 @@ namespace OpenLogReplicator {
         warning(60055, ss.str());
     }
 
+    void Ctx::archUnreadable(const std::string& fileName, const std::string& reason) {
+        std::string message;
+        int code;
+        {
+            std::unique_lock const lck(archUnreadableMtx);
+            const uint64_t now = clock->getTimeUt();
+            if (archUnreadableFile != fileName) {
+                archUnreadableFile = fileName;
+                archUnreadableSinceUt = now;
+                archUnreadableLastLogUt = 0;
+                archUnreadableTries = 0;
+                archUnreadableEscalated = false;
+            }
+            ++archUnreadableTries;
+            const uint64_t waitedUs = archUnreadableSinceUt == 0 || now <= archUnreadableSinceUt ? 0 : now - archUnreadableSinceUt;
+            // The retry loop gives up (or skips the archive) after archReadTries tries, so "half of the budget" is
+            // the point where a late archive has become an instance that is stopped by it - and it is reachable
+            // whatever the configured budget is (61 tries in production = 61 s).
+            const uint64_t escalateTries = archReadTries > 6 ? archReadTries / 2 : 3;
+            const bool escalated = archUnreadableEscalated || archUnreadableTries >= escalateTries ||
+                                   waitedUs >= ARCH_UNREADABLE_WARN_US;
+            const bool quiet = archUnreadableLastLogUt != 0 && now > archUnreadableLastLogUt &&
+                               now - archUnreadableLastLogUt < ARCH_UNREADABLE_QUIET_US;
+            // One line per file per minute, and exactly one line at the moment it escalates.
+            if (quiet && (!escalated || archUnreadableEscalated))
+                return;
+            archUnreadableLastLogUt = now;
+            archUnreadableEscalated = escalated;
+            if (escalated) {
+                // The one that says what is actually happening: the archive is in the source's list, it is not on
+                // the mount, and every redo thread that waits for it is stopped.
+                code = 60072;
+                message = "file: " + fileName + " - the archive list names it but it has not been readable for: " +
+                          std::to_string(waitedUs / 1000000) + " s (attempts: " + std::to_string(archUnreadableTries) +
+                          ", last error: " + reason + ") - every redo thread that waits for it is stopped; check the "
+                          "archive mount (and the retention of the archive directory, an archive can be deleted while "
+                          "it is still in the list)";
+            } else {
+                code = 10003;
+                message = "file: " + fileName + " - " + reason + " (attempt: " + std::to_string(archUnreadableTries) +
+                          ", retried every " + std::to_string(archReadSleepUs / 1000) +
+                          " ms, one line per minute per file)";
+            }
+        }
+
+        if (code == 60072)
+            warning(60072, message);
+        else
+            warning(10003, message);
+    }
+
+    void Ctx::archReadable(const std::string& fileName) {
+        std::string message;
+        {
+            std::unique_lock const lck(archUnreadableMtx);
+            if (archUnreadableFile != fileName || archUnreadableSinceUt == 0)
+                return;
+            const uint64_t now = clock->getTimeUt();
+            const uint64_t waitedUs = now > archUnreadableSinceUt ? now - archUnreadableSinceUt : 0;
+            message = "file: " + fileName + " - readable again after: " + std::to_string(waitedUs / 1000000) +
+                      " s (attempts: " + std::to_string(archUnreadableTries) + ")";
+            archUnreadableFile.clear();
+            archUnreadableSinceUt = 0;
+            archUnreadableLastLogUt = 0;
+            archUnreadableTries = 0;
+        }
+        info(0, message);
+    }
+
+    void Ctx::deliveryStallCheck() {
+        if (deliveryStallUs == 0)
+            return;
+        // Nothing to report before the first commit of this run: a start from the current scn that has caught up,
+        // or a quiet source, delivers nothing for hours and is not a stall.
+        if (statDeliveredCommits.load(std::memory_order_relaxed) == 0)
+            return;
+
+        const uint64_t now = clock->getTimeUt();
+        const uint64_t last = statLastDeliveredUt.load(std::memory_order_relaxed);
+        if (last != 0 && now > last && now - last < deliveryStallUs) {
+            deliveryStallWarnCount.store(0, std::memory_order_relaxed);
+            return;
+        }
+
+        // Work still in the pipeline: the delivery is behind, not idle. builder_out counts the ring occupancy and
+        // is 1 when the ring is empty.
+        const uint64_t sorterPending = statPendingDeliveries.load(std::memory_order_relaxed);
+        const uint64_t inDelivery = statInDelivery.load(std::memory_order_relaxed);
+        const uint64_t writerQueue = statWriterQueue.load(std::memory_order_relaxed);
+        const uint64_t builderOut = statBuilderOut.load(std::memory_order_relaxed);
+        const uint64_t inPipeline = sorterPending + inDelivery + writerQueue + (builderOut > 1 ? builderOut : 0);
+        if (inPipeline == 0) {
+            // Everything that was parsed has been delivered: the instance is waiting for redo, which is 60056's
+            // business (or the delivery is idle because there is nothing to deliver).
+            deliveryStallWarnCount.store(0, std::memory_order_relaxed);
+            return;
+        }
+
+        // Back off like the other periodic reports: the first one at the threshold, then every doubling interval
+        // up to eight times it, so a delivery that is stuck for hours does not flood the log either.
+        uint64_t interval = deliveryStallUs;
+        const uint64_t reports = deliveryStallWarnCount.load(std::memory_order_relaxed);
+        for (uint64_t n = 0; n < reports && interval < deliveryStallUs * 8; ++n)
+            interval *= 2;
+        uint64_t lastWarn = deliveryStallWarnUt.load(std::memory_order_relaxed);
+        if (lastWarn != 0 && now > lastWarn && now - lastWarn < interval)
+            return;
+        if (!deliveryStallWarnUt.compare_exchange_strong(lastWarn, now, std::memory_order_relaxed))
+            return;
+        deliveryStallWarnCount.fetch_add(1, std::memory_order_relaxed);
+
+        const uint64_t waitedUs = last == 0 || now <= last ? 0 : now - last;
+        std::ostringstream ss;
+        ss << "the delivery handed nothing to the writer for: ";
+        if (waitedUs < 1000000)
+            ss << (waitedUs / 1000) << " ms";
+        else
+            ss << (waitedUs / 1000000) << " s";
+        ss << " while " << inPipeline << " item(s) are waiting (sorter_pending=" << sorterPending
+           << ", in_delivery=" << inDelivery << ", writer_queue=" << writerQueue
+           << ", builder_out=" << builderOut << "), last delivered scn: "
+           << deliveredUpToScn.load(std::memory_order_relaxed)
+           << ", commits handed over in this run: " << statDeliveredCommits.load(std::memory_order_relaxed)
+           << " - this is what a rising delivery_lag_ms looks like from the inside; \"state\".\"delivery-stall-us\" "
+              "sets the threshold (0 disables it)";
+        ss << ", layers:" << layersLine();
+        warning(60071, ss.str());
+    }
+
     void Ctx::setReaderSnapshot(uint16_t thread, const char* statusName, uint64_t bufferStart, uint64_t bufferEnd,
                                 uint64_t fileSize, const std::string& fileName, uint64_t waitingSinceUs) {
         std::unique_lock const lck(snapshotMtx);

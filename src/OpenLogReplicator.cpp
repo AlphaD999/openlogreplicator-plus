@@ -477,6 +477,7 @@ namespace OpenLogReplicator {
 
             if (!ctx->isDisableChecksSet(Ctx::DISABLE_CHECKS::JSON_TAGS)) {
                 static const std::vector<std::string> stateNames{
+                    "delivery-stall-us",
                     "drop-delivered-on-restart",
                     "drop-delivered-per-thread",
                     "interval-mb",
@@ -531,6 +532,16 @@ namespace OpenLogReplicator {
                                           ? "the watermark of its own redo thread (and never for a thread that was released from the low-water-mark)"
                                           : "the global delivered watermark (all redo threads)") +
                       " (\"" "drop-delivered-per-thread" "\": " + std::to_string(ctx->dropDeliveredPerThread ? 1 : 0) + ")");
+
+            // Warning 60071: how long the delivery may hand over nothing while work is still in the pipeline.
+            // 0 disables it. The message carries the pipeline occupancy and the last delivered scn, so the log
+            // alone tells whether the delivery or the parser is the one standing still.
+            if (stateJson.HasMember("delivery-stall-us"))
+                ctx->deliveryStallUs = Ctx::getJsonFieldU64(configFileName, stateJson, "delivery-stall-us");
+            if (ctx->deliveryStallUs > 0)
+                ctx->info(0, "delivery: warning 60071 when nothing has been handed to the writer for: " +
+                          std::to_string(ctx->deliveryStallUs / 1000000) + " s while work is waiting ('delivery-stall-us': " +
+                          std::to_string(ctx->deliveryStallUs) + ")");
 
             if (stateJson.HasMember("schema-force-interval"))
                 ctx->schemaForceInterval = Ctx::getJsonFieldU64(configFileName, stateJson, "schema-force-interval");

@@ -1203,6 +1203,10 @@ namespace OpenLogReplicator {
                         // archive identity over once more, so the first block the parser reads is checked against
                         // it and not adopted from a block header (see checkBlockHeader).
                         archReader->setArchiveSequence(parser->sequence);
+                        // Closes the window opened by Ctx::archUnreadable ("readable again after N s") - an archive
+                        // that arrives late is normal, one that never arrives is not, and the difference has to be
+                        // visible.
+                        ctx->archReadable(parser->path);
                         break;
                     }
 
@@ -1232,8 +1236,9 @@ namespace OpenLogReplicator {
                         break;
                     }
 
-                    ctx->info(0, "archived redo log " + parser->path + " is not ready for read, sleeping " +
-                              std::to_string(ctx->archReadSleepUs) + " us");
+                    // No per-retry line: Ctx::archUnreadable already logged this file (once per minute, escalating
+                    // to 60072) and carries the retry interval in its message. 61 identical INFO lines per file is
+                    // the other half of the 2026-11-03 flood.
                     contextSet(CONTEXT::SLEEP);
                     ctx->usleepInt(ctx->archReadSleepUs);
                     contextSet(CONTEXT::CPU);

@@ -314,6 +314,11 @@ namespace OpenLogReplicator {
                 // does it instead (warning 60053).
                 ctx->slowOpWatchdog();
 
+                // Delivery stall (warning 60071, "state"."delivery-stall-us"): independent of the parser watchdog
+                // below, which is gated on "watchdog-us" - a stalled delivery is the failure the operator sees first
+                // (delivery_lag_ms rising) and production 2026-11-03 spent five hours in it with nothing in the log.
+                ctx->deliveryStallCheck();
+
                 // Parser progress watchdog (see Ctx.h, warning 60055). This thread wakes ten times a second and
                 // keeps waking even when the writer is blocked in a delivery, which is exactly the state in
                 // which the parser can sit on the delivery mutex - so it is the second place that looks.

@@ -379,6 +379,24 @@ namespace OpenLogReplicator {
         // Report a parser without progress (warning 60055); "extraBusy" is what the caller's own lock probe
         // found, the locks of this class are probed here.
         void watchdogCheck(const std::string& extraBusy);
+
+        // An archive that the source's list calls for but that the mount does not answer (stat()/open() fails).
+        // Production 2026-11-03: every file was retried 61 times - one ERROR 10003 plus one INFO per retry, about
+        // 3,000 lines per hour - and not one line said "this archive has been unreadable for N minutes", which is
+        // the only thing that matters when the whole instance is stopped by it. One line per file per minute, and
+        // warning 60072 once the wait crosses two minutes.
+        static constexpr uint64_t ARCH_UNREADABLE_QUIET_US{60000000};
+        static constexpr uint64_t ARCH_UNREADABLE_WARN_US{60000000};
+        mutable std::mutex archUnreadableMtx;
+        std::string archUnreadableFile;
+        uint64_t archUnreadableSinceUt{0};
+        uint64_t archUnreadableLastLogUt{0};
+        uint64_t archUnreadableTries{0};
+        bool archUnreadableEscalated{false};
+        void archUnreadable(const std::string& fileName, const std::string& reason);
+        // Same file opened: closes the window started by archUnreadable() with one line, so "it came back" is
+        // visible as well (an archive that is late is normal; one that never arrives is not).
+        void archReadable(const std::string& fileName);
         // Archive slicing: when this many finished transactions wait in the commit sorter for the low-water-mark,
         // the current archive is sliced so that the other redo threads are parsed first. One memory chunk (1 MB)
         // is held per waiting transaction, so this bounds the memory used by the transactions of one archive.
@@ -661,6 +679,17 @@ namespace OpenLogReplicator {
         std::atomic<uint64_t> statDeliveredCommits{0};
         std::atomic<uint64_t> statDeliveredPerS{0};
         std::atomic<uint64_t> statSwapGetWaitMs{0};
+        // Wall clock of the last commit handed to the writer. Its age is what "the delivery stopped" means
+        // (warning 60071): production 2026-11-03 spent five hours with delivery_lag_ms rising and nobody noticed,
+        // because nothing in the log said that no commit had left for hours. Written by the delivery thread only.
+        std::atomic<uint64_t> statLastDeliveredUt{0};
+        // "state"."delivery-stall-us" (default 300 s, 0 disables): how long the delivery may hand over nothing
+        // while there is still work in the pipeline before 60071 is reported.
+        uint64_t deliveryStallUs{300000000};
+        std::atomic<uint64_t> deliveryStallWarnUt{0};
+        std::atomic<uint64_t> deliveryStallWarnCount{0};
+        // Report a delivery that stopped moving (warning 60071); called by the checkpoint thread ten times a second.
+        void deliveryStallCheck();
 
         // "state"."drop-delivered-on-restart": drop the commits of the rewind window that were already handed to
         // the writer before the restart (default on) instead of delivering them a second time. Off = the previous

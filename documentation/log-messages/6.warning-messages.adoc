@@ -642,3 +642,35 @@ What to do: stop the instance, clear the state directory, and start again (the d
 directory positioned from the current scn). The warning does not repeat once this version writes its own checkpoint,
 but leaving a stale directory in place keeps the run in the "drop nothing" mode.
 
+==== code 60071: "the delivery handed nothing to the writer for: <duration> while <n> item(s) are waiting (sorter_pending=..., in_delivery=..., writer_queue=..., builder_out=...), last delivered scn: <scn>, commits handed over in this run: <n> - this is what a rising delivery_lag_ms looks like from the inside; \"state\".\"delivery-stall-us\" sets the threshold (0 disables it), layers: ..."
+
+The delivery thread has not handed a single commit to the writer for `state."delivery-stall-us"` (default
+300 s, 0 disables) while work is still in the pipeline. That is the log-side counterpart of a `delivery_lag_ms`
+that only goes up: before 2026-11-03 nothing in the log said it, and a five-hour stall was found by looking at
+the metric by hand.
+
+Reported with a doubling backoff (the threshold, then 2x, up to 8x), and only while something is waiting
+(`sorter_pending + in_delivery + writer_queue + builder_out > 0`): a source with nothing to send is not a stall,
+it is what `60056` / `60072` describe.
+
+What to do: the message names the layer that holds the work. `sorter_pending` high with `in_delivery=0` = the
+sorter is not releasing (low-water-mark held by a redo thread, see `60045`/`60064`); `in_delivery` high =
+the delivery itself is waiting (look at `60065`/`60068`, the swap file and the builder ring); `writer_queue`
+high = the writer/client side (see `60031`).
+
+==== code 60072: "file: <path> - the archive list names it but it has not been readable for: <seconds> s (attempts: <n>, last error: <error>) - every redo thread that waits for it is stopped; check the archive mount (and the retention of the archive directory, an archive can be deleted while it is still in the list)"
+
+An archive that the source's list calls for cannot be opened (`stat()`/`open()` fails, usually `ENOENT`). The
+retry loop keeps trying (`archReadSleepUs`), and every thread that has to read past that archive waits - the
+instance delivers nothing at all, which is exactly what happened in production on 2026-11-03: the archives were
+deleted by the 5-hour retention while the list still named them, the log filled with `10003` (61 lines per file)
+and no line said why nothing was moving.
+
+`10003` carries the first two minutes of the same condition, one line per minute per file (it used to be one line
+per retry, 61 per file). When the file becomes readable the window is closed with
+`file: <path> - readable again after: <seconds> s (attempts: <n>)`.
+
+What to do: check the archive mount and its retention: if the archive was deleted while it was still listed, the
+redo of that range is gone and the position has to be re-established (start from the current scn) - the instance
+cannot recover on its own.
+

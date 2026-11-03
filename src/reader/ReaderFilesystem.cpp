@@ -106,7 +106,9 @@ namespace OpenLogReplicator {
         const int statRet = stat(path.c_str(), &fileStat);
         contextSet(CONTEXT::CPU);
         if (statRet != 0) {
-            ctx->error(10003, "file: " + path + " - get metadata returned: " + strerror(errno));
+            // Reported through Ctx::archUnreadable: one line per file per minute instead of one per retry (61 per
+            // file in production) and a real warning (60072) once the wait is long enough to stop the instance.
+            ctx->archUnreadable(path, "get metadata returned: " + std::string(strerror(errno)));
             return REDO_CODE::ERROR;
         }
 

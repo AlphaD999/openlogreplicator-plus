@@ -68,6 +68,8 @@ namespace OpenLogReplicator {
                     // at the head of this function). Only the delivery thread writes it - both the global maximum
                     // (the checkpoint value, and the rule the default switch uses) and the per-thread one.
                     ctx->statDeliveredCommits.fetch_add(1, std::memory_order_relaxed);
+                    // For warning 60071: the age of this stamp is "how long nothing has been handed over".
+                    ctx->statLastDeliveredUt.store(ctx->clock->getTimeUt(), std::memory_order_relaxed);
                     const uint64_t commitScnData = transaction->commitScn.getData();
                     if (commitScnData > ctx->deliveredUpToScn.load(std::memory_order_relaxed))
                         ctx->deliveredUpToScn.store(commitScnData, std::memory_order_relaxed);
