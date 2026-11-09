@@ -252,6 +252,36 @@ namespace OpenLogReplicator {
                             element->tag = Ctx::getJsonFieldS(configFileName, Ctx::JSON_TAG_LENGTH, tableElementJson, "tag");
                             element->parseTag(element->tag, separator);
                         }
+
+                        // A configuration reload re-creates every SchemaElement from the JSON file alone, which
+                        // loses the attributes derived while the schema was built:
+                        //   - the "tag"=[pk] default of the debezium-json format (set by the configuration
+                        //     parser, this file has no access to the "format" section), and
+                        //   - the columns of the first standalone UNIQUE index (resolved by
+                        //     ReplicatorOnline::createSchema and stored on the element).
+                        // Without inheriting them, a reload resets the element to SchemaElement's defaults
+                        // (tagType = NONE, empty keyList); the Kafka key of every table then silently becomes
+                        // null, or falls back to the UNIQUE *constraint* columns, which may be nullable and
+                        // therefore never present in the redo log.
+                        for (const SchemaElement* previous: metadata->schemaElements) {
+                            if (previous->owner != owner || previous->table != table)
+                                continue;
+                            if (!tableElementJson.HasMember("tag")) {
+                                element->tagType = previous->tagType;
+                                element->tagList = previous->tagList;
+                            }
+                            if (!tableElementJson.HasMember("key")) {
+                                element->keyList = previous->keyList;
+                                element->key = previous->key;
+                            }
+                            break;
+                        }
+
+                        // Fallback when there is no previous element to inherit from: apply the same default as
+                        // the configuration parser. A table that is not a filter target has no key anyway.
+                        if (!tableElementJson.HasMember("tag") && element->tagType == SchemaElement::TAG_TYPE::NONE &&
+                            metadata->envelopeOutput && DbTable::isFilterTable(element->options))
+                            element->tagType = SchemaElement::TAG_TYPE::PK;
                     }
 
                     for (const auto& user: metadata->users)

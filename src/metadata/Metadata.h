@@ -109,6 +109,10 @@ namespace OpenLogReplicator {
         bool suppLogDbAll{false};
         bool logArchiveFormatCustom{false};
         bool allowedCheckpoints{false};
+        // The source uses the Debezium envelope format ("format.type": "debezium-json"). Needed by the
+        // checkpoint reload and by the checkpoint-restore path, which re-create the "filter.table" elements
+        // from the configuration file only and have to re-apply the "no tag => key on the primary key" default.
+        bool envelopeOutput{false};
         // The writer is controlling the boot parameters. If the data is not available on startup, don't fail immediately.
         bool bootFailsafe{false};
         typeDbId dbId{0};

@@ -235,6 +235,10 @@ namespace OpenLogReplicator {
         throw RuntimeException(10040, "schema file missing");
     }
 
+    void Replicator::resolveKeys() {
+        // Nothing to resolve when the schema comes from a file (offline/batch): the key columns are part of it.
+    }
+
     void Replicator::updateOnlineRedoLogData() {
         int64_t lastGroup = -1;
         Reader* onlineReader = nullptr;
@@ -319,10 +323,16 @@ namespace OpenLogReplicator {
                         positionReader();
 
                     // No schema available?
-                    if (metadata->schema->scn == Scn::none())
+                    if (metadata->schema->scn == Scn::none()) {
                         createSchema();
-                    else
+                    } else {
+                        // The schema comes from a checkpoint: it holds the table structure only, the key
+                        // columns derived at build time are re-created from the configuration file alone.
+                        // Re-resolve them before the first message is built, otherwise the Kafka key of
+                        // every table is silently empty.
+                        resolveKeys();
                         metadata->allowCheckpoints();
+                    }
                     metadata->schema->updateXmlCtx();
 
                     if (metadata->sequence == Seq::none())

@@ -716,6 +716,7 @@ namespace OpenLogReplicator {
         std::string getModeName() const override;
         void verifySchema(Scn currentScn) override;
         void createSchema() override;
+        void resolveKeys() override;
         void readSystemDictionariesMetadata(Schema* schema, Scn targetScn);
         void readSystemDictionariesDetails(Schema* schema, Scn targetScn, typeUser user, typeObj obj);
         void readSystemDictionaries(Schema* schema, Scn targetScn, const std::string& owner, const std::string& table, DbTable::OPTIONS options);

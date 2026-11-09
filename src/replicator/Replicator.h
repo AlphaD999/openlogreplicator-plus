@@ -154,6 +154,10 @@ namespace OpenLogReplicator {
         virtual bool continueWithOnline();
         virtual void verifySchema(Scn currentScn);
         virtual void createSchema();
+        // Called when the schema was restored from a checkpoint instead of being read from the database.
+        // The restored schema carries no key information (the "filter.table" entries are re-created from the
+        // configuration file only), so an implementation that can reach the database re-resolves it here.
+        virtual void resolveKeys();
         virtual void updateOnlineRedoLogData();
         // Loads the incarnation list from the database. Needed on the archives-only / RAC path as well: online
         // redo log data is not read there, but the resetlogs of the current incarnation is still required to

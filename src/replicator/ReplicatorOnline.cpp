@@ -684,7 +684,29 @@ namespace OpenLogReplicator {
             metadata->firstSchemaScn = metadata->firstDataScn;
             readSystemDictionariesMetadata(metadata->schema, metadata->firstDataScn);
 
-            for (const SchemaElement* element: metadata->schemaElements) {
+            for (SchemaElement* element: metadata->schemaElements) {
+                // Debezium-compatible key inference: an explicit "key" wins, otherwise a table without a
+                // primary key falls back to the columns of its first standalone UNIQUE index. The resolved
+                // columns are stored back on the element (not only passed down) so that a later configuration
+                // reload - Checkpoint::load() re-creates every SchemaElement - can inherit them; otherwise the
+                // reload falls back to the UNIQUE *constraint* columns, which may be nullable and therefore
+                // never present in the redo log, and the Kafka key silently becomes null.
+                if (DbTable::isFilterTable(element->options) && element->keyList.empty()) {
+                    std::vector<std::string> uniqueIndexColumns;
+                    readUniqueIndexColumns(element->owner, element->table, uniqueIndexColumns);
+                    if (!uniqueIndexColumns.empty()) {
+                        element->keyList = uniqueIndexColumns;
+                        if (element->key.empty()) {
+                            for (uint64_t i = 0; i < uniqueIndexColumns.size(); ++i) {
+                                if (i > 0)
+                                    element->key.append(",");
+                                element->key.append(uniqueIndexColumns[i]);
+                            }
+                        }
+                        ctx->info(0, "table " + element->owner + "." + element->table +
+                                  " has no primary key; using unique index columns as key");
+                    }
+                }
                 createSchemaForTable(metadata->firstDataScn, element->owner, element->table, element->keyList, element->key, element->tagType,
                                      element->tagList, element->tag, element->condition, element->options, tablesUpdated);
             }
@@ -698,6 +720,64 @@ namespace OpenLogReplicator {
 
         for (const auto& [_, tableName]: tablesUpdated)
             ctx->info(0, "- found: " + tableName);
+    }
+
+    void ReplicatorOnline::resolveKeys() {
+        if (!checkConnection())
+            return;
+
+        bool changed = false;
+        for (SchemaElement* element: metadata->schemaElements) {
+            // Only filter targets get a Kafka key; the dictionary tables loaded to track the schema do not.
+            if (!DbTable::isFilterTable(element->options))
+                continue;
+
+            // Debezium-compatible default of the "debezium-json" format: without an explicit "tag" the table is
+            // keyed on its primary key. The configuration parser applies it, the checkpoint restore does not.
+            if (element->tagType == SchemaElement::TAG_TYPE::NONE && metadata->envelopeOutput) {
+                element->tagType = SchemaElement::TAG_TYPE::PK;
+                changed = true;
+            }
+
+            if (element->keyList.empty()) {
+                std::vector<std::string> uniqueIndexColumns;
+                readUniqueIndexColumns(element->owner, element->table, uniqueIndexColumns);
+                if (!uniqueIndexColumns.empty()) {
+                    element->keyList = uniqueIndexColumns;
+                    if (element->key.empty()) {
+                        for (uint64_t i = 0; i < uniqueIndexColumns.size(); ++i) {
+                            if (i > 0)
+                                element->key.append(",");
+                            element->key.append(uniqueIndexColumns[i]);
+                        }
+                    }
+                    changed = true;
+                    ctx->info(0, "table " + element->owner + "." + element->table +
+                              " has no primary key; using unique index columns as key");
+                }
+            }
+        }
+
+        if (!changed)
+            return;
+
+        // Rebuild the DbTable objects so the resolved key reaches DbTable::tagCols - the same sequence a
+        // configuration reload uses (see Checkpoint::load): purge, mark every object as touched, rebuild.
+        std::vector<std::string> msgs;
+        std::unordered_map<typeObj, std::string> tablesUpdated;
+        {
+            std::unique_lock const lckTransaction(metadata->mtxTransaction);
+            std::unique_lock const lck(metadata->mtxSchema);
+            metadata->schema->purgeMetadata();
+            for (const auto& entry: metadata->schema->sysObjPack.mapRowId)
+                metadata->schema->touchTable(entry.second->obj);
+            metadata->buildMaps(msgs, tablesUpdated);
+            metadata->schema->resetTouched();
+        }
+        for (const auto& msg: msgs)
+            ctx->info(0, msg);
+        for (const auto& entry: tablesUpdated)
+            ctx->info(0, "- found: " + entry.second);
     }
 
     void ReplicatorOnline::readSystemDictionariesMetadata(Schema* schema, Scn targetScn) {
@@ -1608,17 +1688,10 @@ namespace OpenLogReplicator {
 
         readSystemDictionaries(metadata->schema, targetScn, owner, table, options);
 
-        // Debezium-compatible key inference (online mode): when no explicit key is configured, fall
-        // back to the first standalone UNIQUE index of the table. Indexes backing PK/UNIQUE constraints
-        // are excluded by the query and are already resolved by Schema::buildMaps (isPK / isUnique).
-        std::vector<std::string> effectiveKeyList = keyList;
-        if (effectiveKeyList.empty()) {
-            readUniqueIndexColumns(owner, table, effectiveKeyList);
-            if (!effectiveKeyList.empty())
-                ctx->info(0, "table " + owner + "." + table + " has no primary key; using unique index columns as key");
-        }
-
-        metadata->schema->buildMaps(owner, table, effectiveKeyList, key, tagType, tagList, tag, condition, options, tablesUpdated, metadata->suppLogDbPrimary,
+        // The Debezium-compatible fallback to the first standalone UNIQUE index is resolved once by the
+        // caller (createSchema), which stores the result on the SchemaElement so a configuration reload can
+        // inherit it. keyList already carries those columns here.
+        metadata->schema->buildMaps(owner, table, keyList, key, tagType, tagList, tag, condition, options, tablesUpdated, metadata->suppLogDbPrimary,
                                     metadata->suppLogDbAll, metadata->defaultCharacterMapId,
                                     metadata->defaultCharacterNcharMapId);
     }

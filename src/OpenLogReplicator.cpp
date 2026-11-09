@@ -931,6 +931,11 @@ namespace OpenLogReplicator {
                 xidFormat = Format::XID_FORMAT::TEXT_REVERSED;
             }
 
+            // Needed later by Checkpoint::load() and ReplicatorOnline::resolveKeys(): both re-create the
+            // "filter.table" elements outside of this parser, and the Debezium "no tag => key on the primary
+            // key" default has to be applied there as well.
+            metadata->envelopeOutput = envelopeOutput;
+
             if (formatJson.HasMember("db")) {
                 const uint val = Ctx::getJsonFieldU64(configFileName, formatJson, "db");
                 if (val > 3)
