@@ -143,6 +143,13 @@ namespace OpenLogReplicator {
         uint64_t stallYieldLastUs{0};
         uint64_t stallYieldWindowStartUs{0};
         uint64_t stallYieldWindowCount{0};
+        // Credit yield (2026-11-05a): the pass ended because the commit credit of this thread was reached while
+        // another thread held the low-water-mark (CommitSorter::waitForBacklog returned true). The position is a
+        // verified LWN head, exactly like the slice one, so the pass summary and the resume path are shared and
+        // only the reason differs.
+        const char* yieldReason{nullptr};
+        uint64_t creditYieldWindowStartUs{0};
+        uint64_t creditYieldWindowCount{0};
 
         Parser(Ctx* newCtx, Builder* newBuilder, Metadata* newMetadata, TransactionBuffer* newTransactionBuffer, int newGroup, std::string newPath);
         ~Parser();
@@ -153,6 +160,12 @@ namespace OpenLogReplicator {
         [[nodiscard]] Scn orderScn() const {
             return sliceScn != Scn::none() ? sliceScn : firstScn;
         }
+
+        // True when the last pass ended because of the commit credit (CommitSorter::waitForBacklog returned true) and
+        // not because of an archive slice: both exits save the position at a verified LWN head and set slicePending,
+        // so without this the result of the archive would read " (sliced)" while slicing is switched off - measured
+        // in production 2026-11-06: 15 "(sliced)" results against "slice-pending-commits": 0 and credit_yields=15.
+        [[nodiscard]] bool isCreditYield() const { return yieldReason != nullptr; }
 
         Reader::REDO_CODE parse();
         [[nodiscard]] std::string toString() const;

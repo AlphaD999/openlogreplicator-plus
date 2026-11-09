@@ -89,7 +89,13 @@ class Thread;
         // by the parser at the *head* of a record, right after it published its water-mark there - the wait is per
         // redo thread and at a record boundary, both for reasons that were measured (see the implementation). The
         // lock is released while waiting.
-        void waitForBacklog(uint16_t thread);
+        //
+        // Returns true when the caller should *yield* instead of waiting any longer: the thread is stopped by its
+        // commit credit (not by the pool or the swap bound) while another thread holds the low-water-mark, so the
+        // commits can not become deliverable until that other thread is parsed - and the parser is the only thread
+        // that could parse it. The caller then ends the pass at the verified LWN head (the slice/stall-yield exit)
+        // and the scheduler picks the watermark holder next. False = the wait ended, go on.
+        bool waitForBacklog(uint16_t thread);
         void enqueueCheckpoint(const CheckpointEvent& event);
         // All records with scn <= parsedScn have been analyzed for the thread. "currentTime" is the
         // microsecond clock of the parser and is only used to measure how long a thread has been idle:
@@ -161,6 +167,17 @@ class Thread;
         static constexpr uint64_t CREDIT_REPORT_US{3000000};
         static constexpr uint64_t CREDIT_REPORT_GAP_US{60000000};
         std::array<uint64_t, 16> creditWarnUs{};
+        // 2026-11-05a: a thread stopped by its credit while *another* thread holds the low-water-mark can not make
+        // its own commits deliverable - only the watermark holder can, and this parser is the single thread that
+        // could parse it. Waiting here ends in the emergency release (BACKPRESSURE_EMERGENCY_US) which delivers
+        // without the water-mark and gives up the global order; returning to the scheduler instead lets it parse
+        // the watermark holder first. Measured in production 2026-11-05: four such waits, each reported as 60064
+        // after CREDIT_REPORT_US with "deliverable now: 0 of N ... the rest waits for the water-mark".
+        // The threshold is far below the emergency one and far above the 100 ms poll, and the per-thread gap keeps
+        // a noisy thread from yielding on every record.
+        static constexpr uint64_t CREDIT_YIELD_US{250000};
+        static constexpr uint64_t CREDIT_YIELD_GAP_US{500000};
+        std::array<uint64_t, 16> lastCreditYieldUs{};
         // Lowest guaranteed backlog of one redo thread, in chunks (see minShareLocked): 64 chunks is 4 MB with the
         // default 64 KB transaction block. Small on purpose - it only has to keep a thread that is behind able to
         // enqueue, i.e. able to publish a water-mark; everything above it comes from the pool as it becomes free.
@@ -318,6 +335,13 @@ class Thread;
         // and by flushUpTo() only, i.e. under sorterMtx, so they can not drift away from the events.
         std::map<uint16_t, uint64_t> chunksByThread;
         uint64_t pendingChunks{0};
+        // Events currently in the map below, maintained incrementally (+1 on every insert, -n on every collect).
+        // syncPendingEvents() used to count them by walking the whole map, and that call sits on three hot paths:
+        // once per redo block (Parser::parse), once per commit (enqueueCommit) and once per idle poll of the writer
+        // (Builder::sleepForWriterWork). The walk is O(buffered), so the cost of every block rose with the backlog
+        // and the four threads convoyed on sorterMtx: production 2026-11-03/04 fell from 20-28 MB/s (backlog 0) to
+        // 4-5 MB/s (3,000-4,000 buffered SCN groups), 70% of the stack samples landed in std::_Rb_tree_increment.
+        uint64_t bufferedEvents{0};
         std::map<Scn, std::vector<Event*>> events; // insertion order preserved within the same SCN
         std::map<uint16_t, Scn> threadWatermark;
         std::set<uint16_t> closedThreads;

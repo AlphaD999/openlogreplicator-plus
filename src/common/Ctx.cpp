@@ -312,9 +312,13 @@ namespace OpenLogReplicator {
         if (statDeliveredCommits.load(std::memory_order_relaxed) == 0)
             return;
 
-        const uint64_t now = clock->getTimeUt();
+        // "last" is read before "now": the delivery thread writes the stamp, so reading the clock first and the
+        // stamp after it can produce now < last (a delivery that happened in between) - and that used to fall
+        // through to the report with waitedUs clamped to 0, i.e. warning 60071 said "nothing handed over for:
+        // 0 ms" (measured: 128 of 128 reports on 2026-11-04 were "0 ms", none of them a real stall).
         const uint64_t last = statLastDeliveredUt.load(std::memory_order_relaxed);
-        if (last != 0 && now > last && now - last < deliveryStallUs) {
+        const uint64_t now = clock->getTimeUt();
+        if (last == 0 || now <= last || now - last < deliveryStallUs) {
             deliveryStallWarnCount.store(0, std::memory_order_relaxed);
             return;
         }
@@ -362,6 +366,43 @@ namespace OpenLogReplicator {
               "sets the threshold (0 disables it)";
         ss << ", layers:" << layersLine();
         warning(60071, ss.str());
+    }
+
+    void Ctx::writerQueueCheck() {
+        const uint64_t writerQueue = statWriterQueue.load(std::memory_order_relaxed);
+        if (writerQueue < WRITER_QUEUE_WARN) {
+            // Drained (or never grew): arm the report again for the next burst.
+            writerQueueWarnCount.store(0, std::memory_order_relaxed);
+            writerQueueWarnUt.store(0, std::memory_order_relaxed);
+            return;
+        }
+        const uint64_t queueLimit = queueSize;
+        const uint64_t now = clock->getTimeUt();
+        // Same backoff as 60071: the first report at the threshold, then every doubling interval up to eight times it
+        // (one line per minute in practice), so a writer queue that stays high for hours does not flood the log.
+        uint64_t interval = 60000000;
+        const uint64_t reports = writerQueueWarnCount.load(std::memory_order_relaxed);
+        for (uint64_t n = 0; n < reports && interval < 480000000; ++n)
+            interval *= 2;
+        uint64_t lastWarn = writerQueueWarnUt.load(std::memory_order_relaxed);
+        if (lastWarn != 0 && now > lastWarn && now - lastWarn < interval)
+            return;
+        if (!writerQueueWarnUt.compare_exchange_strong(lastWarn, now, std::memory_order_relaxed))
+            return;
+        writerQueueWarnCount.fetch_add(1, std::memory_order_relaxed);
+
+        std::ostringstream ss;
+        ss << "the writer queue holds " << writerQueue << " message(s) of the " << queueLimit
+           << " allowed by \"queue-size\" (high-water mark since the start: "
+           << statWriterQueueHwm.load(std::memory_order_relaxed) << "), sorter_pending="
+           << statPendingDeliveries.load(std::memory_order_relaxed) << ", in_delivery="
+           << statInDelivery.load(std::memory_order_relaxed) << ", builder_out="
+           << statBuilderOut.load(std::memory_order_relaxed)
+           << " - the client (broker, topic, or its acknowledgement) is slower than the delivery: at the limit the "
+              "writer stops the delivery thread, the sorter then stops the parser and the lag starts to rise. Check "
+              "the broker and \"linger.ms\" before raising \"queue-size\"";
+        ss << ", layers:" << layersLine();
+        warning(60073, ss.str());
     }
 
     void Ctx::setReaderSnapshot(uint16_t thread, const char* statusName, uint64_t bufferStart, uint64_t bufferEnd,
@@ -437,13 +478,17 @@ namespace OpenLogReplicator {
                 if (value > pendingMax)
                     pendingMax = value;
             }
-            ss << " credit=" << creditCurrent.load(std::memory_order_relaxed)
+            // creditToEnforce() and not creditCurrent: the latter is only written by the AIMD controller, so with a
+            // fixed "pending-commits-per-thread" it kept printing the 4096 initial value (measured 2026-11-05 in the
+            // rig: the run enforced 1 and the layers line said 4096 - a false trail when reading the report).
+            ss << " credit=" << creditToEnforce()
                << " pending_max=" << pendingMax;
         }
         ss << " swap_chunks=" << swappedChunks.load(std::memory_order_relaxed)
            << " swap_chunks_max=" << swapChunksLimit.load(std::memory_order_relaxed)
            << " swap_cap_hit=" << (swapCapReached() ? 1 : 0)
-           << " stall_yields=" << statStallYields.load(std::memory_order_relaxed);
+           << " stall_yields=" << statStallYields.load(std::memory_order_relaxed)
+           << " credit_yields=" << statCreditYields.load(std::memory_order_relaxed);
         return ss.str();
     }
 

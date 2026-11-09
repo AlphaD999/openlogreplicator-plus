@@ -1365,7 +1365,10 @@ namespace OpenLogReplicator {
         void releaseBuffers(Thread* t, uint64_t maxId);
         void releaseDdl();
         void appendDdlChunk(const uint8_t* data, typeTransactionSize size);
-        void sleepForWriterWork(Thread* t, uint64_t queueSize, uint64_t nanoseconds);
+        // The interval is Ctx::pollIntervalUs, i.e. microseconds - it used to be passed to a std::chrono::nanoseconds
+        // wait, which made the site value of "poll-interval-us": 1000 a 1 us poll of the writer (1,000 times more
+        // often than configured) and every poll takes sorterMtx in the delivery nudge below.
+        void sleepForWriterWork(Thread* t, uint64_t queueSize, uint64_t microseconds);
         void wakeUp();
 
         void flush() {

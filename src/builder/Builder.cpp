@@ -2564,7 +2564,7 @@ namespace OpenLogReplicator {
         }
     }
 
-    void Builder::sleepForWriterWork(Thread* t, uint64_t queueSize, uint64_t nanoseconds) {
+    void Builder::sleepForWriterWork(Thread* t, uint64_t queueSize, uint64_t microseconds) {
         if (unlikely(ctx->isTraceSet(Ctx::TRACE::SLEEP)))
             ctx->logTrace(Ctx::TRACE::SLEEP, "Builder:sleepForWriterWork");
 
@@ -2581,8 +2581,10 @@ namespace OpenLogReplicator {
         // this thread's own work. The defect C emergency (a parser blocked in Ctx::swappedMemoryInit) is the
         // delivery thread's job as well: it brings the lowest buffered event out without waiting for the
         // water-mark while the parser is blocked (see DeliveryExecutor::run).
+        // The atomic mirror, not CommitSorter::getPendingEvents(): this runs on every idle poll of the writer (the
+        // poll interval is 1 us with the site value of "poll-interval-us"), and the getter takes sorterMtx.
         if (metadata->commitSorter != nullptr && !ctx->hardShutdown &&
-            metadata->commitSorter->getPendingEvents() > 0)
+            ctx->statPendingDeliveries.load(std::memory_order_relaxed) > 0)
             metadata->commitSorter->notifyDelivery();
 
         {
@@ -2590,7 +2592,7 @@ namespace OpenLogReplicator {
             std::unique_lock lck(mtx);
             t->contextSet(Thread::CONTEXT::WAIT, Thread::REASON::WRITER_NO_WORK);
             if (queueSize > 0)
-                condNoWriterWork.wait_for(lck, std::chrono::nanoseconds(nanoseconds));
+                condNoWriterWork.wait_for(lck, std::chrono::microseconds(microseconds));
             else
                 // Nothing is in flight, so a longer wait is fine: the delivery thread wakes this thread up
                 // (Builder::flush) as soon as it has built messages, and the five seconds are only the fallback.

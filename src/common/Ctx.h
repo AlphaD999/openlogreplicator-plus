@@ -453,8 +453,12 @@ namespace OpenLogReplicator {
         // while they are in fact archiving. Must stay well above "archive_lag_target" plus the arrival and
         // visibility delay of the archives (900 s default). 0 = disabled: a thread is never released, only waited for.
         uint64_t threadInactiveUs{900000000};
-        // Writer
-        uint64_t pollIntervalUs{100000};
+        // Writer: the fallback poll of the writer when it has no message to send, in MICROSECONDS. The default used
+        // to be 100000 with the value handed to a std::chrono::nanoseconds wait, i.e. an effective 100 us poll; the
+        // unit is fixed (Builder::sleepForWriterWork takes microseconds) and the default is 1 ms, which is the same
+        // order as the old effective value and still 1000x above a "1 us" misreading. The writer is normally woken
+        // by Builder::wakeUp() and this interval is only the fallback.
+        uint64_t pollIntervalUs{1000};
         uint64_t queueSize{65536};
 
         std::atomic<uint32_t> version{0}; // Compatibility level of redo logs
@@ -694,6 +698,16 @@ namespace OpenLogReplicator {
         // Report a delivery that stopped moving (warning 60071); called by the checkpoint thread ten times a second.
         void deliveryStallCheck();
 
+        // Warning 60073: the writer queue (messages produced but not confirmed by the client) is close to
+        // "writer"."queue-size" - the writer is then one step away from stopping the delivery thread, which stops
+        // the sorter, which stops the parser. In production 2026-11-05/06 the high-water mark reached 17,068 of
+        // 65,536 (26%) in bursts around the restart catch-up and no counter said a word about it, so this reports the
+        // first crossing and then every doubling interval, and re-arms when the queue drains below the threshold.
+        static constexpr uint64_t WRITER_QUEUE_WARN{20000};
+        std::atomic<uint64_t> writerQueueWarnUt{0};
+        std::atomic<uint64_t> writerQueueWarnCount{0};
+        void writerQueueCheck();
+
         // "state"."drop-delivered-on-restart": drop the commits of the rewind window that were already handed to
         // the writer before the restart (default on) instead of delivering them a second time. Off = the previous
         // behaviour, which trades the duplicates for nothing: the commits in the writer queue at the stop are lost
@@ -711,8 +725,10 @@ namespace OpenLogReplicator {
         // g4: the credit actually applied (written by CommitSorter: the configured value, or the one AIMD picked).
         std::atomic<uint64_t> creditCurrent{4096};
         // Highest number of buffered commits seen for a single thread since the last layers report - the number that
-        // says whether the credit holds (it should stay at the credit plus one record) or whether something still
-        // runs away from it. Mirrored by CommitSorter::syncPendingEvents(), reset by layersLine().
+        // says whether the credit holds or whether something still runs away from it. The real bound is the credit
+        // plus the commits of one record (the backpressure is checked at a record head; measured: 4,127 against a
+        // credit of 4,096, one record carrying 31 commits), not "plus one". Mirrored by
+        // CommitSorter::syncPendingEvents(), reset by layersLine().
         std::array<std::atomic<uint64_t>, 16> statPendingMaxByThread{};
         // Microseconds each thread spent stopped by the credit in the current report interval: the congestion signal
         // of the AIMD controller, and the number that tells "the parser is held on purpose" from "the parser is
@@ -732,6 +748,11 @@ namespace OpenLogReplicator {
         // Archives yielded because the read stalled (see stallYieldUs): cumulative, and per thread for the 60067
         // report.
         std::atomic<uint64_t> statStallYields{0};
+        // 2026-11-05a: passes ended because the commit credit of the thread was reached while another thread held
+        // the low-water-mark (CommitSorter::waitForBacklog -> true). Reported in the layers line next to
+        // stall_yields, so a run can be checked for "yield instead of wait" without reading the log.
+        std::atomic<uint64_t> statCreditYields{0};
+        std::array<std::atomic<uint64_t>, 16> statCreditYieldsByThread{};
         // Archives waiting in the replicator queue, mirrored by Replicator::run() when it takes one out. A stalled
         // parser only yields when this is not zero: with nothing else to parse, yielding would reopen the same file.
         std::atomic<uint64_t> archivesQueued{0};

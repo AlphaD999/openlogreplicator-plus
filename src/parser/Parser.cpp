@@ -1361,6 +1361,9 @@ namespace OpenLogReplicator {
     Reader::REDO_CODE Parser::parse() {
         typeBlk lwnConfirmedBlock = 2;
         uint64_t lwnRecords = 0;
+        // Every pass starts with no yield reason: the scheduler reads it right after this call returns (to label the
+        // result of the archive "credit-yield" instead of "sliced"), and it must not survive into the next pass.
+        yieldReason = nullptr;
 
         if (firstScn == Scn::none() && nextScn == Scn::none() && reader->getFirstScn() != Scn::zero()) {
             firstScn = reader->getFirstScn();
@@ -1530,9 +1533,12 @@ namespace OpenLogReplicator {
                         ((static_cast<uint64_t>(currentBlock) * reader->getBlockSize()) / ctx->memoryChunkSize) % ctx->memoryChunksReadBufferMax;
                 const uint8_t* redoBlock = reader->redoBufferList[redoBufferNum] + redoBufferPos;
 
-                // Watchdog (Ctx::watchdogCheck): where the parser was the last time it moved
-                ctx->watchdogNote(thread, static_cast<uint64_t>(currentBlock) * reader->getBlockSize(),
-                                  metadata->commitSorter != nullptr ? metadata->commitSorter->getPendingEvents() : 0);
+                // Watchdog (Ctx::watchdogCheck): where the parser was the last time it moved. The buffered count is
+                // read from the atomic mirror and not from CommitSorter::getPendingEvents(): that one takes
+                // sorterMtx and (before the incremental counter) walked the whole map, i.e. once per redo block.
+                if (unlikely(ctx->watchdogUs > 0))
+                    ctx->watchdogNote(thread, static_cast<uint64_t>(currentBlock) * reader->getBlockSize(),
+                                      ctx->statPendingDeliveries.load(std::memory_order_relaxed));
 
                 blockOffset = 16U;
                 // New LWN block
@@ -1730,8 +1736,36 @@ namespace OpenLogReplicator {
                         // record carrying more commits than the limit (measured: 4,097 of a limit of 4,096) would
                         // have the parser wait for a water-mark only it could publish. Here the water-mark of this
                         // record was published just above, so everything of the previous records is deliverable.
-                        if (metadata->commitSorter != nullptr)
-                            metadata->commitSorter->waitForBacklog(thread);
+                        if (metadata->commitSorter != nullptr && metadata->commitSorter->waitForBacklog(thread)) {
+                            // 2026-11-05a credit yield: the credit of this thread is reached and another thread
+                            // holds the low-water-mark, so nothing of this one can be delivered until that thread
+                            // is parsed - and this is the only thread that could parse it. End the pass at the
+                            // verified LWN head (the same exit the slice and stall-yield paths use) and let the
+                            // scheduler pick the watermark holder next, instead of waiting for the emergency
+                            // release that delivers without the water-mark.
+                            ctx->statCreditYields.fetch_add(1, std::memory_order_relaxed);
+                            ctx->statCreditYieldsByThread[thread].fetch_add(1, std::memory_order_relaxed);
+                            const uint64_t yieldNowUs = ctx->clock->getTimeUt();
+                            if (creditYieldWindowStartUs == 0 ||
+                                (yieldNowUs > creditYieldWindowStartUs && yieldNowUs - creditYieldWindowStartUs >= 60000000)) {
+                                creditYieldWindowStartUs = yieldNowUs;
+                                creditYieldWindowCount = 0;
+                            }
+                            ++creditYieldWindowCount;
+                            if (creditYieldWindowCount == 4)
+                                ctx->warning(60067, "redo thread: " + std::to_string(thread) + " yielded archive seq: " +
+                                             sequence.toString() + " " + std::to_string(creditYieldWindowCount) +
+                                             " time(s) within a minute because it was stopped by its commit credit while "
+                                             "another thread held the low-water-mark - the parser is a single thread, so "
+                                             "that thread has to be parsed for the commits to become deliverable (see "
+                                             "\"pending-commits-per-thread\" and credit_yields in the layers line)");
+                            metadata->saveFileOffset(thread, sequence, FileOffset(lwnConfirmedBlock, reader->getBlockSize()));
+                            if (lwnScn != Scn::none())
+                                sliceScn = lwnScn;
+                            yieldReason = "credit-yield";
+                            slicePending = true;
+                            break;
+                        }
 
                         ++lwnNumCnt;
 
@@ -2028,7 +2062,7 @@ namespace OpenLogReplicator {
             // Archive sliced: the position is saved and the scheduler will resume this parser after the other
             // redo threads have been parsed (and released the memory held by the commit sorter)
             if (slicePending) {
-                passSummary("sliced");
+                passSummary(yieldReason != nullptr ? yieldReason : "sliced");
                 break;
             }
 

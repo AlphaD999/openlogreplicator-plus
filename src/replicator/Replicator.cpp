@@ -1006,8 +1006,11 @@ namespace OpenLogReplicator {
                         if (archWaitReportTime == 0 || nowUs - archWaitReportTime >= interval) {
                             archWaitReportTime = nowUs;
                             ++archWaitReportCount;
-                            ctx->warning(60056, "no archived redo log to read for: " + std::to_string((nowUs - archWaitSince) / 1000000) +
-                                         " s - " + archiveWaitState() + " (\"arch-wait-warn-us\")");
+                            // INFO since 2026-11-05a: waiting for the next archive is normal operation on a quiet
+                            // instance (measured: 385 times in 16 h), and as a WARN it drowned the real warnings -
+                            // 60045 and 60056 together were 1,360 of the ~1,400 WARN lines of that run.
+                            ctx->info(0, "no archived redo log to read for: " + std::to_string((nowUs - archWaitSince) / 1000000) +
+                                      " s - " + archiveWaitState() + " (\"arch-wait-warn-us\")");
                         }
                     }
 
@@ -1269,7 +1272,8 @@ namespace OpenLogReplicator {
                 // all, which made a run that stopped delivering indistinguishable from an idle one.
                 ctx->info(0, "archived redo log " + parser->path + " - thread: " + std::to_string(parser->thread) +
                           ", seq: " + parser->sequence.toString() + " - result: " +
-                          std::string(Reader::REDO_MSG[static_cast<uint>(ret)]) + (parser->slicePending ? " (sliced)" : "") +
+                          std::string(Reader::REDO_MSG[static_cast<uint>(ret)]) +
+                          (parser->isCreditYield() ? " (credit-yield)" : (parser->slicePending ? " (sliced)" : "")) +
                           ", position: " + archReader->getBufferStart().toString() + " / " + archReader->getBufferEnd().toString() +
                           ", expected sequence: " + metadata->threadSequence(parser->thread).toString());
 

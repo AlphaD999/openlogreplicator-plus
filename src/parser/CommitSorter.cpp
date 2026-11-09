@@ -141,6 +141,7 @@ namespace OpenLogReplicator {
         std::unique_lock lck(sorterMtx);
         events[commitScn].push_back(event);
         ++pendingEvents;
+        ++bufferedEvents;
         ++pendingByThread[event->thread];
         chunksByThread[event->thread] += event->chunks;
         pendingChunks += event->chunks;
@@ -150,7 +151,7 @@ namespace OpenLogReplicator {
         // Parser::parse) and not per commit - see the comment there.
     }
 
-    void CommitSorter::waitForBacklog(uint16_t thread) {
+    bool CommitSorter::waitForBacklog(uint16_t thread) {
         // Backpressure (stage 2): with the delivery on its own thread (stage 4) nothing else paces the parser -
         // it can walk away from the delivery until the transaction pool is full, and a buffered commit that owns
         // a single chunk can not be swapped out, so the pool can not be relieved any more (measured: 4,500
@@ -171,11 +172,13 @@ namespace OpenLogReplicator {
         //    one record and not by the limit exactly, which the free half of the pool covers.
         std::unique_lock lck(sorterMtx);
         if (ctx == nullptr)
-            return;
+            return false;
         if (allowanceLocked(thread) == 0)
-            return; // the pool is not initialized (yet): nothing to bound against
+            return false; // the pool is not initialized (yet): nothing to bound against
 
         bool reported = false;
+        // Set when the caller should end the pass at the LWN head instead of waiting any longer (see the header).
+        bool yield = false;
         // Emergency: a wait longer than BACKPRESSURE_EMERGENCY_US means this parser can not go on while the delivery
         // has nothing it may flush below the low-water-mark - the same circle the swapped-memory wait has (see
         // Ctx::parserInSwapWait): the parser is the only thread that publishes a position, and it is the blocked one.
@@ -224,6 +227,32 @@ namespace OpenLogReplicator {
                 // Wake the delivery thread: it is the one that acts on the flag (DeliveryExecutor::run).
                 notifyDeliveryLocked();
             }
+
+            // 2026-11-05a credit yield. Only the thread that holds the low-water-mark can make buffered commits
+            // deliverable, and this parser is the single thread that could parse it - so waiting here can only end
+            // in the emergency release above, which delivers without the water-mark and gives up the global order
+            // (production 2026-11-05: four waits, each reported by 60064 as "deliverable now: 0 of N ... the rest
+            // waits for the water-mark"). Ending the pass at the LWN head instead lets the scheduler parse the
+            // watermark holder first, and that is the same verified position the slice and stall-yield exits use.
+            //
+            // lowWaterMarkLocked() and not isAheadOfWatermark(): that one takes sorterMtx on its own and this
+            // function already holds it. hitChunks/hitSwapCap are excluded on purpose - those are pool and disk
+            // pressure, and no other thread would be better off parsing them either.
+            if (!yield && hitCredit && !hitChunks && !hitSwapCap && creditBlockedSince != 0 && now > creditBlockedSince &&
+                now - creditBlockedSince >= CREDIT_YIELD_US &&
+                ctx->archivesQueued.load(std::memory_order_relaxed) > 0) {
+                const Scn lowWaterMark = lowWaterMarkLocked();
+                const auto mineIt = threadWatermark.find(thread);
+                const Scn mine = mineIt == threadWatermark.end() ? Scn::none() : mineIt->second;
+                const bool otherHoldsWatermark = lowWaterMark != Scn::none() && (mine == Scn::none() || mine > lowWaterMark);
+                const uint64_t lastYield = lastCreditYieldUs[thread < 16 ? thread : 0];
+                if (otherHoldsWatermark &&
+                    (lastYield == 0 || (now > lastYield && now - lastYield >= CREDIT_YIELD_GAP_US))) {
+                    lastCreditYieldUs[thread < 16 ? thread : 0] = now;
+                    yield = true;
+                    break;
+                }
+            }
             // g4: the credit has its own report. 60062 talks about the pool (chunks); a thread stopped by the
             // credit is not waiting for memory, it is waiting for the delivery to catch up - mixing the two in one
             // message made the analysis read a memory problem where there was an ordering one.
@@ -246,6 +275,7 @@ namespace OpenLogReplicator {
                              std::to_string((now - creditBlockedSince) / 1000000) + " s - redo thread: " +
                              std::to_string(thread) + " holds " + std::to_string(buffered) +
                              " buffered commit(s) against a credit of " + std::to_string(credit) +
+                             " (the bound is the credit plus the commits of one record, so a few above it is expected)" +
                              (hitSwapCap ? ", the swap bound is reached as well (\"swap_chunks\" of \"swap_chunks_max\")" :
                                            ", and the swap bound is not the reason") +
                              "; deliverable now: " + std::to_string(creditDeliverable) + " of " +
@@ -305,6 +335,7 @@ namespace OpenLogReplicator {
         }
         if (emergency)
             ctx->parserInBacklogWait.store(false, std::memory_order_relaxed);
+        return yield;
     }
 
     uint64_t CommitSorter::minShareLocked(uint64_t globalCap) const {
@@ -359,6 +390,7 @@ namespace OpenLogReplicator {
         std::lock_guard const lck(sorterMtx);
         events[checkpoint.scn].push_back(event);
         ++pendingEvents;
+        ++bufferedEvents;
         ++pendingByThread[event->thread];
         syncPendingEvents();
         notifyDeliveryLocked();
@@ -462,7 +494,9 @@ namespace OpenLogReplicator {
                     // Released: its transactions are delivered after transactions with a higher SCN (see the
                     // message below), so its redo must not be dropped against the global delivered watermark.
                     ctx->threadReleased[idleThread < 16 ? idleThread : 0].store(true, std::memory_order_relaxed);
-                    ctx->warning(60045, "redo thread: " + std::to_string(idleThread) + " did not advance for: " +
+                    // INFO since 2026-11-05a: a released thread is normal operation (one per archive of a quiet
+                    // thread), not a warning - see the same change for 60056 in Replicator.cpp.
+                    ctx->info(0, "redo thread: " + std::to_string(idleThread) + " did not advance for: " +
                                  std::to_string((currentTime - lastAdvance) / 1000000) + " s - it stops holding back the "
                                  "low-water-mark (reason: timeout, \"idle-thread-release-us\"); its transactions can now "
                                  "be delivered after transactions with a higher SCN");
@@ -511,7 +545,7 @@ namespace OpenLogReplicator {
                 // delivering is given up when this thread stops holding the low-water-mark (see 60045 and
                 // Ctx::deliveredDropLimit - the redo it reads when it comes back may be below the watermark).
                 ctx->threadReleased[thread < 16 ? thread : 0].store(true, std::memory_order_relaxed);
-                ctx->warning(60045, "redo thread: " + std::to_string(thread) + " has no archived redo log left to read "
+                ctx->info(0, "redo thread: " + std::to_string(thread) + " has no archived redo log left to read "
                              "(expected seq: " + expectedSeq.toString() + ", highest known seq: " + highestSeq.toString() +
                              ") - it stops holding back the low-water-mark (reason: no-work); its transactions can now be "
                              "delivered after transactions with a higher SCN");
@@ -592,10 +626,12 @@ namespace OpenLogReplicator {
         ctx->statInDelivery.store(inDelivery, std::memory_order_relaxed);
         // Layered mirror for Ctx::layersLine(): how many events are buffered, in how many SCN groups, and how they
         // sit per redo thread. Relaxed stores only, in the critical section that already holds sorterMtx.
-        uint64_t totalEvents = 0;
-        for (const auto& [scn, group]: events)
-            totalEvents += group.size();
-        ctx->statSorterEvents.store(totalEvents, std::memory_order_relaxed);
+        //
+        // The event count is the incrementally maintained bufferedEvents and NOT a walk over the map: this
+        // function runs on every enqueue (once per commit), on every collect and on every getPendingEvents(), and
+        // the walk made each of those O(buffered). With 3,000-4,000 buffered groups the parse fell from 20-28 MB/s
+        // to 4-5 MB/s and the whole pipeline convoyed on sorterMtx (production 2026-11-03 and 2026-11-04).
+        ctx->statSorterEvents.store(bufferedEvents, std::memory_order_relaxed);
         ctx->statSorterScns.store(events.size(), std::memory_order_relaxed);
         for (uint16_t thread = 0; thread < 16; ++thread) {
             const auto it = pendingByThread.find(thread);
@@ -616,12 +652,9 @@ namespace OpenLogReplicator {
     }
 
     uint64_t CommitSorter::getPendingEvents() const {
+        // No syncPendingEvents() here: every change keeps the mirror in step (see the comment above), so calling
+        // it again on each read only added another lock acquisition to a getter that the writer polls.
         std::lock_guard const lck(sorterMtx);
-        // Mirror for warning 60050 (Ctx::statPendingDeliveries): that message is written by the parser while it
-        // is blocked in Ctx::swappedMemoryInit, and it must not take this lock - a delivery may be in flight and
-        // call back into the sorter. Every change keeps the mirror in step (syncPendingEvents), so the
-        // pending_commits metric read by the checkpoint thread is just as fresh as this getter.
-        syncPendingEvents();
         return pendingEvents;
     }
 
@@ -761,6 +794,8 @@ namespace OpenLogReplicator {
                     ready.push_back(event);
                 events.erase(it);
             }
+            // The mirror of the map content: exactly the events that just left it (see bufferedEvents).
+            bufferedEvents = bufferedEvents >= ready.size() ? bufferedEvents - ready.size() : 0;
             // g5: the events are *not* taken out of the accounting here any more. They are handed to the executor
             // below, outside the lock, and only when executeCommit() returns has the backlog really shrunk. Before
             // g5 the counters dropped at collection time, so a writer that could not send (QUEUE_FULL, a black-holed
